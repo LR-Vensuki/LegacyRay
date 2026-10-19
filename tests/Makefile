@@ -209,8 +209,9 @@ sub_audit: sub_audit.c $(CFG_SRC) $(CORE)/config.h $(CORE)/b64.h
 	$(CC) $(CFLAGS) $(TLS_CFLAGS) sub_audit.c $(CFG_SRC) -o $@ $(TLS_LDFLAGS)
 
 test_transport_ws: test_transport_ws.c $(CORE)/transport_ws.c $(CORE)/transport_tcp.c $(CORE)/transport_tls.c $(CORE)/frag.c $(CORE)/tls_clienthello.c $(CORE)/transport.h
-	$(CC) $(CFLAGS) $(TLS_CFLAGS) test_transport_ws.c $(CORE)/transport_ws.c \
-	      $(CORE)/transport_tcp.c $(CORE)/transport_tls.c $(CORE)/frag.c $(CORE)/tls_clienthello.c -o $@ $(TLS_LDFLAGS)
+	$(CC) $(CFLAGS) $(TLS_CFLAGS) $(THREAD_CFLAGS) test_transport_ws.c $(CORE)/transport_ws.c \
+	      $(CORE)/transport_tcp.c $(CORE)/transport_tls.c $(CORE)/frag.c $(CORE)/tls_clienthello.c -o $@ \
+	      $(TLS_LDFLAGS) $(THREAD_LDFLAGS)
 
 test_store_contract: test_store_contract.c $(CORE)/store.c $(CFG_SRC) $(CORE)/store.h
 	$(CC) $(CFLAGS) $(TLS_CFLAGS) test_store_contract.c $(CORE)/store.c $(CFG_SRC) -o $@ $(TLS_LDFLAGS)

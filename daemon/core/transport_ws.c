@@ -1,8 +1,11 @@
 #include "transport.h"
+#include <errno.h>
+#include <poll.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <sys/time.h>
 
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -134,6 +137,62 @@ static int ws_accept_ok(ws_handle_t *h, const char *start, const char *end) {
     return strcmp(got, h->accept) == 0;
 }
 
+static int ws_handshake_step(ws_handle_t *h);
+
+/* the status line of a refused upgrade, so the log says what the server or
+   the cdn in front of it answered. the text comes from the network, so only
+   printable ascii of the first line goes through */
+static void ws_log_refusal(const ws_handle_t *h) {
+    char line[96];
+    size_t n = 0;
+    for (const uint8_t *p = h->hs_buf; *p && *p != '\r' && *p != '\n' &&
+                                       n < sizeof line - 1; ++p)
+        line[n++] = (*p >= 0x20 && *p < 0x7f) ? (char)*p : '?';
+    line[n] = '\0';
+    fprintf(stderr, "legacyrayd: websocket upgrade refused: %s\n", line);
+}
+
+static long ws_now_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long)tv.tv_sec * 1000L + (long)(tv.tv_usec / 1000);
+}
+
+static int ws_wait(int fd, short events, long deadline) {
+    struct pollfd p;
+    int r;
+    long left = deadline - ws_now_ms();
+    if (left <= 0) return -1;
+    p.fd = fd;
+    p.events = events;
+    p.revents = 0;
+    do {
+        r = poll(&p, 1, (int)left);
+    } while (r < 0 && errno == EINTR);
+    /* a hangup or error shows up as the next step's failure */
+    return r > 0 ? 0 : -1;
+}
+
+/* cdn fronts refuse a share of upgrades with a 5xx (about one in four on
+   some providers). done here, on the opener's thread, a refusal fails the
+   open while the client's bytes are still unsent, and the opener dials a
+   fresh connection instead of the session dying with nothing received */
+static int ws_finish_handshake(ws_handle_t *h, int fd, int budget_ms) {
+    long deadline = ws_now_ms() + budget_ms;
+    while (h->state != WS_STATE_ESTABLISHED) {
+        int r = ws_handshake_step(h);
+        if (h->state == WS_STATE_ESTABLISHED) break;
+        if (r == TRANSPORT_WANT_READ) {
+            if (ws_wait(fd, POLLIN, deadline) != 0) return -1;
+        } else if (r == TRANSPORT_WANT_WRITE || r == 0) {
+            if (ws_wait(fd, POLLOUT, deadline) != 0) return -1;
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static void *ws_open_common(int fd, const transport_tls_cfg_t *cfg, const transport_vt_t *sub_vt) {
     ws_handle_t *h = (ws_handle_t *)calloc(1, sizeof *h);
     if (!h) return NULL;
@@ -186,6 +245,12 @@ static void *ws_open_common(int fd, const transport_tls_cfg_t *cfg, const transp
     h->hs_len = (size_t)l;
     h->hs_off = 0;
 
+    if (cfg && cfg->handshake_ms > 0 &&
+        ws_finish_handshake(h, fd, cfg->handshake_ms) != 0) {
+        h->sub_vt->close(h->sub_h);
+        free(h);
+        return NULL;
+    }
     return h;
 }
 
@@ -310,6 +375,7 @@ static int ws_handshake_step(ws_handle_t *h) {
                     }
                     return 0;
                 }
+                ws_log_refusal(h);
                 return TRANSPORT_ERR;
             }
             if (h->hs_len >= sizeof(h->hs_buf) - 1) {

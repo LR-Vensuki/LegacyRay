@@ -118,6 +118,9 @@ static void flush_remote(session_t *s) {
                                      s->to_remote_raw);
         if (w > 0) { off += (size_t)w; continue; }
         if (w == TRANSPORT_WANT_WRITE || w == TRANSPORT_WANT_READ) break;
+        senko_trace_sess(s, "SESS_ERROR", "flush_remote");
+        fprintf(stderr, "legacyrayd: session remote write failed (queued, %s)\n",
+                w == TRANSPORT_EOF ? "peer closed" : "error");
         s->state = SESS_ERROR;
         return;
     }

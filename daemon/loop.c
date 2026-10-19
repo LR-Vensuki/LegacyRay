@@ -59,6 +59,9 @@ static long loop_now_ms(void) {
    away without a word, usually on the other side of a wifi/cellular move */
 #define LOOP_IDLE_MS (20L * 60L * 1000L)
 #define LOOP_DIRECT_CONNECT_MS 10000
+/* how long an opener waits on a transport's own handshake (tls and the
+   websocket upgrade) before it gives up on that connection and dials again */
+#define LOOP_OPEN_HANDSHAKE_MS 7000
 
 /* dead peers are found by the kernel instead of holding a slot forever */
 static void set_keepalive(int fd) {
@@ -760,6 +763,7 @@ static void fill_open_fields(loop_t *lp, loop_conn_t *c) {
     c->open_tls_cfg.xhttp_mode = c->open_xhttp_mode;
     c->open_tls_cfg.peer_host = c->open_peer_host;
     c->open_tls_cfg.insecure = c->open_insecure;
+    c->open_tls_cfg.handshake_ms = LOOP_OPEN_HANDSHAKE_MS;
 }
 
 /* hand a connection whose client socket is set to a worker that dials and
