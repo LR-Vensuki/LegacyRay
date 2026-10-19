@@ -27,6 +27,7 @@
 #include <sys/time.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/file.h>
 #include <unistd.h>
 #include "netwatch.h"
 #include "geo_ctl.h"
@@ -128,11 +129,62 @@ static int run_single(const char *link, int port) {
     return 0;
 }
 
+/* one managed daemon at a time. two of them used to start side by side
+   (launchd's job and the kick's direct spawn, or a respawn racing a slow
+   start) and take the socket file and the token from each other, which left a
+   daemon running for days that no client could talk to. the lock lives in
+   /var/run, where only root can create it, and is held for the life of the
+   process; a second copy waits for it instead of exiting, so launchd's
+   KeepAlive does not respawn it every few seconds and it takes over the
+   moment the first one dies */
+static int take_instance_lock(const char *ctl_path) {
+    char path[128];
+    const char *base = strrchr(ctl_path, '/');
+    base = base ? base + 1 : ctl_path;
+    size_t bl = strlen(base);
+    if (bl > 5 && strcmp(base + bl - 5, ".sock") == 0) bl -= 5;
+    int fd = -1;
+    if (snprintf(path, sizeof path, "/var/run/%.*s.lock", (int)bl, base) < (int)sizeof path)
+        fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
+    if (fd < 0 && snprintf(path, sizeof path, "%s.lock", ctl_path) < (int)sizeof path)
+        fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "legacyrayd: no instance lock (%s); continuing without one\n",
+                strerror(errno));
+        return -1;
+    }
+    /* children (pfctl, the awg helper) must not keep the lock past the daemon */
+    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        char held[24] = "?";
+        ssize_t n = pread(fd, held, sizeof held - 1, 0);
+        if (n > 0) {
+            held[n] = '\0';
+            held[strcspn(held, "\r\n")] = '\0';
+        }
+        fprintf(stderr, "legacyrayd: another daemon (pid %s) is running; "
+                        "waiting to take over from it\n", held);
+        while (flock(fd, LOCK_EX) != 0) {
+            if (errno != EINTR) {
+                fprintf(stderr, "legacyrayd: instance lock failed: %s\n", strerror(errno));
+                close(fd);
+                return -2;
+            }
+        }
+        fprintf(stderr, "legacyrayd: the other daemon exited, taking over\n");
+    }
+    char pid[24];
+    int pl = snprintf(pid, sizeof pid, "%ld\n", (long)getpid());
+    if (ftruncate(fd, 0) == 0 && pl > 0) (void)pwrite(fd, pid, (size_t)pl, 0);
+    return fd;
+}
+
 static int run_managed(const char *ctl_path, const char *config_path,
                        int full_device, daemon_settings_t *settings) {
     if (!settings) return 2;
     /* the tunnel has to outlive whatever started it */
     senko_proc_detach();
+    if (take_instance_lock(ctl_path) == -2) return 1;
     int port = (int)settings->socks_port;
     int socks_public = settings->socks_public;
     /* stale socket files survive crashes, so a live connect decides ownership */

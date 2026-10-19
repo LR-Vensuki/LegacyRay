@@ -116,10 +116,15 @@ static int load_token(const char *sock, char *token, size_t cap) {
     return n > 0 ? 0 : -1;
 }
 
+/* which step failed, so a missing token is not reported as a missing daemon */
+static const char *g_fail_step = "connect";
+
 /* without AUTH any local process can mutate the tunnel on a jailbreak */
 static int ctl_auth(int fd, const char *sock) {
     char token[48];
+    g_fail_step = "read token";
     if (load_token(sock, token, sizeof token) != 0) return -1;
+    g_fail_step = "auth";
     char line[80];
     int ln = snprintf(line, sizeof line, "AUTH %s\n", token);
     if (ln <= 0 || (size_t)ln >= sizeof line) return -1;
@@ -168,6 +173,7 @@ static ssize_t talk_ex(const char *sock, const char *line, size_t line_len,
                        int (*done)(const char *, size_t), int *out_timed_out) {
     int fd;
     if (out_timed_out) *out_timed_out = 0;
+    g_fail_step = "connect";
     if (connect_sock(sock, &fd) != 0) return -1;
 
 /* every command needs the token, including read-only status */
@@ -175,6 +181,7 @@ static ssize_t talk_ex(const char *sock, const char *line, size_t line_len,
         close(fd);
         return -1;
     }
+    g_fail_step = "the command";
 
     if (write_all(fd, line, line_len) < 0) { close(fd); return -1; }
 
@@ -424,8 +431,12 @@ int main(int argc, char **argv) {
     ssize_t n = talk_ex(sock, line, strlen(line), buf, sizeof buf,
                         timeout_sec, done, &timed_out);
     if (n < 0) {
-        fprintf(stderr, "legacyrayctl: cannot reach daemon at %s (%s)\n",
-                sock, strerror(errno));
+        if (strcmp(g_fail_step, "connect") == 0)
+            fprintf(stderr, "legacyrayctl: cannot reach daemon at %s (%s)\n",
+                    sock, strerror(errno));
+        else
+            fprintf(stderr, "legacyrayctl: daemon at %s answers, but %s failed (%s)\n",
+                    sock, g_fail_step, strerror(errno));
         return 2;
     }
     if (n > 0) {

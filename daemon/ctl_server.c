@@ -41,6 +41,11 @@
 
 #define AWG_PID_PATH "/var/run/legacyrayawgd.pid"
 
+/* how often the daemon makes sure its socket file and token are still there */
+#define CTL_PATH_CHECK_MS 2000
+
+static long ctl_now_ms(void);
+
 /* one connect has to answer while a client is still waiting, and every attempt
    carries a dns lookup, a handshake and a verify probe */
 #define CTL_FAILOVER_MAX_TRIES 8
@@ -93,8 +98,8 @@ static void ctl_token_path_from_sock(const char *sock, char *out, size_t cap) {
 
 #define CTL_MOBILE_GID 501 /* mobile group id */
 
-static int write_ctl_token(const char *path, char *token_out, size_t token_cap) {
-    if (!path || !token_out || token_cap < 33) return -1;
+static int new_ctl_token(char *token_out, size_t token_cap) {
+    if (!token_out || token_cap < 33) return -1;
     unsigned char raw[16];
     int ur = open("/dev/urandom", O_RDONLY);
     ssize_t got = (ur >= 0) ? read(ur, raw, sizeof raw) : -1;
@@ -106,7 +111,11 @@ static int write_ctl_token(const char *path, char *token_out, size_t token_cap) 
         token_out[i * 2 + 1] = hex[raw[i] & 0xf];
     }
     token_out[32] = '\0';
+    return 0;
+}
 
+static int write_ctl_token(const char *path, const char *token) {
+    if (!path || !token) return -1;
     char tmp[128];
     int tn = snprintf(tmp, sizeof tmp, "%s.%ld.tmp", path, (long)getpid());
     if (tn <= 0 || (size_t)tn >= sizeof tmp) return -1;
@@ -118,7 +127,7 @@ static int write_ctl_token(const char *path, char *token_out, size_t token_cap) 
     int fd = open(tmp, flags, 0640);
     if (fd < 0) return -1;
     char line[48];
-    int ln = snprintf(line, sizeof line, "%s\n", token_out);
+    int ln = snprintf(line, sizeof line, "%s\n", token);
     ssize_t w = (ln > 0) ? write(fd, line, (size_t)ln) : -1;
     int secure = fchmod(fd, 0640) == 0;
     if (fchown(fd, 0, CTL_MOBILE_GID) != 0 && geteuid() == 0) secure = 0;
@@ -133,6 +142,19 @@ static int write_ctl_token(const char *path, char *token_out, size_t token_cap) 
         return -1;
     }
     return 0;
+}
+
+/* 1 when the file at path holds exactly this token */
+static int token_file_matches(const char *path, const char *token) {
+    char line[48];
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    int got = fgets(line, sizeof line, f) != NULL;
+    fclose(f);
+    if (!got) return 0;
+    size_t n = strlen(line);
+    while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = '\0';
+    return strcmp(line, token) == 0;
 }
 
 static int tighten_sock_perms(const char *path) {
@@ -152,6 +174,36 @@ static int token_equal(const char *a, const char *b) {
         diff |= (unsigned char)(ac ^ bc);
     }
     return diff == 0;
+}
+
+/* a fresh listener at sock_path; remembers which file it made */
+static int bind_listener(ctl_server_t *s) {
+    size_t pl = strlen(s->sock_path);
+    struct sockaddr_un addr;
+    if (pl == 0 || pl >= sizeof addr.sun_path) return -1;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    memcpy(addr.sun_path, s->sock_path, pl + 1);
+    struct stat st;
+    if (remove_stale_socket(s->sock_path) != 0 ||
+        bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
+        close(fd);
+        return -1;
+    }
+    if (tighten_sock_perms(s->sock_path) != 0 ||
+        listen(fd, CTL_SERVER_MAX_CLIENTS) != 0 ||
+        lstat(s->sock_path, &st) != 0) {
+        close(fd);
+        unlink(s->sock_path);
+        return -1;
+    }
+    s->sock_dev = st.st_dev;
+    s->sock_ino = st.st_ino;
+    set_nonblock(fd);
+    return fd;
 }
 
 ctls_status_t ctl_server_init(ctl_server_t *s, const char *path,
@@ -180,50 +232,20 @@ ctls_status_t ctl_server_init(ctl_server_t *s, const char *path,
     memcpy(s->sock_path, path, pl + 1);
     ctl_token_path_from_sock(path, s->token_path, sizeof s->token_path);
 
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (new_ctl_token(s->token, sizeof s->token) != 0) {
+        close(s->ping_pipe[0]);
+        close(s->ping_pipe[1]);
+        s->ping_pipe[0] = s->ping_pipe[1] = -1;
+        return CTLS_ERR_AUTH;
+    }
+    int fd = bind_listener(s);
     if (fd < 0) {
         close(s->ping_pipe[0]);
         close(s->ping_pipe[1]);
         s->ping_pipe[0] = s->ping_pipe[1] = -1;
         return CTLS_ERR_BIND;
     }
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sun_family = AF_UNIX;
-    memcpy(addr.sun_path, path, pl + 1);
-
-    if (remove_stale_socket(path) != 0) {
-        close(fd);
-        close(s->ping_pipe[0]);
-        close(s->ping_pipe[1]);
-        s->ping_pipe[0] = s->ping_pipe[1] = -1;
-        return CTLS_ERR_BIND;
-    }
-    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
-        close(fd);
-        close(s->ping_pipe[0]);
-        close(s->ping_pipe[1]);
-        s->ping_pipe[0] = s->ping_pipe[1] = -1;
-        return CTLS_ERR_BIND;
-    }
-    if (tighten_sock_perms(path) != 0) {
-        close(fd);
-        unlink(path);
-        close(s->ping_pipe[0]);
-        close(s->ping_pipe[1]);
-        s->ping_pipe[0] = s->ping_pipe[1] = -1;
-        return CTLS_ERR_BIND;
-    }
-    if (listen(fd, CTL_SERVER_MAX_CLIENTS) != 0) {
-        close(fd);
-        unlink(path);
-        close(s->ping_pipe[0]);
-        close(s->ping_pipe[1]);
-        s->ping_pipe[0] = s->ping_pipe[1] = -1;
-        return CTLS_ERR_BIND;
-    }
-    if (write_ctl_token(s->token_path, s->token, sizeof s->token) != 0) {
+    if (write_ctl_token(s->token_path, s->token) != 0) {
         close(fd);
         unlink(path);
         close(s->ping_pipe[0]);
@@ -231,9 +253,38 @@ ctls_status_t ctl_server_init(ctl_server_t *s, const char *path,
         s->ping_pipe[0] = s->ping_pipe[1] = -1;
         return CTLS_ERR_AUTH;
     }
-    set_nonblock(fd);
     s->listen_fd = fd;
+    s->paths_checked_ms = ctl_now_ms();
     return CTLS_OK;
+}
+
+/* the socket file and the token are how every client finds this daemon, and
+   both live in a directory anyone with root can clean. a daemon that lost
+   either kept running for days with nobody able to reach it (the app saw
+   "auth required" and no token to answer it with), so the daemon puts back
+   whatever went missing instead of waiting to be restarted */
+void ctl_server_check_paths(ctl_server_t *s) {
+    if (!s || s->listen_fd < 0 || !s->sock_path[0]) return;
+    long now = ctl_now_ms();
+    if (s->paths_checked_ms && now - s->paths_checked_ms < CTL_PATH_CHECK_MS &&
+        now >= s->paths_checked_ms)
+        return;
+    s->paths_checked_ms = now;
+
+    struct stat st;
+    if (lstat(s->sock_path, &st) != 0 || !S_ISSOCK(st.st_mode) ||
+        st.st_dev != s->sock_dev || st.st_ino != s->sock_ino) {
+        int fd = bind_listener(s);
+        if (fd >= 0) {
+            close(s->listen_fd);
+            s->listen_fd = fd;
+            fprintf(stderr, "legacyrayd: control socket was gone, bound it again\n");
+        }
+    }
+    if (s->token_path[0] && s->token[0] && !token_file_matches(s->token_path, s->token)) {
+        if (write_ctl_token(s->token_path, s->token) == 0)
+            fprintf(stderr, "legacyrayd: control token was gone, wrote it again\n");
+    }
 }
 
 void ctl_server_set_persist(ctl_server_t *s, ctl_persist_fn persist) {
@@ -1303,6 +1354,7 @@ static void check_scheduled_refresh(ctl_server_t *s, long now) {
 
 void ctl_server_tick(ctl_server_t *s) {
     if (!s || !s->apply) return;
+    ctl_server_check_paths(s);
     long now = ctl_now_ms();
 
     check_egress_change(s, now);
@@ -2351,8 +2403,14 @@ void ctl_server_close(ctl_server_t *s) {
     for (size_t i = 0; i < CTL_SERVER_MAX_CLIENTS; ++i)
         if (s->clients[i].fd >= 0) drop_client(&s->clients[i]);
     if (s->listen_fd >= 0) { close(s->listen_fd); s->listen_fd = -1; }
-    if (s->sock_path[0]) (void)remove_stale_socket(s->sock_path);
-    if (s->token_path[0]) (void)unlink(s->token_path);
+    /* another daemon may own these files by now; removing them took its
+       control channel away while it went on running */
+    struct stat st;
+    if (s->sock_path[0] && lstat(s->sock_path, &st) == 0 && S_ISSOCK(st.st_mode) &&
+        st.st_dev == s->sock_dev && st.st_ino == s->sock_ino)
+        (void)unlink(s->sock_path);
+    if (s->token_path[0] && s->token[0] && token_file_matches(s->token_path, s->token))
+        (void)unlink(s->token_path);
     s->token[0] = '\0';
     if (s->ping_pipe[0] >= 0) close(s->ping_pipe[0]);
     if (s->ping_pipe[1] >= 0) close(s->ping_pipe[1]);
