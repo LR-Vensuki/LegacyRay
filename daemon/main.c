@@ -16,6 +16,7 @@
 #include "storefile.h"
 #include "settings.h"
 #include "status.h"
+#include "../common/senko_paths.h"
 
 #include <openssl/crypto.h>
 
@@ -29,6 +30,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include "netwatch.h"
 #include "geo_ctl.h"
@@ -180,12 +182,50 @@ static int take_instance_lock(const char *ctl_path) {
     return fd;
 }
 
+/* the system log is the daemon's stderr, opened by launchd or the kick, and
+   nothing ever rotated it: on the ipad it had grown to 25 MB. past the limit
+   the newest part moves to a .old file and the log starts over */
+#define LOG_TRIM_BYTES (2L * 1024 * 1024)
+#define LOG_KEEP_BYTES (256L * 1024)
+#define LOG_TRIM_EVERY_S (10L * 60)
+
+/* seconds are enough for a ten minute schedule, and fit a 32-bit long */
+static long clock_s(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long)tv.tv_sec;
+}
+
+static void trim_system_log(void) {
+    struct stat st;
+    if (fstat(STDERR_FILENO, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= LOG_TRIM_BYTES)
+        return;
+    char *tail = (char *)malloc((size_t)LOG_KEEP_BYTES);
+    if (tail) {
+        off_t from = st.st_size - LOG_KEEP_BYTES;
+        ssize_t n = pread(STDERR_FILENO, tail, (size_t)LOG_KEEP_BYTES, from);
+        int out = open(SENKO_SYSTEM_LOG ".old", O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0640);
+        if (out >= 0) {
+            if (n > 0) (void)write(out, tail, (size_t)n);
+            close(out);
+        }
+        free(tail);
+    }
+    if (ftruncate(STDERR_FILENO, 0) != 0) return;
+    /* without O_APPEND the next write would land at the old offset */
+    int fl = fcntl(STDERR_FILENO, F_GETFL, 0);
+    if (fl >= 0 && !(fl & O_APPEND)) (void)lseek(STDERR_FILENO, 0, SEEK_SET);
+    fprintf(stderr, "legacyrayd: log trimmed, the previous %ld KB are in %s.old\n",
+            LOG_KEEP_BYTES / 1024, SENKO_SYSTEM_LOG);
+}
+
 static int run_managed(const char *ctl_path, const char *config_path,
                        int full_device, daemon_settings_t *settings) {
     if (!settings) return 2;
     /* the tunnel has to outlive whatever started it */
     senko_proc_detach();
     if (take_instance_lock(ctl_path) == -2) return 1;
+    trim_system_log();
     int port = (int)settings->socks_port;
     int socks_public = settings->socks_public;
     /* stale socket files survive crashes, so a live connect decides ownership */
@@ -317,6 +357,7 @@ static int run_managed(const char *ctl_path, const char *config_path,
         fprintf(stderr, "legacyrayd: no routing socket; network moves are polled\n");
 
     static struct pollfd pfd[LOOP_POLLFD_MAX + CTL_SERVER_POLLFD_MAX + 2];
+    long last_trim_s = clock_s();
     while (!g_stop) {
         size_t nl = loop_prepare(&lp, pfd, LOOP_POLLFD_MAX);
         size_t nc = ctl_server_prepare(&cs, pfd + nl, CTL_SERVER_POLLFD_MAX);
@@ -364,6 +405,11 @@ static int run_managed(const char *ctl_path, const char *config_path,
         if (daemon_ctl_maintain(&dc) != 0)
             ctl_server_tunnel_lost(&cs);
         ctl_server_tick(&cs);
+        long now_s = clock_s();
+        if (now_s < last_trim_s || now_s - last_trim_s >= LOG_TRIM_EVERY_S) {
+            last_trim_s = now_s;
+            trim_system_log();
+        }
     }
     netwatch_close(route_fd);
 

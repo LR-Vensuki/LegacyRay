@@ -210,6 +210,9 @@ static int pfctl_state_dest(uint16_t redir_port, uint16_t client_port,
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
+    /* pfctl without -q says "No ALTQ support in kernel" on every run, and this
+       runs for every redirected connection */
+    posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
     posix_spawn_file_actions_addclose(&fa, fds[0]);
     posix_spawn_file_actions_addclose(&fa, fds[1]);
 
