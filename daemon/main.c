@@ -62,10 +62,23 @@ static void open_signal_pipe(void) {
     }
 }
 
+/* SIGUSR1 only wakes the loop: the kick sends it before it gives up on a daemon
+   whose socket does not answer, and the wake-up puts back a socket file or token
+   that something removed while the daemon slept */
+static void on_wake(int sig) {
+    (void)sig;
+    if (g_sig_pipe[1] >= 0) {
+        char b = 1;
+        ssize_t w = write(g_sig_pipe[1], &b, 1);
+        (void)w;
+    }
+}
+
 static void install_signals(void) {
     signal(SIGPIPE, SIG_IGN); /* ignore broken client sockets */
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+    signal(SIGUSR1, on_wake);
 }
 
 /* nothing scheduled still wakes the daemon once in a long while, so a
@@ -148,7 +161,10 @@ static int take_instance_lock(const char *ctl_path) {
     int fd = -1;
     if (snprintf(path, sizeof path, "/var/run/%.*s.lock", (int)bl, base) < (int)sizeof path)
         fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
-    if (fd < 0 && snprintf(path, sizeof path, "%s.lock", ctl_path) < (int)sizeof path)
+    /* the socket's directory is world-writable on the phone, where anyone could
+       hold a lock file made there; it is only a fallback for unprivileged runs */
+    if (fd < 0 && geteuid() != 0 &&
+        snprintf(path, sizeof path, "%s.lock", ctl_path) < (int)sizeof path)
         fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
     if (fd < 0) {
         fprintf(stderr, "legacyrayd: no instance lock (%s); continuing without one\n",
@@ -157,6 +173,8 @@ static int take_instance_lock(const char *ctl_path) {
     }
     /* children (pfctl, the awg helper) must not keep the lock past the daemon */
     (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+    /* the kick nudges every legacyrayd with SIGUSR1; a waiting copy ignores it */
+    signal(SIGUSR1, SIG_IGN);
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         char held[24] = "?";
         ssize_t n = pread(fd, held, sizeof held - 1, 0);
@@ -199,18 +217,28 @@ static void trim_system_log(void) {
     struct stat st;
     if (fstat(STDERR_FILENO, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= LOG_TRIM_BYTES)
         return;
+    /* stderr is write-only, so the tail is read through a descriptor of our own,
+       and only from the file stderr really is */
+    struct stat named;
+    int in = open(SENKO_SYSTEM_LOG, O_RDONLY | O_NOFOLLOW);
+    if (in < 0) return;
+    if (fstat(in, &named) != 0 || named.st_dev != st.st_dev || named.st_ino != st.st_ino) {
+        close(in);
+        return;
+    }
     char *tail = (char *)malloc((size_t)LOG_KEEP_BYTES);
-    if (tail) {
-        off_t from = st.st_size - LOG_KEEP_BYTES;
-        ssize_t n = pread(STDERR_FILENO, tail, (size_t)LOG_KEEP_BYTES, from);
+    ssize_t n = tail ? pread(in, tail, (size_t)LOG_KEEP_BYTES, st.st_size - LOG_KEEP_BYTES) : -1;
+    close(in);
+    int saved = 0;
+    if (n > 0) {
         int out = open(SENKO_SYSTEM_LOG ".old", O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0640);
         if (out >= 0) {
-            if (n > 0) (void)write(out, tail, (size_t)n);
+            saved = write(out, tail, (size_t)n) == n;
             close(out);
         }
-        free(tail);
     }
-    if (ftruncate(STDERR_FILENO, 0) != 0) return;
+    free(tail);
+    if (!saved || ftruncate(STDERR_FILENO, 0) != 0) return;
     /* without O_APPEND the next write would land at the old offset */
     int fl = fcntl(STDERR_FILENO, F_GETFL, 0);
     if (fl >= 0 && !(fl & O_APPEND)) (void)lseek(STDERR_FILENO, 0, SEEK_SET);
@@ -223,7 +251,6 @@ static int run_managed(const char *ctl_path, const char *config_path,
     if (!settings) return 2;
     /* the tunnel has to outlive whatever started it */
     senko_proc_detach();
-    if (take_instance_lock(ctl_path) == -2) return 1;
     trim_system_log();
     int port = (int)settings->socks_port;
     int socks_public = settings->socks_public;
@@ -477,6 +504,10 @@ int main(int argc, char **argv) {
         const char *config_path = "";
         int full_device = 0;
         parse_managed_args(argc, argv, &ctl_path, &config_path, &settings, &full_device);
+        /* before the settings are read: a copy that waited for the lock must
+           take over with what the previous daemon saved, not with what was on
+           disk when it started waiting */
+        if (take_instance_lock(ctl_path) == -2) return 1;
         if (config_path[0]) {
             /* two megabytes of servers do not fit the small default stack on
                ios 5, and only the settings are wanted from this first read,

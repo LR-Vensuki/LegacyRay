@@ -126,6 +126,7 @@ typedef struct {
     dev_t         sock_dev;
     ino_t         sock_ino;
     long          paths_checked_ms;
+    int           foreign_logged;
     ctl_engine_t  engine;
     ctl_apply_fn  apply;
     ctl_reason_fn reason;
