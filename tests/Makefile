@@ -58,6 +58,7 @@ HOST_TESTS += test_site
 HOST_TESTS += test_dialer
 HOST_TESTS += test_sniff
 HOST_TESTS += test_loop_route
+HOST_TESTS += test_engine_config
 
 all: test
 
@@ -105,6 +106,7 @@ test: $(HOST_TESTS)
 	./test_hpack
 	./test_app_proxy
 	./test_go_config
+	./test_engine_config
 	./test_net_safe
 	./test_legacy_ios
 	./test_subinfo
@@ -152,6 +154,10 @@ test_loop_traffic: test_loop_traffic.c $(DAEMON)/loop.c $(CORE)/session.c
 test_go_config: test_go_config.c $(DAEMON)/go_config.c $(CFG_SRC)
 	$(CC) $(CFLAGS) $(TLS_CFLAGS) -I$(DAEMON) test_go_config.c \
 	      $(DAEMON)/go_config.c $(CFG_SRC) -o $@ $(TLS_LDFLAGS)
+
+test_engine_config: test_engine_config.c $(DAEMON)/engine_config.c $(DAEMON)/engine_config.h $(CFG_SRC)
+	$(CC) $(CFLAGS) $(TLS_CFLAGS) -I$(DAEMON) test_engine_config.c \
+	      $(DAEMON)/engine_config.c $(CFG_SRC) -o $@ $(TLS_LDFLAGS)
 
 test_url_headers: test_url_headers.c $(CORE)/url.c $(CORE)/net_safe.c $(CORE)/url.h
 	$(CC) $(CFLAGS) test_url_headers.c $(CORE)/url.c $(CORE)/net_safe.c -o $@
