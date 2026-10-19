@@ -60,7 +60,7 @@ typedef struct {
     int      auto_connect; /* redial the stored selection at startup */
     int      auto_reconnect; /* redial after the data path drops */
     int      reconnect_max_attempts; /* 0 retries until it works */
-    int      sub_refresh_hours; /* 0 turns scheduled refreshes off */
+    int      sub_refresh_hours; /* -1 off, 0 the provider's interval (12 h without one), else hours */
     int      failover; /* walk the current section when a server will not come up */
 
 /* the developer overrides. they exist because the ladders below them choose

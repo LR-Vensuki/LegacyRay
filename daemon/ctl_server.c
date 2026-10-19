@@ -1320,18 +1320,37 @@ static void check_egress_change(ctl_server_t *s, long now) {
    pass and the most overdue subscription is the one that gets it */
 static int refresh_subscription(ctl_server_t *s, int si, char *msg, size_t cap);
 
+/* seconds between two refreshes of subscription i, 0 when it is never
+   refreshed on a schedule. providers rotate servers and keys every few days,
+   and a list that was never pulled again (the old default) went dead on the
+   ipad within a week; "automatic" does what happ does: the provider's
+   profile-update-interval, or twice a day without one */
+#define CTL_SUB_AUTO_HOURS 12
+
+static uint64_t sub_period_s(const ctl_server_t *s, int i) {
+    if (!s->settings || s->settings->sub_refresh_hours < 0) return 0;
+    uint32_t h = (uint32_t)s->settings->sub_refresh_hours;
+    if (h == 0) {
+        h = s->engine.store.subs[i].update_interval_h;
+        if (h == 0) h = CTL_SUB_AUTO_HOURS;
+        if (h > 168) h = 168;
+    }
+    return (uint64_t)h * 3600u;
+}
+
 static void check_scheduled_refresh(ctl_server_t *s, long now) {
-    if (!s->settings || s->settings->sub_refresh_hours <= 0 || !s->fetch) return;
+    if (!s->settings || s->settings->sub_refresh_hours < 0 || !s->fetch) return;
     if (s->sub_check_ms && now - s->sub_check_ms < 60000) return;
     s->sub_check_ms = now;
 
     uint64_t nowsec = (uint64_t)ctl_engine_now();
-    uint64_t period = (uint64_t)s->settings->sub_refresh_hours * 3600u;
     int pick = -1;
     uint64_t oldest = 0;
     for (int i = 0; i < STORE_MAX_SUBS; ++i) {
         if (!s->engine.store.subs[i].used) continue;
         if (s->sub_retry_at_ms[i] && now < s->sub_retry_at_ms[i]) continue;
+        uint64_t period = sub_period_s(s, i);
+        if (!period) continue;
         uint64_t last = s->engine.store.subs[i].last_refresh;
         if (last && nowsec < last + period) continue;
         if (pick < 0 || last < oldest) { pick = i; oldest = last; }
@@ -1392,12 +1411,13 @@ void ctl_server_network_changed(ctl_server_t *s) {
 
 /* when check_scheduled_refresh will next find a subscription to pull */
 static long refresh_due_in_ms(const ctl_server_t *s, long now) {
-    if (!s->settings || s->settings->sub_refresh_hours <= 0 || !s->fetch) return -1;
+    if (!s->settings || s->settings->sub_refresh_hours < 0 || !s->fetch) return -1;
     uint64_t nowsec = (uint64_t)ctl_engine_now();
-    uint64_t period = (uint64_t)s->settings->sub_refresh_hours * 3600u;
     long best = -1;
     for (int i = 0; i < STORE_MAX_SUBS; ++i) {
         if (!s->engine.store.subs[i].used) continue;
+        uint64_t period = sub_period_s(s, i);
+        if (!period) continue;
         uint64_t last = s->engine.store.subs[i].last_refresh;
         uint64_t left_s = (last && nowsec < last + period) ? last + period - nowsec : 0;
         if (left_s > 86400u) left_s = 86400u; /* look again tomorrow at the latest */

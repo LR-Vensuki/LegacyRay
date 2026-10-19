@@ -214,10 +214,11 @@ static void LRRoutingChanged(void) {
                                        footer:L(@"Old iPhones have no AES instructions; ChaCha20 costs them a fraction of the work, and servers pick it when asked first. The daemon sleeps while idle either way.")]];
 
     /* subscriptions */
+    /* 0 is automatic: the provider's own interval, twice a day without one */
     NSInteger hours = [DS() integerForKey:@"sub_refresh_hours" fallback:0];
-    NSArray *hourValues = [NSArray arrayWithObjects:@"0", @"6", @"12", @"24", @"48", @"168", nil];
-    NSArray *hourNames = [NSArray arrayWithObjects:L(@"Off"), L(@"Every 6 hours"), L(@"Every 12 hours"),
-                          L(@"Every day"), L(@"Every 2 days"), L(@"Every week"), nil];
+    NSArray *hourValues = [NSArray arrayWithObjects:@"0", @"6", @"12", @"24", @"48", @"168", @"-1", nil];
+    NSArray *hourNames = [NSArray arrayWithObjects:L(@"Automatic"), L(@"Every 6 hours"), L(@"Every 12 hours"),
+                          L(@"Every day"), L(@"Every 2 days"), L(@"Every week"), L(@"Off"), nil];
     NSUInteger hourIndex = [hourValues indexOfObject:[NSString stringWithFormat:@"%ld", (long)hours]];
     NSString *ua = [DS() stringForKey:@"sub_user_agent"];
     NSString *xver = [DS() stringForKey:@"xray_version"];
