@@ -907,6 +907,9 @@ static int ensure_legacyrayd(void) {
        threw a working daemon away together with its launchd job, which a
        jailbreak whose launchctl cannot reach launchd never got back */
     if (legacyrayd_alive()) {
+        /* a daemon asleep in poll puts back a removed socket file or token
+           once it wakes, and SIGUSR1 is what wakes it */
+        (void)kill_named("legacyrayd", SIGUSR1);
         if (wait_sock(BUSY_DAEMON_WAIT_TENTHS) == 0) {
             klog("up after waiting for a busy daemon");
             return 0;

@@ -190,6 +190,21 @@ static int token_equal(const char *a, const char *b) {
     return diff == 0;
 }
 
+/* 1 when something accepts connections at path */
+static int socket_answers(const char *path) {
+    struct sockaddr_un addr;
+    size_t pl = strlen(path);
+    if (pl >= sizeof addr.sun_path) return 0;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return 0;
+    memset(&addr, 0, sizeof addr);
+    addr.sun_family = AF_UNIX;
+    memcpy(addr.sun_path, path, pl + 1);
+    int ok = connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0;
+    close(fd);
+    return ok;
+}
+
 /* a fresh listener at sock_path; remembers which file it made */
 static int bind_listener(ctl_server_t *s) {
     size_t pl = strlen(s->sock_path);
@@ -286,7 +301,21 @@ void ctl_server_check_paths(ctl_server_t *s) {
     s->paths_checked_ms = now;
 
     struct stat st;
-    if (lstat(s->sock_path, &st) != 0 || !S_ISSOCK(st.st_mode) ||
+    int present = lstat(s->sock_path, &st) == 0;
+    if (present && S_ISSOCK(st.st_mode) &&
+        (st.st_dev != s->sock_dev || st.st_ino != s->sock_ino) &&
+        socket_answers(s->sock_path)) {
+        /* another daemon is listening there (one from before the instance
+           lock, during an upgrade); taking its socket back every two seconds
+           would leave both unreachable half the time */
+        if (!s->foreign_logged) {
+            fprintf(stderr, "legacyrayd: another daemon owns %s, leaving it alone\n",
+                    s->sock_path);
+            s->foreign_logged = 1;
+        }
+        return;
+    }
+    if (!present || !S_ISSOCK(st.st_mode) ||
         st.st_dev != s->sock_dev || st.st_ino != s->sock_ino) {
         int fd = bind_listener(s);
         if (fd >= 0) {

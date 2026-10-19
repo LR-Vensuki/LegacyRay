@@ -1501,6 +1501,11 @@ rexec_status_t routing_exec_up(routing_exec_t *st, int socks_port,
                          st->pf_last_error);
 #endif
             clear_pf();
+            unlink(PF_CONF);
+#if !defined(LR_MACOS)
+            /* the next rung may be ipfw, which needs neither pf nor forwarding */
+            restore_prior_state();
+#endif
         }
     } else {
         fprintf(stderr, "legacyrayd: pfctl not found\n");
@@ -1553,13 +1558,13 @@ void routing_exec_down(routing_exec_t *st) {
     if (st->mode == ROUTING_MODE_PF) {
         clear_pf();
         unlink(PF_CONF);
-#if !defined(LR_MACOS)
-        restore_prior_state();
-#endif
     }
 #if defined(LR_MACOS)
     mac_pf_release();
     mac_forwarding_restore();
+#else
+    /* also after a failed pf attempt left mode unset */
+    restore_prior_state();
 #endif
     memset(st, 0, sizeof *st);
 }
