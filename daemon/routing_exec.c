@@ -32,6 +32,8 @@ extern char **environ;
 
 #define PF_CONF "/var/run/legacyray-pf.conf"
 #define PF_ERR  "/var/tmp/legacyray-pf.err"
+/* how pf and forwarding were set before the first rules went in */
+#define PF_PRIOR "/var/run/legacyray-pf.prior"
 #define PF_OS   SENKO_JBROOT "/etc/pf.os"
 #define PF_ANCHOR "com.apple/legacyray"
 #define PF_CONF_CAP (512u * 1024u)
@@ -172,6 +174,7 @@ static int sysctl_read(const char *sysctl, const char *name,
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
     posix_spawn_file_actions_addclose(&fa, fds[0]);
     posix_spawn_file_actions_addclose(&fa, fds[1]);
     pid_t pid = 0;
@@ -416,7 +419,7 @@ static void pf_geo_tables(const routing_exec_t *st) {
         char *argv[] = { (char *)pfctl, (char *)"-q", (char *)"-t", (char *)table,
                          (char *)"-T", (char *)"add", (char *)"-f", path, NULL };
 #endif
-        int rc = routing_spawn(pfctl, argv);
+        int rc = run_spawn_quiet(pfctl, argv);
         fprintf(stderr, "legacyrayd: geoip %s %s %s\n", r->value,
                 rc == 0 ? "loaded into" : "could not be loaded into", table);
     }
@@ -652,6 +655,83 @@ static int apply_ipfw(const char *ipfw, const char *server_ip,
     return 0;
 }
 
+/* 1 when pfctl reports pf enabled, 0 when disabled, -1 when it cannot tell */
+static int pf_is_enabled(const char *pfctl) {
+    char *argv[] = { (char *)pfctl, (char *)"-s", (char *)"info", NULL };
+    int fds[2];
+    if (pipe(fds) != 0) return -1;
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addclose(&fa, fds[0]);
+    posix_spawn_file_actions_addclose(&fa, fds[1]);
+    pid_t pid = 0;
+    int rc = posix_spawn(&pid, pfctl, &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(fds[1]);
+    if (rc != 0) {
+        close(fds[0]);
+        return -1;
+    }
+    char buf[512];
+    size_t got = 0;
+    for (;;) {
+        ssize_t n = read(fds[0], buf + got, sizeof buf - 1 - got);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        got += (size_t)n;
+        if (got == sizeof buf - 1) break;
+    }
+    close(fds[0]);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    buf[got] = '\0';
+    if (strstr(buf, "Status: Enabled")) return 1;
+    if (strstr(buf, "Status: Disabled")) return 0;
+    return -1;
+}
+
+/* the first rule load of a session notes how pf and ip forwarding were set,
+   and the teardown puts them back. a disconnect used to leave pf enabled
+   with an empty rule set and forwarding on, on a phone where neither had
+   been on before. the note is a file, so the daemon that starts after a
+   crash still knows what to restore */
+static void remember_prior_state(const char *pfctl) {
+    if (access(PF_PRIOR, F_OK) == 0) return;
+    int pf_on = pfctl ? pf_is_enabled(pfctl) : -1;
+    char fwd[16] = "";
+    const char *sysctl = find_sysctl();
+    if (!sysctl || sysctl_read(sysctl, "net.inet.ip.forwarding", fwd, sizeof fwd) != 0 ||
+        strspn(fwd, "0123456789") != strlen(fwd))
+        fwd[0] = '\0';
+    char note[64];
+    int n = snprintf(note, sizeof note, "pf %d\nforwarding %s\n", pf_on, fwd[0] ? fwd : "-");
+    if (n > 0 && (size_t)n < sizeof note) (void)write_file(PF_PRIOR, note, (size_t)n);
+}
+
+static void restore_prior_state(void) {
+    FILE *f = fopen(PF_PRIOR, "r");
+    if (!f) return;
+    int pf_on = -1;
+    char fwd[16] = "-";
+    if (fscanf(f, "pf %d forwarding %15s", &pf_on, fwd) < 1) pf_on = -1;
+    fclose(f);
+    unlink(PF_PRIOR);
+    const char *pfctl = routing_find_pfctl();
+    if (pf_on == 0 && pfctl) {
+        char *argv[] = { (char *)pfctl, (char *)"-q", (char *)"-d", NULL };
+        (void)run_spawn_quiet(pfctl, argv);
+    }
+    const char *sysctl = find_sysctl();
+    if (sysctl && strcmp(fwd, "-") != 0 && strspn(fwd, "0123456789") == strlen(fwd)) {
+        char val[48];
+        snprintf(val, sizeof val, "net.inet.ip.forwarding=%s", fwd);
+        char *argv[] = { (char *)sysctl, (char *)"-w", val, NULL };
+        (void)run_spawn_quiet(sysctl, argv);
+    }
+}
+
 static void clear_pf(void) {
     const char *pfctl = routing_find_pfctl();
     if (!pfctl) return;
@@ -672,6 +752,7 @@ static int apply_pf_mode(const char *pfctl, const char *server_ips,
                          char *detail, size_t detail_cap) {
     if (detail && detail_cap > 0) detail[0] = '\0';
     ensure_pf_os_file();
+    remember_prior_state(pfctl);
     const char *sysctl = find_sysctl();
     if (sysctl) {
         char *argv[] = { (char *)sysctl, (char *)"-w",
@@ -1235,8 +1316,11 @@ void routing_exec_down(routing_exec_t *st) {
     stop_dns_forwarder(st);
     routing_scopedroute_restore(st->scoped_route_prev);
     if (st->mode == ROUTING_MODE_IPFW) clear_ipfw();
-    if (st->mode == ROUTING_MODE_PF)   clear_pf();
-    if (st->mode == ROUTING_MODE_PF) unlink(PF_CONF);
+    if (st->mode == ROUTING_MODE_PF) {
+        clear_pf();
+        unlink(PF_CONF);
+        restore_prior_state();
+    }
     memset(st, 0, sizeof *st);
 }
 
@@ -1382,6 +1466,11 @@ int routing_exec_bypass_add_ipv4(routing_exec_t *st, const char *ip) {
 void routing_exec_clear_stale(void) {
     /* clear both backends because a crash may leave either one active */
     clear_ipfw();
-    clear_pf();
-    unlink(PF_CONF);
+    /* pf only when our rules are what a crash left behind: flushing it at
+       every start also wiped the rules of other vpn apps on the phone */
+    if (access(PF_CONF, F_OK) == 0) {
+        clear_pf();
+        unlink(PF_CONF);
+    }
+    restore_prior_state();
 }
