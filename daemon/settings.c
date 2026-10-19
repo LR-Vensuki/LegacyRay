@@ -203,8 +203,10 @@ settings_status_t daemon_settings_set(daemon_settings_t *s,
     }
     if (key_is(key, key_len, "sub_refresh_hours")) {
         int v;
-        /* a week is the longest schedule a panel expiry makes any sense at */
-        if (parse_bounded_int(val, ve, 0, 168, &v) != 0) return SETTINGS_ERR_VALUE;
+        /* -1 is off; 0 follows the provider's own interval. a week is the
+           longest schedule a panel expiry makes any sense at */
+        if (ve - val == 2 && val[0] == '-' && val[1] == '1') v = -1;
+        else if (parse_bounded_int(val, ve, 0, 168, &v) != 0) return SETTINGS_ERR_VALUE;
         s->sub_refresh_hours = v;
         return SETTINGS_OK;
     }

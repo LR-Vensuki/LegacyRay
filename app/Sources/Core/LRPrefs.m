@@ -72,7 +72,7 @@ static BOOL LRBool(NSString *key, BOOL fallback) {
 }
 + (void)setSortMode:(LRSortMode)mode { [D() setInteger:mode forKey:@"LRSort"]; LRChanged(); }
 
-+ (BOOL)refreshSubscriptionsOnOpen { return LRBool(@"LRRefreshOnOpen", NO); }
++ (BOOL)refreshSubscriptionsOnOpen { return LRBool(@"LRRefreshOnOpen", YES); }
 + (void)setRefreshSubscriptionsOnOpen:(BOOL)on { [D() setBool:on forKey:@"LRRefreshOnOpen"]; LRChanged(); }
 
 + (BOOL)automaticUpdateChecks { return LRBool(@"LRUpdateChecks", YES); }

@@ -858,6 +858,16 @@ int main(void) {
     ok("out of range setting reported", strcmp(buf, "ERR value out of range\n") == 0);
     ok("out of range setting changed nothing", live.sub_refresh_hours == 0);
 
+    write(cli, "SET sub_refresh_hours -1\n", 25);
+    exchange(&s, cli, buf, sizeof buf);
+    ok("subscription timer can be turned off", live.sub_refresh_hours == -1);
+    write(cli, "SET sub_refresh_hours -2\n", 25);
+    exchange(&s, cli, buf, sizeof buf);
+    ok("only -1 below zero", strcmp(buf, "ERR value out of range\n") == 0 &&
+       live.sub_refresh_hours == -1);
+    write(cli, "SET sub_refresh_hours 0\n", 24);
+    exchange(&s, cli, buf, sizeof buf);
+
     write(cli, "SETTINGS\n", 9);
     exchange(&s, cli, buf, sizeof buf);
     ok("settings dump follows the change",
