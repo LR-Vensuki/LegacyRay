@@ -24,6 +24,11 @@ typedef struct {
     const char *xhttp_mode; /* preserve the xhttp stream mode */
     const char *peer_host; /* dial target host, last authority fallback */
     int insecure; /* skip certificate and hostname verification (allowInsecure) */
+/* when positive, open finishes the transport's own handshake within this many
+   ms before it returns, so a server that refuses it fails the open and the
+   caller can dial again. zero leaves the handshake to the first read/write.
+   only the websocket transports use it */
+    int handshake_ms;
 } transport_tls_cfg_t;
 
 typedef struct transport_vt {

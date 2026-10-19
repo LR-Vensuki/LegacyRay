@@ -2,9 +2,12 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <openssl/evp.h>
@@ -211,10 +214,89 @@ static int big_frame_roundtrip(int fd, void *h) {
     return got == BIG_FRAME_TOTAL ? 0 : -5;
 }
 
+/* a server on its own thread for opens that finish the upgrade themselves:
+   it reads the request and answers 101 with the right accept */
+static void *upgrade_server(void *arg) {
+    int fd = *(int *)arg;
+    char req[2048], key[64], accept[64];
+    size_t len = 0;
+    while (len < sizeof req - 1) {
+        struct pollfd p = { fd, POLLIN, 0 };
+        if (poll(&p, 1, 2000) <= 0) return NULL;
+        ssize_t n = read(fd, req + len, sizeof req - 1 - len);
+        if (n <= 0) return NULL;
+        len += (size_t)n;
+        req[len] = '\0';
+        if (strstr(req, "\r\n\r\n")) break;
+    }
+    if (header_value(req, "Sec-WebSocket-Key", key, sizeof key) == 0 &&
+        accept_for_key(key, accept, sizeof accept) == 0)
+        (void)write_response(fd, accept);
+    return NULL;
+}
+
+static long ms_now(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long)tv.tv_sec * 1000L + (long)(tv.tv_usec / 1000);
+}
+
+static void *open_with_budget(int sv[2], int budget_ms) {
+    transport_tls_cfg_t cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.ws_host = "cdn.example";
+    cfg.path = "/ws";
+    cfg.handshake_ms = budget_ms;
+    return transport_ws_tcp.open(sv[0], &cfg);
+}
+
+static void test_open_handshake(void) {
+    int sv[2];
+    void *h;
+    pthread_t server;
+    static const char refused[] =
+        "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+
+    /* a 5xx fails the open itself, so the opener can dial again */
+    ok("refused pair", socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    nonblock(sv[0]);
+    ok("queue 502", write(sv[1], refused, sizeof refused - 1) == (ssize_t)(sizeof refused - 1));
+    h = open_with_budget(sv, 2000);
+    ok("502 fails the open", h == NULL);
+    close_pair(sv, NULL);
+
+    /* a silent server fails it once the budget runs out */
+    ok("silent pair", socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    nonblock(sv[0]);
+    long started = ms_now();
+    h = open_with_budget(sv, 150);
+    long took = ms_now() - started;
+    ok("silent server fails the open", h == NULL);
+    ok("silent server waits the budget", took >= 140 && took < 1500);
+    close_pair(sv, NULL);
+
+    /* a 101 comes back established: the first write goes out as a frame */
+    ok("upgrade pair", socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    nonblock(sv[0]);
+    ok("server thread", pthread_create(&server, NULL, upgrade_server, &sv[1]) == 0);
+    h = open_with_budget(sv, 2000);
+    pthread_join(server, NULL);
+    ok("101 opens", h != NULL);
+    if (h) {
+        uint8_t one = 0x5a, frame[16];
+        ok("established write", transport_ws_tcp.write(h, &one, 1) == 1);
+        ssize_t n = read(sv[1], frame, sizeof frame);
+        ok("one masked frame", n == 7 && frame[0] == 0x82 && frame[1] == 0x81 &&
+                               (frame[6] ^ frame[2]) == 0x5a);
+    }
+    close_pair(sv, h);
+}
+
 int main(void) {
     int sv[2];
     void *h = NULL;
     char req[2048];
+    test_open_handshake();
     ok("start ws", start_ws(sv, &h, req, sizeof req) == 0);
     ok("path in request", strstr(req, "GET /ws HTTP/1.1\r\n") != NULL);
     ok("ws host header", strstr(req, "\r\nHost: cdn.example\r\n") != NULL);
