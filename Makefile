@@ -3,6 +3,7 @@
 #   make deps       fetch and build static openssl + mbedtls (once)
 #   make            daemon, tweaks and the app
 #   make package    packages/com.legacyray.app_<version>_iphoneos-arm.deb
+#                   (LR_ENGINE=<path> also ships the rust engine)
 #   make install    copy the .deb to THEOS_DEVICE_IP and dpkg -i it
 #   make test       the host test suite (needs `make deps HOST=1` first)
 #   make xcode      regenerate xcode/LegacyRay.xcodeproj
@@ -17,6 +18,10 @@ CONTROL_VERSION := $(shell sed -n 's/^Version: //p' layout/DEBIAN/control)
 PACKAGE := com.legacyray.app
 DEB := packages/$(PACKAGE)_$(VERSION)_iphoneos-arm.deb
 STAGE := .stage
+
+# the rust engine (an armv7 build of shoes) is optional: without it the
+# daemon runs its built-in core. point LR_ENGINE at the binary to ship it
+LR_ENGINE ?=
 
 # theos' own packer runs on linux and os x alike and always writes root:wheel
 LR_DEB_TOOL ?= $(if $(wildcard $(THEOS)/bin/dm.pl),$(THEOS)/bin/dm.pl,dpkg-deb --root-owner-group)
@@ -66,12 +71,15 @@ package: all
 	cp -R app/build/LegacyRay.app $(STAGE)/Applications/
 	cp LICENSE $(STAGE)/usr/share/doc/legacyray/LICENSE
 	cp app/Resources/THIRD_PARTY_LICENSES.txt $(STAGE)/usr/share/doc/legacyray/
+	$(if $(LR_ENGINE),cp $(LR_ENGINE) $(STAGE)/usr/lib/legacyray-engine)
 	find $(STAGE) -type d -exec chmod 755 {} +
 	find $(STAGE) -type f -exec chmod 644 {} +
 	chmod 755 $(STAGE)/DEBIAN/postinst $(STAGE)/DEBIAN/prerm $(STAGE)/DEBIAN/postrm
 	chmod 755 $(STAGE)/usr/bin/* $(STAGE)/usr/lib/*.dylib $(STAGE)/Applications/LegacyRay.app \
 	          $(STAGE)/Applications/LegacyRay.app/LegacyRay
 	chmod 4755 $(STAGE)/usr/bin/legacyray-kick
+	@# the daemon starts the engine only when it may execute it
+	[ ! -e $(STAGE)/usr/lib/legacyray-engine ] || chmod 755 $(STAGE)/usr/lib/legacyray-engine
 	find $(STAGE)/Applications/LegacyRay.app -type f ! -name LegacyRay -exec chmod 644 {} +
 	find $(STAGE)/usr/lib/legacyraytlsfix -type f -exec chmod 644 {} +
 	@printf 'Installed-Size: %s\n' "$$(du -sk $(STAGE) | cut -f1)" >> $(STAGE)/DEBIAN/control

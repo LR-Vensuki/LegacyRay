@@ -12,7 +12,8 @@ STATUS_STATE=$PREFS/com.legacyray.status.state
 LAUNCHCTL=/bin/launchctl
 [ -x "$LAUNCHCTL" ] || LAUNCHCTL=/usr/bin/launchctl
 
-for bin in /usr/bin/legacyrayd /usr/bin/legacyrayctl /usr/bin/legacyrayawgd /usr/bin/legacyray-ssh; do
+for bin in /usr/bin/legacyrayd /usr/bin/legacyrayctl /usr/bin/legacyrayawgd /usr/bin/legacyray-ssh \
+           /usr/lib/legacyray-engine; do
   [ -e "$bin" ] && chown root:wheel "$bin" && chmod 755 "$bin" || true
 done
 # the app runs as mobile and cannot signal the root daemon itself; the kick
