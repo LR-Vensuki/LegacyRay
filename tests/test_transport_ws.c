@@ -1,4 +1,5 @@
 #include "transport.h"
+#include "ws_path.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -294,10 +295,63 @@ static void test_open_handshake(void) {
     close_pair(sv, h);
 }
 
+/* a socket that takes a little at a time: the writer's count of taken bytes
+   and the payload the peer decodes must match, with nothing sent twice */
+static int slow_socket_once(int sv[2], void *h) {
+    static uint8_t big[100000];
+    static uint8_t wire[300000];
+    size_t taken = 0, wire_len = 0, payload = 0;
+    int small = 4096;
+    for (size_t i = 0; i < sizeof big; ++i) big[i] = (uint8_t)(i * 31);
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof small);
+    setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
+    for (int round = 0; round < 100000 && (taken < sizeof big || transport_ws_tcp.want_write(h));
+         ++round) {
+        int w = transport_ws_tcp.write(h, big + taken, sizeof big - taken);
+        if (w > 0) taken += (size_t)w;
+        else if (w != TRANSPORT_WANT_WRITE) return -1;
+        ssize_t n = read(sv[1], wire + wire_len, sizeof wire - wire_len);
+        if (n > 0) wire_len += (size_t)n;
+    }
+    for (;;) {
+        ssize_t n = read(sv[1], wire + wire_len, sizeof wire - wire_len);
+        if (n <= 0) break;
+        wire_len += (size_t)n;
+    }
+    for (size_t off = 0; off + 2 <= wire_len;) {
+        size_t len = wire[off + 1] & 0x7f, hl = 2;
+        if (len == 126) { len = ((size_t)wire[off + 2] << 8) | wire[off + 3]; hl = 4; }
+        else if (len == 127) return -1;
+        hl += 4; /* mask */
+        if (off + hl + len > wire_len) return -1;
+        for (size_t i = 0; i < len; ++i) {
+            uint8_t b = wire[off + hl + i] ^ wire[off + hl - 4 + (i % 4)];
+            if (b != big[payload + i]) return -1;
+        }
+        payload += len;
+        off += hl + len;
+    }
+    return taken == sizeof big && payload == sizeof big ? 0 : -1;
+}
+
+/* xray's early-data setting leaves the path, the other parameters stay */
+static void test_path_without_early_data(void) {
+    char out[128];
+    ws_path_without_early_data("/ws?ed=2048", out, sizeof out);
+    ok("ed alone", strcmp(out, "/ws") == 0);
+    ws_path_without_early_data("/p?a=1&ed=5&b=2", out, sizeof out);
+    ok("ed among others", strcmp(out, "/p?a=1&b=2") == 0);
+    ws_path_without_early_data("?ed=1", out, sizeof out);
+    ok("only ed leaves the root", strcmp(out, "/") == 0);
+    ws_path_without_early_data(NULL, out, sizeof out);
+    ok("no path is the root", strcmp(out, "/") == 0);
+}
+
 int main(void) {
     int sv[2];
     void *h = NULL;
     char req[2048];
+    test_path_without_early_data();
     test_open_handshake();
     ok("start ws", start_ws(sv, &h, req, sizeof req) == 0);
     ok("path in request", strstr(req, "GET /ws HTTP/1.1\r\n") != NULL);
@@ -355,6 +409,27 @@ int main(void) {
     ok("write bad u64 length", write_bad_u64_length(sv[1]) == 0);
     rr = transport_ws_tcp.read(h, tmp, sizeof tmp);
     ok("bad u64 length rejected", rr == TRANSPORT_ERR);
+    close_pair(sv, h);
+
+    h = NULL;
+    ok("start ws big write", start_ws(sv, &h, req, sizeof req) == 0);
+    ok("complete ws big write", complete_ws(sv[1], h, req) == 0);
+    {
+        static uint8_t big[70000];
+        uint8_t hdr[4];
+        memset(big, 'u', sizeof big);
+        int bw = transport_ws_tcp.write(h, big, sizeof big);
+        ok("a write bigger than a frame sends one frame", bw > 0 && bw <= 0xffff);
+        ok("frame header", read(sv[1], hdr, sizeof hdr) == (ssize_t)sizeof hdr);
+        ok("frame length is what the write took",
+           hdr[0] == 0x82 && (hdr[1] & 0x7f) == 126 && ((hdr[2] << 8) | hdr[3]) == bw);
+    }
+    close_pair(sv, h);
+
+    h = NULL;
+    ok("start ws slow socket", start_ws(sv, &h, req, sizeof req) == 0);
+    ok("complete ws slow socket", complete_ws(sv[1], h, req) == 0);
+    ok("slow socket: every byte reaches the peer once", slow_socket_once(sv, h) == 0);
     close_pair(sv, h);
 
     h = NULL;

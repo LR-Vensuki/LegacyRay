@@ -34,6 +34,7 @@ static inline void ws_path_without_early_data(const char *path, char *out, size_
         p += n;
         if (*p == '&') ++p;
     }
+    if (!out[0]) snprintf(out, cap, "/"); /* the path was only "?ed=..." */
 }
 
 #endif
