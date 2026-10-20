@@ -175,12 +175,20 @@ static void *open_worker_main(void *arg) {
             if (rfd < 0) continue;
             set_nonblock(rfd);
             set_keepalive(rfd);
+/* publish the fd under the lock, so a cancel that came during the dial is
+   seen here and a later one can shut the fd down to end the handshake */
+            pthread_mutex_lock(&lp->open_lock);
             c->remote_fd = rfd;
+            cancelled = c->open_cancelled;
+            pthread_mutex_unlock(&lp->open_lock);
+            if (cancelled) break;
         }
         th = c->open_vt->open(c->remote_fd, &c->open_tls_cfg);
         if (th) break;
+        pthread_mutex_lock(&lp->open_lock);
         close(c->remote_fd);
         c->remote_fd = -1;
+        pthread_mutex_unlock(&lp->open_lock);
     }
 
     pthread_mutex_lock(&lp->open_lock);
@@ -484,14 +492,14 @@ static void cancel_opening_conn(loop_t *lp, loop_conn_t *c) {
     if (!c->used || !c->opening) return;
     pthread_mutex_lock(&lp->open_lock);
     c->open_cancelled = 1;
+    /* wake the worker without reusing its remote fd */
+    if (c->remote_fd >= 0)
+        shutdown(c->remote_fd, SHUT_RDWR);
     pthread_mutex_unlock(&lp->open_lock);
     if (c->local_fd >= 0) {
         close(c->local_fd);
         c->local_fd = -1;
     }
-    /* wake the worker without reusing its remote fd */
-    if (c->remote_fd >= 0)
-        shutdown(c->remote_fd, SHUT_RDWR);
 }
 
 static void discard_conn(loop_conn_t *c);
@@ -1170,7 +1178,18 @@ static void service_conn(loop_t *lp, loop_conn_t *c,
         }
     }
     /* flush before handling hangup */
+    int was_full = session_remote_room(&c->sess) == 0;
     if (flush_to_local(c) != 0) { drop_conn(lp, c); return; }
+    /* a pump that stopped on a full client queue can leave bytes inside the
+       transport (a websocket frame, a tls record) that no poll event will
+       announce: pump again while the flush keeps making room */
+    for (int i = 0; was_full && i < 8 && session_remote_room(&c->sess) > 0 &&
+                    c->sess.state != SESS_ERROR; ++i) {
+        size_t before = c->sess.to_client_len;
+        session_pump_remote(&c->sess);
+        if (c->sess.to_client_len == before) break;
+        if (flush_to_local(c) != 0) { drop_conn(lp, c); return; }
+    }
 
     if (local_re & (POLLHUP | POLLERR)) {
         drop_conn(lp, c);
