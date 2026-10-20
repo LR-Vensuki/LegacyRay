@@ -124,7 +124,11 @@ static void *tls_open(int fd, const transport_tls_cfg_t *cfg) {
    server that honors h2 over an alpn offer leaves both trying to parse a
    binary h2 frame as a plaintext response */
     static const unsigned char alpn[] = "\x08http/1.1";
-    SSL_CTX_set_alpn_protos(h->ctx, alpn, sizeof alpn - 1);
+    static const unsigned char alpn_h2[] = "\x02h2";
+    if (cfg && cfg->alpn_h2)
+        SSL_CTX_set_alpn_protos(h->ctx, alpn_h2, sizeof alpn_h2 - 1);
+    else
+        SSL_CTX_set_alpn_protos(h->ctx, alpn, sizeof alpn - 1);
     SSL_CTX_set_ciphersuites(h->ctx, tls_ch_prefer_chacha()
         ? "TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"
         : "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256");
@@ -237,7 +241,7 @@ static void tls_close(void *handle) {
 }
 
 const transport_vt_t transport_tls = {
-    tls_open, tls_read, tls_write, tls_raw_write, tls_close, NULL, NULL
+    tls_open, tls_read, tls_write, tls_raw_write, tls_close, NULL, NULL, NULL
 };
 
 /* reality uses its own handshake path, not ssl_connect */

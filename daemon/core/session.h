@@ -163,6 +163,9 @@ size_t session_remote_room(const session_t *s);
 /* bytes queued for the remote that can be written now */
 size_t session_remote_pending(const session_t *s);
 
+/* 1 while the transport takes nothing until the remote sends something */
+int session_remote_blocked(const session_t *s);
+
 /* how many client bytes the session can take in one feed without refusing
    any: none while its remote queue is too full for one more read */
 size_t session_client_room(const session_t *s);

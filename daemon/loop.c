@@ -1306,7 +1306,8 @@ size_t loop_prepare(loop_t *lp, struct pollfd *pfd, size_t cap) {
         /* poll remote writes only when needed, and reads only while the
            client queue has room: a full one would spin the loop */
         short ev = session_remote_room(&c->sess) > 0 ? POLLIN : 0;
-        if (session_remote_pending(&c->sess) > 0) ev |= POLLOUT;
+        if (session_remote_pending(&c->sess) > 0 && !session_remote_blocked(&c->sess))
+            ev |= POLLOUT;
         else if (c->sess.vt && c->sess.vt->want_write && c->sess.th &&
                  c->sess.vt->want_write(c->sess.th))
             ev |= POLLOUT;
