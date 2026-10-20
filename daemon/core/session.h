@@ -82,6 +82,11 @@ typedef struct {
 
 /* delay socks success until the remote response proves the tunnel exists */
     int            pending_socks_ok;
+/* a redirected connection never spoke socks, so it gets no socks replies */
+    int            no_socks_reply;
+/* a socks5 upstream's reply can arrive in pieces; the start waits here */
+    uint8_t        up_stage[300];
+    size_t         up_stage_len;
 
 /* the destination label and the close latch exist in every build: an event line
    with no destination in it names nothing, and 280 bytes a session is a cost

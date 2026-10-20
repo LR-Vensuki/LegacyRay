@@ -156,11 +156,91 @@ static void test_socks5_ipv6_address_type(void) {
                      out[20] == 0x01 && out[21] == 0xbb);
 }
 
+/* a redirected connection never spoke socks: the start goes straight to the
+   upstream's handshake, and the app gets only the destination's bytes */
+static void test_transparent_socks5_upstream(void) {
+    int sv[2];
+    uint8_t got[4096];
+    size_t n, consumed = 0, used = 99;
+    session_t *s = calloc(1, sizeof *s);
+    vless_dest_t dest;
+    memset(&dest, 0, sizeof dest);
+    dest.atyp = VLESS_ADDR_IPV4;
+    dest.host_addr[0] = 192; dest.host_addr[1] = 0; dest.host_addr[2] = 2; dest.host_addr[3] = 7;
+    dest.port = 443;
+
+    ok("tp alloc", s != NULL);
+    ok("tp pair", socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    nonblock(sv[0]);
+    nonblock(sv[1]);
+    void *th = transport_tcp.open(sv[0], NULL);
+    ok("tp init", session_init(s, &transport_tcp, th, VL_PROTO_SOCKS5, NULL, NULL, NULL, NULL) == SESS_OK);
+    ok("tp start", session_start_from_transparent_dest(s, &dest, (const uint8_t *)"hello", 5, &used) ==
+                   SESS_OK);
+    ok("tp payload left to the caller", used == 0);
+    ok("tp payload fed", session_feed_client(s, (const uint8_t *)"hello", 5, &consumed) == SESS_OK &&
+                         consumed == 5);
+    n = drain(sv[1], got, sizeof got);
+    ok("tp greeting only", n == 3 && got[0] == 0x05);
+
+/* the replies come in pieces */
+    ok("tp method 1", write(sv[1], "\x05", 1) == 1);
+    ok("tp pump 1", session_pump_remote(s) == SESS_OK);
+    ok("tp method 2", write(sv[1], "\x00", 1) == 1);
+    ok("tp pump 2", session_pump_remote(s) == SESS_OK);
+    n = drain(sv[1], got, sizeof got);
+    ok("tp connect request after a split method reply", n == 10 && got[0] == 0x05 && got[1] == 0x01 &&
+                                                        got[3] == 0x01 && got[4] == 192 && got[7] == 7);
+    ok("tp reply 1", write(sv[1], "\x05\x00\x00\x01", 4) == 4);
+    ok("tp pump 3", session_pump_remote(s) == SESS_OK && s->state != SESS_RELAY);
+    ok("tp reply 2 and data", write(sv[1], "\x00\x00\x00\x00\x00\x00HTTP", 10) == 10);
+    ok("tp pump 4", session_pump_remote(s) == SESS_OK && s->state == SESS_RELAY);
+    n = drain(sv[1], got, sizeof got);
+    ok("tp payload after the reply", n == 5 && memcmp(got, "hello", 5) == 0);
+    n = session_take_client(s, got, sizeof got);
+    ok("tp app sees no socks reply, only the destination", n == 4 && memcmp(got, "HTTP", 4) == 0);
+
+    transport_tcp.close(th);
+    close(sv[0]);
+    close(sv[1]);
+    free(s);
+}
+
+/* trojan carries the first bytes in its request, again without a reply */
+static void test_transparent_trojan(void) {
+    int sv[2];
+    uint8_t got[4096];
+    size_t used = 0;
+    session_t *s = calloc(1, sizeof *s);
+    vless_dest_t dest;
+    memset(&dest, 0, sizeof dest);
+    dest.atyp = VLESS_ADDR_IPV4;
+    dest.host_addr[0] = 198; dest.host_addr[1] = 51; dest.host_addr[2] = 100; dest.host_addr[3] = 1;
+    dest.port = 80;
+    ok("tt alloc", s != NULL);
+    ok("tt pair", socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    nonblock(sv[0]);
+    nonblock(sv[1]);
+    void *th = transport_tcp.open(sv[0], NULL);
+    ok("tt init", session_init(s, &transport_tcp, th, VL_PROTO_TROJAN, NULL, NULL, NULL, "pw") == SESS_OK);
+    ok("tt start", session_start_from_transparent_dest(s, &dest, (const uint8_t *)"GET /", 5, &used) ==
+                   SESS_OK && used == 5 && s->state == SESS_RELAY);
+    size_t n = drain(sv[1], got, sizeof got);
+    ok("tt request carries the payload", n > 5 && memcmp(got + n - 5, "GET /", 5) == 0);
+    ok("tt no socks reply", session_take_client(s, got, sizeof got) == 0);
+    transport_tcp.close(th);
+    close(sv[0]);
+    close(sv[1]);
+    free(s);
+}
+
 int main(void) {
     test_socks5_ipv6_address_type();
     test_socks5_upstream_holds_client_bytes();
     test_http_upstream_holds_client_bytes();
     test_client_room();
+    test_transparent_socks5_upstream();
+    test_transparent_trojan();
     if (g_fail) {
         fprintf(stderr, "%d check(s) failed\n", g_fail);
         return 1;
