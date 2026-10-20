@@ -214,6 +214,35 @@ int main(void) {
            reparsed.xh_pad_min == 50 && reparsed.xh_pad_max == 60 &&
            reparsed.xh_post_max == 4096 && reparsed.xh_no_grpc == 1 &&
            strcmp(reparsed.mode, "stream-one") == 0);
+        ok("xhttp link with request shaping accepted",
+           store_add_manual(&rt,
+               "vless://11111111-1111-4111-8111-111111111111@xh.example:443"
+               "?security=tls&type=xhttp&sni=front.example&path=%2Fx&mode=packet-up"
+               "&extra=%7B%22uplinkDataPlacement%22%3A%22cookie%22%2C%22uplinkHTTPMethod%22"
+               "%3A%22GET%22%2C%22sessionIDPlacement%22%3A%22header%22%2C%22seqKey%22%3A%22n%22"
+               "%2C%22seqPlacement%22%3A%22cookie%22%2C%22xPaddingObfsMode%22%3Atrue%2C"
+               "%22xPaddingPlacement%22%3A%22query%22%2C%22xPaddingKey%22%3A%22pad%22%2C"
+               "%22uplinkChunkSize%22%3A%22100-200%22%2C%22scMinPostsIntervalMs%22%3A20%7D#XS",
+               &xidx) == STORE_OK);
+        ok("xhttp shaping link rebuilds", store_link_at(&rt, xidx, relink, sizeof relink) == 0);
+        memset(&reparsed, 0, sizeof reparsed);
+        ok("rebuilt shaping link reparses", cfg_parse_link(relink, &reparsed) == CFG_OK);
+        ok("xhttp shaping survives the round trip",
+           cfg_xh_same(&reparsed, &rt.servers[xidx]) &&
+           strcmp(reparsed.xh_data_place, "cookie") == 0 &&
+           strcmp(reparsed.xh_method, "GET") == 0 &&
+           strcmp(reparsed.xh_sess_place, "header") == 0 &&
+           strcmp(reparsed.xh_seq_place, "cookie") == 0 &&
+           strcmp(reparsed.xh_seq_key, "n") == 0 && reparsed.xh_pad_obfs == 1 &&
+           strcmp(reparsed.xh_pad_place, "query") == 0 &&
+           strcmp(reparsed.xh_pad_key, "pad") == 0 &&
+           reparsed.xh_chunk_min == 100 && reparsed.xh_chunk_max == 200 &&
+           reparsed.xh_gap_min == 20 && reparsed.xh_gap_max == 20);
+        ok("the same node with its data in the body is a different server",
+           store_add_manual(&rt,
+               "vless://11111111-1111-4111-8111-111111111111@xh.example:443"
+               "?security=tls&type=xhttp&sni=front.example&path=%2Fx&mode=packet-up#XB",
+               &xidx) == STORE_OK && rt.servers[xidx].xh_data_place[0] == '\0');
         ok("a different padding range is a different server",
            store_add_manual(&rt,
                "vless://11111111-1111-4111-8111-111111111111@xh.example:443"

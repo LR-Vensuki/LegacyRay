@@ -156,6 +156,37 @@ static const char *http_host(const vl_server_t *s) {
     return s->ws_host[0] ? s->ws_host : tls_name(s);
 }
 
+static void put_opt(eout_t *o, const char *key, const char *value) {
+    if (!value[0]) return;
+    put(o, ",");
+    put_key(o, key, value);
+}
+
+/* xray's newer request shaping, by the engine's names */
+static void put_xh_shape(eout_t *o, const vl_server_t *s) {
+    put_opt(o, "uplink_http_method", s->xh_method);
+    put_opt(o, "uplink_data_placement", s->xh_data_place);
+    put_opt(o, "uplink_data_key", s->xh_data_key);
+    if (s->xh_chunk_max)
+        putf(o, ",\"uplink_chunk_size\":\"%lu-%lu\"",
+             (unsigned long)s->xh_chunk_min, (unsigned long)s->xh_chunk_max);
+    put_opt(o, "session_placement", s->xh_sess_place);
+    put_opt(o, "session_key", s->xh_sess_key);
+    put_opt(o, "seq_placement", s->xh_seq_place);
+    put_opt(o, "seq_key", s->xh_seq_key);
+    if (s->xh_pad_obfs) {
+        put(o, ",\"x_padding_obfs_mode\":true");
+        put_opt(o, "x_padding_placement",
+                strcmp(s->xh_pad_place, "queryInHeader") == 0 ? "query-in-header"
+                                                               : s->xh_pad_place);
+        put_opt(o, "x_padding_key", s->xh_pad_key);
+        put_opt(o, "x_padding_header", s->xh_pad_header);
+    }
+    if (s->xh_gap_max)
+        putf(o, ",\"sc_min_posts_interval_ms\":\"%lu-%lu\"",
+             (unsigned long)s->xh_gap_min, (unsigned long)s->xh_gap_max);
+}
+
 /* the http layer between the security layer and the proxy protocol */
 static void put_carrier(eout_t *o, const vl_server_t *s) {
     if (s->net == VL_NET_WS) {
@@ -177,6 +208,10 @@ static void put_carrier(eout_t *o, const vl_server_t *s) {
         if (strcmp(s->mode, "packet-up") == 0 || strcmp(s->mode, "stream-up") == 0 ||
             strcmp(s->mode, "stream-one") == 0)
             mode = s->mode;
+        /* data outside the body and get uploads exist only in packet-up */
+        if (strcmp(s->xh_data_place, "header") == 0 ||
+            strcmp(s->xh_data_place, "cookie") == 0 || strcmp(s->xh_method, "GET") == 0)
+            mode = "packet-up";
         put(o, "{");
         put_key(o, "type", "xhttp");
         put(o, ",");
@@ -196,6 +231,7 @@ static void put_carrier(eout_t *o, const vl_server_t *s) {
             putf(o, ",\"sc_max_each_post_bytes\":%lu", (unsigned long)s->xh_post_max);
         if (s->xh_no_grpc)
             put(o, ",\"no_grpc_header\":true");
+        put_xh_shape(o, s);
         put(o, ",\"protocol\":");
         put_proxy(o, s);
         put(o, "}");
