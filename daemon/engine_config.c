@@ -1,4 +1,5 @@
 #include "engine_config.h"
+#include "core/ws_path.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -150,40 +151,11 @@ static const char *http_host(const vl_server_t *s) {
     return s->ws_host[0] ? s->ws_host : tls_name(s);
 }
 
-/* "ed=N" in a websocket path is xray's early-data setting for the client,
-   not part of the path; xray takes it out before the request, and so do we */
-static void ws_path(const char *path, char *out, size_t cap) {
-    const char *query;
-    size_t used;
-    if (!path[0]) path = "/";
-    query = strchr(path, '?');
-    if (!query) {
-        snprintf(out, cap, "%s", path);
-        return;
-    }
-    used = (size_t)(query - path);
-    if (used >= cap) used = cap - 1;
-    memcpy(out, path, used);
-    out[used] = '\0';
-    for (const char *p = query + 1; *p;) {
-        const char *end = strchr(p, '&');
-        size_t n = end ? (size_t)(end - p) : strlen(p);
-        if (n && strncmp(p, "ed=", 3) != 0 && used + n + 1 < cap) {
-            out[used++] = strchr(out, '?') ? '&' : '?';
-            memcpy(out + used, p, n);
-            used += n;
-            out[used] = '\0';
-        }
-        p += n;
-        if (*p == '&') ++p;
-    }
-}
-
 /* the http layer between the security layer and the proxy protocol */
 static void put_carrier(eout_t *o, const vl_server_t *s) {
     if (s->net == VL_NET_WS) {
         char path[sizeof s->path];
-        ws_path(s->path, path, sizeof path);
+        ws_path_without_early_data(s->path, path, sizeof path);
         put(o, "{");
         put_key(o, "type", "websocket");
         put(o, ",");

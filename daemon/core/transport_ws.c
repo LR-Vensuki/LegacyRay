@@ -1,4 +1,5 @@
 #include "transport.h"
+#include "ws_path.h"
 #include <errno.h>
 #include <poll.h>
 #include <string.h>
@@ -209,7 +210,7 @@ static void *ws_open_common(int fd, const transport_tls_cfg_t *cfg, const transp
     snprintf(h->host, sizeof h->host, "%s",
              (cfg && cfg->ws_host && cfg->ws_host[0]) ? cfg->ws_host :
              ((cfg && cfg->sni && cfg->sni[0]) ? cfg->sni : "localhost"));
-    snprintf(h->path, sizeof h->path, "%s", (cfg && cfg->path && cfg->path[0]) ? cfg->path : "/");
+    ws_path_without_early_data(cfg ? cfg->path : NULL, h->path, sizeof h->path);
     if (!ws_token_ok(h->host) || !ws_token_ok(h->path)) {
         h->sub_vt->close(h->sub_h);
         free(h);
