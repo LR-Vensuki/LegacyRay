@@ -8,6 +8,9 @@ SYS="/Library/Application Support/LegacyRay"
 PLIST=/Library/LaunchDaemons/com.legacyray.daemon.plist
 
 if [ -f "$PLIST" ]; then launchctl unload "$PLIST" >/dev/null 2>&1; fi
+# an engine whose daemon was killed outright is still running
+killall -9 legacyray-engine >/dev/null 2>&1
+rm -f /var/run/legacyray-engine.yaml /var/run/legacyray-engine.pid
 if [ -x "$PREFIX/bin/legacyray-kick" ]; then "$PREFIX/bin/legacyray-kick" --awg-stop >/dev/null 2>&1; fi
 pfctl -a com.apple/legacyray -F all >/dev/null 2>&1
 # the daemon puts the system proxy back when it stops; a dead one leaves the
