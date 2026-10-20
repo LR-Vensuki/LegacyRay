@@ -101,6 +101,11 @@ typedef struct {
 /* the relay ended without error, so a transport may half close politely */
     int        relay_clean;
 
+/* times the upstream hung up before it answered and the request went out
+   again; redialing is set while a worker opens the new connection */
+    int        redials;
+    int        redialing;
+
 /* retain local output so large package transfers survive backpressure */
     uint8_t    pend[64 * 1024];
     size_t     pend_len;

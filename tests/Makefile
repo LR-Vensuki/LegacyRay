@@ -58,6 +58,7 @@ HOST_TESTS += test_site
 HOST_TESTS += test_dialer
 HOST_TESTS += test_sniff
 HOST_TESTS += test_loop_route
+HOST_TESTS += test_loop_redial
 HOST_TESTS += test_engine_config
 HOST_TESTS += test_session_upstream
 
@@ -75,6 +76,7 @@ test: $(HOST_TESTS)
 	./test_loop_traffic
 	./test_sniff
 	./test_loop_route
+	./test_loop_redial
 	./test_rules
 	./test_dns_msg
 	./test_dns_cache
@@ -144,6 +146,10 @@ test_sniff: test_sniff.c $(CORE)/sniff.c $(CORE)/sniff.h
 
 test_loop_route: test_loop_route.c $(DAEMON)/loop.c $(DAEMON)/loop.h $(CORE)/sniff.c
 	$(CC) $(CFLAGS) $(TLS_CFLAGS) $(THREAD_CFLAGS) -DSENKO_RELEASE -I$(DAEMON) test_loop_route.c \
+	      $(LOOP_DEPS) -o $@ $(TLS_LDFLAGS) $(THREAD_LDFLAGS)
+
+test_loop_redial: test_loop_redial.c $(DAEMON)/loop.c $(DAEMON)/loop.h $(CORE)/session.c
+	$(CC) $(CFLAGS) $(TLS_CFLAGS) $(THREAD_CFLAGS) -DSENKO_RELEASE -I$(DAEMON) test_loop_redial.c \
 	      $(LOOP_DEPS) -o $@ $(TLS_LDFLAGS) $(THREAD_LDFLAGS)
 
 test_loop_traffic: test_loop_traffic.c $(DAEMON)/loop.c $(CORE)/session.c
