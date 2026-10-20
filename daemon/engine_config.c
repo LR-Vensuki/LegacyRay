@@ -1,6 +1,7 @@
 #include "engine_config.h"
 #include "core/ws_path.h"
 
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -95,9 +96,13 @@ int engine_config_supports(const vl_server_t *s) {
         case VL_PROTO_SHADOWSOCKS:
             return s->security == VL_SEC_NONE && s->net == VL_NET_TCP &&
                    s->pass[0] && ss_cipher_known(s->user);
+        case VL_PROTO_HYSTERIA2:
+            /* salamander is the one obfuscation the engine's client knows */
+            if (!s->pass[0]) return 0;
+            if (!s->obfs[0] || strcmp(s->obfs, "none") == 0) return 1;
+            return strcmp(s->obfs, "salamander") == 0 && s->obfs_password[0];
         default:
-            /* plain socks/http proxies need no engine; hysteria2 has no
-               client in it yet */
+            /* plain socks/http proxies need no engine */
             return 0;
     }
     if (s->security != VL_SEC_NONE && s->security != VL_SEC_TLS &&
@@ -235,6 +240,51 @@ static void put_security(eout_t *o, const vl_server_t *s) {
     put_carrier(o, s);
 }
 
+/* hysteria2 rides its own quic connection, so tls sits beside the protocol
+   rather than around it. a pinned certificate is trusted on its own, as xray
+   and hysteria trust it: those servers mostly carry a self-signed one */
+static void put_hysteria2(eout_t *o, const vl_server_t *s) {
+    put(o, "{");
+    put_key(o, "type", "hysteria2");
+    put(o, ",");
+    put_key(o, "password", s->pass);
+    if (s->obfs[0] && strcmp(s->obfs, "none") != 0) {
+        put(o, ",");
+        put_key(o, "salamander_password", s->obfs_password);
+    }
+    put(o, "},\"transport\":\"quic\",\"quic_settings\":{");
+    put_key(o, "sni_hostname", tls_name(s));
+    put(o, ",\"alpn_protocols\":[\"h3\"]");
+    if (s->pin_sha256[0]) {
+        /* comma separated sha256 digests, hex with or without colons
+           (openssl's form). anything else, such as a second pin cut short
+           by the profile's field, is left out rather than failing the start */
+        const char *p = s->pin_sha256;
+        int first = 1;
+        put(o, ",\"verify\":false,\"server_fingerprints\":[");
+        while (*p) {
+            char hex[65];
+            size_t n = 0;
+            int bad = 0;
+            for (; *p && *p != ','; ++p) {
+                if (*p == ':' || *p == '-' || *p == ' ') continue;
+                if (!isxdigit((unsigned char)*p) || n == 64) bad = 1;
+                else hex[n++] = *p;
+            }
+            hex[n] = '\0';
+            if (*p == ',') ++p;
+            if (bad || n != 64) continue;
+            if (!first) put(o, ",");
+            put_str(o, hex);
+            first = 0;
+        }
+        put(o, "]");
+    } else {
+        putf(o, ",\"verify\":%s", s->insecure ? "false" : "true");
+    }
+    put(o, "}");
+}
+
 int engine_config_render(const vl_server_t *s, const char *dial_ip,
                          int socks_port, char *out, size_t out_cap) {
     eout_t o;
@@ -257,7 +307,10 @@ int engine_config_render(const vl_server_t *s, const char *dial_ip,
              "\"client_chain\":{", socks_port);
     put_key(&o, "address", address);
     put(&o, ",\"protocol\":");
-    put_security(&o, s);
+    if (s->proto == VL_PROTO_HYSTERIA2)
+        put_hysteria2(&o, s);
+    else
+        put_security(&o, s);
     put(&o, "}}]}]\n");
     return o.failed ? -1 : 0;
 }

@@ -203,6 +203,84 @@ int main(int argc, char **argv) {
     assert(strcmp(str(p, "cipher"), "2022-blake3-chacha20-ietf-poly1305") == 0);
     cJSON_Delete(root);
 
+    /* hysteria2: its own quic connection, tls beside the protocol */
+    root = render("hysteria2://secret@example.com:8449?sni=cdn.example.com#hy",
+                  "203.0.113.7", json, sizeof json);
+    chain = chain_of(root);
+    assert(strcmp(str(chain, "address"), "203.0.113.7:8449") == 0);
+    assert(strcmp(str(chain, "transport"), "quic") == 0);
+    p = inner(chain);
+    assert(strcmp(str(p, "type"), "hysteria2") == 0);
+    assert(strcmp(str(p, "password"), "secret") == 0);
+    assert(cJSON_GetObjectItem(p, "salamander_password") == NULL);
+    {
+        const cJSON *q = cJSON_GetObjectItem(chain, "quic_settings");
+        const cJSON *alpn = cJSON_GetObjectItem(q, "alpn_protocols");
+        assert(strcmp(str(q, "sni_hostname"), "cdn.example.com") == 0);
+        assert(cJSON_IsTrue(cJSON_GetObjectItem(q, "verify")));
+        assert(cJSON_GetArraySize(alpn) == 1);
+        assert(strcmp(cJSON_GetArrayItem(alpn, 0)->valuestring, "h3") == 0);
+        assert(cJSON_GetObjectItem(q, "server_fingerprints") == NULL);
+    }
+    cJSON_Delete(root);
+
+    /* salamander, a hop list (the first port is dialed) and a pinned
+       certificate in openssl's colon form; a pin is trusted on its own */
+    root = render("hy2://secret@example.com:20000-20010,443?obfs=salamander"
+                  "&obfs-password=mask&pinSHA256="
+                  "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:"
+                  "AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89",
+                  "2001:db8::7", json, sizeof json);
+    chain = chain_of(root);
+    assert(strcmp(str(chain, "address"), "[2001:db8::7]:20000") == 0);
+    p = inner(chain);
+    assert(strcmp(str(p, "salamander_password"), "mask") == 0);
+    {
+        const cJSON *q = cJSON_GetObjectItem(chain, "quic_settings");
+        const cJSON *pins = cJSON_GetObjectItem(q, "server_fingerprints");
+        assert(strcmp(str(q, "sni_hostname"), "example.com") == 0);
+        assert(cJSON_IsFalse(cJSON_GetObjectItem(q, "verify")));
+        assert(cJSON_GetArraySize(pins) == 1);
+        assert(strcmp(cJSON_GetArrayItem(pins, 0)->valuestring,
+                      "ABCDEF0123456789ABCDEF0123456789"
+                      "ABCDEF0123456789ABCDEF0123456789") == 0);
+    }
+    cJSON_Delete(root);
+
+    /* two pins overflow the profile's field: the whole first one is kept,
+       the cut second one is dropped */
+    root = render("hysteria2://secret@example.com:443?pinSHA256="
+                  "0000000000000000000000000000000000000000000000000000000000000001,"
+                  "0000000000000000000000000000000000000000000000000000000000000002",
+                  "203.0.113.7", json, sizeof json);
+    {
+        const cJSON *pins = cJSON_GetObjectItem(
+            cJSON_GetObjectItem(chain_of(root), "quic_settings"), "server_fingerprints");
+        assert(cJSON_GetArraySize(pins) == 1);
+        assert(strcmp(cJSON_GetArrayItem(pins, 0)->valuestring,
+                      "0000000000000000000000000000000000000000000000000000000000000001") == 0);
+    }
+    cJSON_Delete(root);
+
+    /* insecure without a pin turns verification off */
+    root = render("hysteria2://secret@example.com:443?insecure=1",
+                  "203.0.113.7", json, sizeof json);
+    assert(cJSON_IsFalse(cJSON_GetObjectItem(
+        cJSON_GetObjectItem(chain_of(root), "quic_settings"), "verify")));
+    cJSON_Delete(root);
+
+    /* an obfuscation the engine's client does not know stays off it */
+    {
+        vl_server_t server;
+        parse("hysteria2://secret@example.com:443", &server);
+        snprintf(server.obfs, sizeof server.obfs, "gecko");
+        snprintf(server.obfs_password, sizeof server.obfs_password, "mask");
+        assert(!engine_config_supports(&server));
+        snprintf(server.obfs, sizeof server.obfs, "salamander");
+        server.obfs_password[0] = '\0';
+        assert(!engine_config_supports(&server));
+    }
+
     /* what stays on the c core */
     unsupported("vless://11111111-1111-4111-8111-111111111111@example.com:443"
                 "?type=grpc&security=tls&serviceName=senko");
@@ -213,7 +291,6 @@ int main(int argc, char **argv) {
     unsupported("vless://11111111-1111-4111-8111-111111111111@example.com:443"
                 "?type=tcp&security=reality&sni=cdn.example.com");
     unsupported("ss://cmM0LW1kNTpzZWNyZXQ@example.com:8388");
-    unsupported("hysteria2://secret@example.com:443?sni=example.com");
     unsupported("socks5://user:pass@example.com:1080");
 
     /* a buffer too small fails instead of writing a cut config */
