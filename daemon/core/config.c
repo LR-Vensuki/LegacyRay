@@ -4,6 +4,7 @@
 #include "profiles.h"
 #include "third_party/cJSON.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -415,7 +416,62 @@ static int j_range(const cJSON *v, uint32_t *lo, uint32_t *hi) {
 /* the xhttp knobs a server holds its clients to. xray reads them both at the
    top of xhttpSettings and inside its "extra", which is also what a share
    link carries. a zero upper bound is xray's "use the default" */
+/* a value xray accepts for the knob, copied when it is one of them */
+static void j_choice(const cJSON *o, const char *key, const char *const *allowed,
+                     char *dst, size_t cap) {
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, key);
+    if (!cJSON_IsString(v) || !v->valuestring) return;
+    for (int i = 0; allowed[i]; ++i) {
+        if (strcmp(v->valuestring, allowed[i]) == 0 && strlen(allowed[i]) < cap) {
+            snprintf(dst, cap, "%s", allowed[i]);
+            return;
+        }
+    }
+}
+
+/* a header, cookie or query key: http token characters only, so it goes
+   into a request, a share link and the engine's config as it is */
+static void j_token(const cJSON *o, const char *key, char *dst, size_t cap) {
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(o, key);
+    const char *p;
+    if (!cJSON_IsString(v) || !v->valuestring || !v->valuestring[0] ||
+        strlen(v->valuestring) >= cap)
+        return;
+    for (p = v->valuestring; *p; ++p) {
+        unsigned char c = (unsigned char)*p;
+        if (!isalnum(c) && c != '-' && c != '_' && c != '.') return;
+    }
+    snprintf(dst, cap, "%s", v->valuestring);
+}
+
+int cfg_xh_same(const vl_server_t *a, const vl_server_t *b) {
+    return a->xh_pad_min == b->xh_pad_min && a->xh_pad_max == b->xh_pad_max
+        && a->xh_post_max == b->xh_post_max && a->xh_no_grpc == b->xh_no_grpc
+        && strcmp(a->xh_method, b->xh_method) == 0
+        && strcmp(a->xh_data_place, b->xh_data_place) == 0
+        && strcmp(a->xh_data_key, b->xh_data_key) == 0
+        && a->xh_chunk_min == b->xh_chunk_min && a->xh_chunk_max == b->xh_chunk_max
+        && strcmp(a->xh_sess_place, b->xh_sess_place) == 0
+        && strcmp(a->xh_sess_key, b->xh_sess_key) == 0
+        && strcmp(a->xh_seq_place, b->xh_seq_place) == 0
+        && strcmp(a->xh_seq_key, b->xh_seq_key) == 0
+        && a->xh_pad_obfs == b->xh_pad_obfs
+        && strcmp(a->xh_pad_place, b->xh_pad_place) == 0
+        && strcmp(a->xh_pad_key, b->xh_pad_key) == 0
+        && strcmp(a->xh_pad_header, b->xh_pad_header) == 0
+        && a->xh_gap_min == b->xh_gap_min && a->xh_gap_max == b->xh_gap_max;
+}
+
+int cfg_xh_custom(const vl_server_t *s) {
+    vl_server_t plain;
+    memset(&plain, 0, sizeof plain);
+    return !cfg_xh_same(s, &plain);
+}
+
 static void xh_extra_apply(vl_server_t *s, const cJSON *o) {
+    static const char *const data_places[] = { "body", "auto", "header", "cookie", NULL };
+    static const char *const meta_places[] = { "path", "query", "header", "cookie", NULL };
+    static const char *const pad_places[] = { "queryInHeader", "header", "query", "cookie", NULL };
     uint32_t lo, hi;
     const cJSON *v;
     if (!cJSON_IsObject(o)) return;
@@ -429,6 +485,40 @@ static void xh_extra_apply(vl_server_t *s, const cJSON *o) {
         s->xh_post_max = lo; /* a post at the low end passes any check the server makes */
     v = cJSON_GetObjectItemCaseSensitive(o, "noGRPCHeader");
     if (cJSON_IsBool(v)) s->xh_no_grpc = cJSON_IsTrue(v) ? 1 : 0;
+
+    v = cJSON_GetObjectItemCaseSensitive(o, "uplinkHTTPMethod");
+    if (cJSON_IsString(v) && v->valuestring && v->valuestring[0] &&
+        strlen(v->valuestring) < sizeof s->xh_method) {
+        char method[sizeof s->xh_method];
+        size_t i;
+        for (i = 0; v->valuestring[i]; ++i) {
+            if (!isalpha((unsigned char)v->valuestring[i])) break;
+            method[i] = (char)toupper((unsigned char)v->valuestring[i]);
+        }
+        method[i] = '\0';
+        if (!v->valuestring[i]) snprintf(s->xh_method, sizeof s->xh_method, "%s", method);
+    }
+    j_choice(o, "uplinkDataPlacement", data_places, s->xh_data_place, sizeof s->xh_data_place);
+    j_token(o, "uplinkDataKey", s->xh_data_key, sizeof s->xh_data_key);
+    if (j_range(cJSON_GetObjectItemCaseSensitive(o, "uplinkChunkSize"), &lo, &hi) == 0 &&
+        hi > 0) {
+        s->xh_chunk_min = lo;
+        s->xh_chunk_max = hi;
+    }
+    j_choice(o, "sessionIDPlacement", meta_places, s->xh_sess_place, sizeof s->xh_sess_place);
+    j_token(o, "sessionIDKey", s->xh_sess_key, sizeof s->xh_sess_key);
+    j_choice(o, "seqPlacement", meta_places, s->xh_seq_place, sizeof s->xh_seq_place);
+    j_token(o, "seqKey", s->xh_seq_key, sizeof s->xh_seq_key);
+    v = cJSON_GetObjectItemCaseSensitive(o, "xPaddingObfsMode");
+    if (cJSON_IsBool(v)) s->xh_pad_obfs = cJSON_IsTrue(v) ? 1 : 0;
+    j_choice(o, "xPaddingPlacement", pad_places, s->xh_pad_place, sizeof s->xh_pad_place);
+    j_token(o, "xPaddingKey", s->xh_pad_key, sizeof s->xh_pad_key);
+    j_token(o, "xPaddingHeader", s->xh_pad_header, sizeof s->xh_pad_header);
+    if (j_range(cJSON_GetObjectItemCaseSensitive(o, "scMinPostsIntervalMs"), &lo, &hi) == 0 &&
+        hi > 0) {
+        s->xh_gap_min = lo;
+        s->xh_gap_max = hi;
+    }
 }
 
 static void apply_link_extra(vl_server_t *s, const char *v, size_t vlen) {

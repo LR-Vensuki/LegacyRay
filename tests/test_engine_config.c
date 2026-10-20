@@ -141,6 +141,35 @@ int main(int argc, char **argv) {
     assert(cJSON_IsTrue(cJSON_GetObjectItem(p, "no_grpc_header")));
     cJSON_Delete(root);
 
+    /* request shaping for fronts that refuse bodies, by the engine's names;
+       data in headers exists only in packet-up, whatever the mode says */
+    root = render("vless://11111111-1111-4111-8111-111111111111@example.com:443"
+                  "?type=xhttp&security=tls&sni=cdn.example.com&path=%2Fxh"
+                  "&extra=%7B%22uplinkDataPlacement%22%3A%22header%22%2C%22uplinkDataKey%22"
+                  "%3A%22X-Up%22%2C%22uplinkChunkSize%22%3A%221000-2000%22%2C"
+                  "%22uplinkHTTPMethod%22%3A%22GET%22%2C%22sessionIDPlacement%22%3A%22query%22"
+                  "%2C%22sessionIDKey%22%3A%22sid%22%2C%22seqPlacement%22%3A%22cookie%22%2C"
+                  "%22xPaddingObfsMode%22%3Atrue%2C%22xPaddingPlacement%22%3A%22queryInHeader"
+                  "%22%2C%22xPaddingHeader%22%3A%22X-Ref%22%2C%22xPaddingKey%22%3A%22q%22%2C"
+                  "%22scMinPostsIntervalMs%22%3A%2210-50%22%7D",
+                  "203.0.113.7", json, sizeof json);
+    p = inner(inner(chain_of(root)));
+    assert(strcmp(str(p, "mode"), "packet-up") == 0);
+    assert(strcmp(str(p, "uplink_data_placement"), "header") == 0);
+    assert(strcmp(str(p, "uplink_data_key"), "X-Up") == 0);
+    assert(strcmp(str(p, "uplink_chunk_size"), "1000-2000") == 0);
+    assert(strcmp(str(p, "uplink_http_method"), "GET") == 0);
+    assert(strcmp(str(p, "session_placement"), "query") == 0);
+    assert(strcmp(str(p, "session_key"), "sid") == 0);
+    assert(strcmp(str(p, "seq_placement"), "cookie") == 0);
+    assert(cJSON_GetObjectItem(p, "seq_key") == NULL);
+    assert(cJSON_IsTrue(cJSON_GetObjectItem(p, "x_padding_obfs_mode")));
+    assert(strcmp(str(p, "x_padding_placement"), "query-in-header") == 0);
+    assert(strcmp(str(p, "x_padding_header"), "X-Ref") == 0);
+    assert(strcmp(str(p, "x_padding_key"), "q") == 0);
+    assert(strcmp(str(p, "sc_min_posts_interval_ms"), "10-50") == 0);
+    cJSON_Delete(root);
+
     /* vless + tls + xhttp: the engine picks the alpn itself (h2 only) */
     root = render("vless://11111111-1111-4111-8111-111111111111@example.com:443"
                   "?type=xhttp&security=tls&sni=cdn.example.com&path=%2Fxh",
@@ -154,6 +183,8 @@ int main(int argc, char **argv) {
     assert(strcmp(str(p, "host"), "cdn.example.com") == 0);
     assert(cJSON_GetObjectItem(p, "x_padding_bytes") == NULL);
     assert(cJSON_GetObjectItem(p, "no_grpc_header") == NULL);
+    assert(cJSON_GetObjectItem(p, "uplink_data_placement") == NULL);
+    assert(cJSON_GetObjectItem(p, "x_padding_obfs_mode") == NULL);
     cJSON_Delete(root);
 
     /* other query parameters of a websocket path stay, early data goes */
