@@ -20,7 +20,7 @@ CORE_SRC = core/vless.c core/b64.c core/config.c core/rules.c core/dns_msg.c cor
            core/socks5_client.c core/http_client.c core/vision.c core/awg_config.c core/awg_handshake.c \
            core/trojan_client.c core/shadowsocks_client.c core/blake2b256.c
 DAEMON_SRC = dialer.c loop.c core/sniff.c pf_natlook.c ctl_server.c daemon_ctl.c storefile.c netwatch.c geo_ctl.c settings.c status.c \
-             routing.c routing_exec.c routing_fwd.c pf_table.c c_backend.c go_config.c go_backend.c \
+             routing.c routing_exec.c routing_fwd.c pf_table.c c_backend.c mac_sysproxy.c go_config.c go_backend.c \
              engine_config.c engine_backend.c \
              awg_utun.c awg_route.c awg_pfroute.c legacy_ios.c proc_detach.c main.c
 
