@@ -687,6 +687,7 @@ sess_status_t session_pump_remote(session_t *s) {
         if (n == TRANSPORT_EOF) {
             fprintf(stderr, "legacyrayd: transport eof in session state=%d queued=%zu\n",
                     (int)s->state, s->to_client_len);
+            if (upstream_handshake_pending(s)) s->upstream_refused = 1;
             fail_pending_socks(s);
             s->state = SESS_CLOSED;
             return SESS_OK;
@@ -694,6 +695,7 @@ sess_status_t session_pump_remote(session_t *s) {
         if (n < 0) {
             fprintf(stderr, "legacyrayd: transport read error in session state=%d rc=%d\n",
                     (int)s->state, n);
+            if (upstream_handshake_pending(s)) s->upstream_refused = 1;
             fail_pending_socks(s);
             s->state = SESS_ERROR;
             return SESS_ERR;
@@ -878,4 +880,38 @@ int session_is_done(const session_t *s) {
     if (s->state == SESS_ERROR) return 1;
     if (s->state == SESS_CLOSED && s->to_client_len == 0) return 1;
     return 0;
+}
+
+int session_upstream_refused(const session_t *s) {
+    return s && s->upstream_refused;
+}
+
+sess_status_t session_restart_upstream(session_t *s, void *th) {
+    if (!s || !th || !s->upstream_refused) return SESS_ERR_ARG;
+/* the handshake bytes still queued were meant for the connection that is
+   gone; only the held client bytes carry over */
+    size_t hold = s->to_remote_hold;
+    memmove(s->to_remote, s->to_remote + s->to_remote_len - hold, hold);
+    s->to_remote_len = hold;
+    s->up_stage_len = 0;
+    s->upstream_refused = 0;
+    s->th = th;
+    s->state = SESS_VLESS_RESP;
+
+    uint8_t req[1024];
+    size_t reqlen = 0;
+    int made;
+    if (s->proto == VL_PROTO_SOCKS5) {
+        s->u.s5c.state = S5C_ST_INIT;
+        made = s5c_make_request(&s->u.s5c, req, sizeof req, &reqlen) == S5C_OK;
+    } else if (s->proto == VL_PROTO_HTTP || s->proto == VL_PROTO_HTTPS) {
+        s->u.hc.state = HC_ST_INIT;
+        s->u.hc.rbuf_len = 0;
+        made = hc_make_request(&s->u.hc, req, sizeof req, &reqlen) == HC_OK;
+    } else {
+        made = 0;
+    }
+    if (!made) { s->state = SESS_ERROR; return SESS_ERR; }
+    push_remote(s, req, reqlen);
+    return s->state == SESS_ERROR ? SESS_ERR : SESS_OK;
 }

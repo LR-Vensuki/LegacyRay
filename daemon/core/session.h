@@ -87,6 +87,8 @@ typedef struct {
 /* a socks5 upstream's reply can arrive in pieces; the start waits here */
     uint8_t        up_stage[300];
     size_t         up_stage_len;
+/* the socks5 or http upstream hung up before it answered */
+    int            upstream_refused;
 
 /* the destination label and the close latch exist in every build: an event line
    with no destination in it names nothing, and 280 bytes a session is a cost
@@ -177,6 +179,14 @@ size_t session_client_room(const session_t *s);
 
 /* close only after errors or a drained remote eof */
 int session_is_done(const session_t *s);
+
+/* 1 when a socks5 or http upstream hung up before it answered. nothing has
+   gone to the destination then, so the request may be sent again */
+int session_upstream_refused(const session_t *s);
+
+/* send the request again over a new transport handle; the client bytes that
+   wait for the upstream's answer are kept */
+sess_status_t session_restart_upstream(session_t *s, void *th);
 
 #ifdef __cplusplus
 }

@@ -62,6 +62,12 @@ static long loop_now_ms(void) {
 /* how long an opener waits on a transport's own handshake (tls and the
    websocket upgrade) before it gives up on that connection and dials again */
 #define LOOP_OPEN_HANDSHAKE_MS 7000
+/* how many times a request the upstream proxy hung up on before answering
+   goes out again. the engine is such an upstream: when a cdn in front of the
+   server fails a websocket upgrade with 502 it closes the socks stream
+   without a reply, and a cdn does that to a share of upgrades */
+#define LOOP_REDIALS 3
+#define LOOP_REDIAL_WAIT_MS 150
 
 /* dead peers are found by the kernel instead of holding a slot forever */
 static void set_keepalive(int fd) {
@@ -156,6 +162,10 @@ static void *open_worker_main(void *arg) {
     loop_conn_t *c = (loop_conn_t *)arg;
     loop_t *lp = c->owner;
     void *th = NULL;
+
+/* the upstream just refused this request: give it a moment */
+    if (c->redialing)
+        usleep((useconds_t)(LOOP_REDIAL_WAIT_MS * 1000 * c->redials));
 
 /* keep retries short */
     for (int attempt = 0; attempt < 3; ++attempt) {
@@ -601,7 +611,10 @@ static void reap_opening_conns(loop_t *lp) {
 
         c->th = th;
         sess_status_t ir;
-        if (c->transparent) {
+        if (c->redialing) {
+            c->redialing = 0;
+            ir = session_restart_upstream(&c->sess, th);
+        } else if (c->transparent) {
             ir = session_init(&c->sess, c->open_vt, th, c->open_proto,
                               c->open_proto == VL_PROTO_VLESS ? c->open_uuid : NULL,
                               c->open_flow[0] ? c->open_flow : NULL,
@@ -819,6 +832,33 @@ static void discard_conn(loop_conn_t *c) {
     if (c->local_fd >= 0) close(c->local_fd);
     if (c->remote_fd >= 0) close(c->remote_fd);
     clear_conn_slot(c);
+}
+
+/* the upstream proxy hung up before it answered, so nothing reached the
+   site yet: the session keeps the request and the client's bytes, and a
+   worker opens a new connection for them. -1 leaves the conn as it was */
+static int redial_conn(loop_t *lp, loop_conn_t *c) {
+    if (!session_upstream_refused(&c->sess) || c->redials >= LOOP_REDIALS)
+        return -1;
+    if (c->th && c->open_vt) c->open_vt->close(c->th);
+    c->th = NULL;
+    c->sess.th = NULL;
+    if (c->remote_fd >= 0) close(c->remote_fd);
+    c->remote_fd = -1;
+    c->redials++;
+    c->redialing = 1;
+/* the client's socks exchange is over whoever answered it; what it sends
+   while the worker opens is payload, not a request to parse */
+    c->socks_greet_done = 1;
+    c->socks_req_done = 1;
+    if (lp->nconns > 0) lp->nconns--;
+    fprintf(stderr, "legacyrayd: upstream closed before its reply, dialing again (%d)\n",
+            c->redials);
+    if (begin_open(lp, c) != 0) {
+        session_trace_close(&c->sess, "redial");
+        discard_conn(c);
+    }
+    return 0;
 }
 
 static void route_log(const loop_conn_t *c, const char *host, loop_route_t r) {
@@ -1146,6 +1186,7 @@ static void service_conn(loop_t *lp, loop_conn_t *c,
 /* pump remote output when it is ready */
     if (remote_re & (POLLIN | POLLOUT | POLLHUP | POLLERR)) {
         session_pump_remote(&c->sess);
+        if (redial_conn(lp, c) == 0) return;
     }
     if (c->prebuf_len > 0 && feed_backlog(c) != 0) {
         drop_conn(lp, c);
@@ -1203,6 +1244,7 @@ static void service_conn(loop_t *lp, loop_conn_t *c,
         drop_conn(lp, c);
         return;
     }
+    if (redial_conn(lp, c) == 0) return;
 
     /* close only after the session and pending output are done */
     if (session_is_done(&c->sess) && c->pend_off >= c->pend_len) {

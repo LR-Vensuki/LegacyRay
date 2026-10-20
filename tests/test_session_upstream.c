@@ -5,6 +5,7 @@
 #include "transport.h"
 
 #include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -125,6 +126,125 @@ static void test_http_upstream_holds_client_bytes(void) {
     free(s);
 }
 
+/* the engine closes a socks stream without a reply when its own connection
+   upstream fails; the session says the request may go out again, and on a
+   new connection it sends the handshake once more and only then the bytes
+   the client sent meanwhile */
+static void test_socks5_upstream_refused_restart(void) {
+    int sv[2], sv2[2];
+    uint8_t got[4096];
+    size_t n, consumed = 0;
+    session_t *s = calloc(1, sizeof *s);
+    static const uint8_t request[] = { 0x05, 0x01, 0x00, 0x03, 11, 'e', 'x', 'a', 'm', 'p',
+                                       'l', 'e', '.', 'c', 'o', 'm', 0x01, 0xbb };
+    uint8_t first[sizeof request + 5];
+
+    ok("alloc refused", s != NULL);
+    ok("pair refused", socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    nonblock(sv[0]);
+    nonblock(sv[1]);
+    void *th = transport_tcp.open(sv[0], NULL);
+    ok("session refused", session_init_after_greet(s, &transport_tcp, th, VL_PROTO_SOCKS5,
+                                                   NULL, NULL, NULL, NULL) == SESS_OK);
+    memcpy(first, request, sizeof request);
+    memcpy(first + sizeof request, "hello", 5);
+    ok("feed refused", session_feed_client(s, first, sizeof first, &consumed) == SESS_OK &&
+                       consumed == sizeof first);
+    n = drain(sv[1], got, sizeof got);
+    ok("greeting out", n == 3);
+    ok("method reply refused", write(sv[1], "\x05\x00", 2) == 2);
+    ok("pump to request", session_pump_remote(s) == SESS_OK);
+    n = drain(sv[1], got, sizeof got);
+    ok("request out", n == sizeof request);
+    ok("not refused while waiting", !session_upstream_refused(s));
+
+    close(sv[1]); /* the engine gives up without a reply */
+    session_pump_remote(s);
+    ok("refused", session_upstream_refused(s));
+    ok("restart needs a handle", session_restart_upstream(s, NULL) == SESS_ERR_ARG);
+
+    ok("pair again", socketpair(AF_UNIX, SOCK_STREAM, 0, sv2) == 0);
+    nonblock(sv2[0]);
+    nonblock(sv2[1]);
+    void *th2 = transport_tcp.open(sv2[0], NULL);
+    ok("restart", session_restart_upstream(s, th2) == SESS_OK);
+    ok("waiting again", s->state == SESS_VLESS_RESP && !session_upstream_refused(s));
+    n = drain(sv2[1], got, sizeof got);
+    ok("greeting again, alone", n == 3 && got[0] == 0x05);
+    ok("more while waiting", session_feed_client(s, (const uint8_t *)"more", 4, &consumed) ==
+                             SESS_OK && consumed == 4);
+    ok("method reply again", write(sv2[1], "\x05\x00", 2) == 2);
+    ok("pump again", session_pump_remote(s) == SESS_OK);
+    n = drain(sv2[1], got, sizeof got);
+    ok("request again, alone", n == sizeof request && memcmp(got, request, n) == 0);
+    ok("connect reply again", write(sv2[1], "\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00", 10) == 10);
+    ok("pump relay again", session_pump_remote(s) == SESS_OK && s->state == SESS_RELAY);
+    n = drain(sv2[1], got, sizeof got);
+    ok("the held bytes, once and in order", n == 9 && memcmp(got, "hellomore", 9) == 0);
+
+    /* an eof once the relay runs is the site's answer, not a refusal */
+    close(sv2[1]);
+    session_pump_remote(s);
+    ok("eof in relay is not a refusal", !session_upstream_refused(s) && s->state == SESS_CLOSED);
+    ok("no restart after relay", session_restart_upstream(s, th2) == SESS_ERR_ARG);
+
+    transport_tcp.close(th);
+    transport_tcp.close(th2);
+    close(sv[0]);
+    close(sv2[0]);
+    free(s);
+}
+
+/* the same for an http connect upstream that hangs up before its status line */
+static void test_http_upstream_refused_restart(void) {
+    int sv[2], sv2[2];
+    uint8_t got[4096];
+    size_t n, consumed = 0;
+    session_t *s = calloc(1, sizeof *s);
+    static const uint8_t request[] = { 0x05, 0x01, 0x00, 0x01, 192, 0, 2, 1, 0x01, 0xbb };
+    uint8_t first[sizeof request + 5];
+
+    ok("alloc http refused", s != NULL);
+    ok("pair http refused", socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    nonblock(sv[0]);
+    nonblock(sv[1]);
+    void *th = transport_tcp.open(sv[0], NULL);
+    ok("session http refused", session_init_after_greet(s, &transport_tcp, th, VL_PROTO_HTTP,
+                                                        NULL, NULL, NULL, NULL) == SESS_OK);
+    memcpy(first, request, sizeof request);
+    memcpy(first + sizeof request, "hello", 5);
+    ok("feed http refused", session_feed_client(s, first, sizeof first, &consumed) == SESS_OK);
+    (void)drain(sv[1], got, sizeof got);
+    ok("half a status line", write(sv[1], "HTTP/1.1 2", 10) == 10);
+    session_pump_remote(s);
+    close(sv[1]);
+    session_pump_remote(s);
+    ok("http refused", session_upstream_refused(s));
+
+    ok("pair http again", socketpair(AF_UNIX, SOCK_STREAM, 0, sv2) == 0);
+    nonblock(sv2[0]);
+    nonblock(sv2[1]);
+    void *th2 = transport_tcp.open(sv2[0], NULL);
+    ok("http restart", session_restart_upstream(s, th2) == SESS_OK);
+    n = drain(sv2[1], got, sizeof got);
+    got[n < sizeof got ? n : sizeof got - 1] = 0;
+    ok("connect again, without the client bytes",
+       n > 0 && strncmp((char *)got, "CONNECT 192.0.2.1:443", 21) == 0 &&
+       strstr((char *)got, "hello") == NULL);
+    static const char reply[] = "HTTP/1.1 200 Connection established\r\n\r\n";
+    ok("http reply again", write(sv2[1], reply, sizeof reply - 1) == (ssize_t)(sizeof reply - 1));
+    ok("pump http again", session_pump_remote(s) == SESS_OK && s->state == SESS_RELAY);
+    n = drain(sv2[1], got, sizeof got);
+    ok("then the client bytes after a restart", n == 5 && memcmp(got, "hello", 5) == 0);
+
+    transport_tcp.close(th);
+    transport_tcp.close(th2);
+    close(sv[0]);
+    close(sv2[0]);
+    close(sv2[1]);
+    free(s);
+}
+
 /* a session whose remote queue is full says so, so the loop stops reading */
 static void test_client_room(void) {
     session_t *s = calloc(1, sizeof *s);
@@ -235,9 +355,12 @@ static void test_transparent_trojan(void) {
 }
 
 int main(void) {
+    signal(SIGPIPE, SIG_IGN); /* the daemon ignores it too */
     test_socks5_ipv6_address_type();
     test_socks5_upstream_holds_client_bytes();
     test_http_upstream_holds_client_bytes();
+    test_socks5_upstream_refused_restart();
+    test_http_upstream_refused_restart();
     test_client_room();
     test_transparent_socks5_upstream();
     test_transparent_trojan();
