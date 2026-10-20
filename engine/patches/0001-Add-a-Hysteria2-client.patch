@@ -1,0 +1,918 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 16:12:39 +0000
+Subject: [PATCH 1/2] Add a Hysteria2 client
+
+A hop-0 client for apernet's Hysteria2: one QUIC connection per server,
+authenticated with the HTTP/3 POST to /auth (status 233), and one
+bidirectional stream per TCP connection (0x401 request, status reply).
+Optional Salamander obfuscation wraps the UDP socket. A dead connection
+is noticed when a new stream gets no datagram back and is replaced once.
+UDP relaying is not implemented.
+---
+ Cargo.lock                            |   1 +
+ Cargo.toml                            |   1 +
+ src/client_proxy_chain.rs             |  22 +-
+ src/config/types/client.rs            |  16 +
+ src/config/validate.rs                |   6 +
+ src/hysteria2_client.rs               | 638 ++++++++++++++++++++++++++
+ src/lib.rs                            |   1 +
+ src/main.rs                           |   1 +
+ src/tcp/chain_builder.rs              |  12 +-
+ src/tcp/tcp_client_handler_factory.rs |   6 +
+ 10 files changed, 698 insertions(+), 6 deletions(-)
+ create mode 100644 src/hysteria2_client.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 3305173..09a0ae6 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2540,6 +2540,7 @@ dependencies = [
+  "async-trait",
+  "aws-lc-rs",
+  "base64 0.23.1",
++ "blake2",
+  "blake3",
+  "bytes",
+  "chrono",
+diff --git a/Cargo.toml b/Cargo.toml
+index bb33886..9ebea6e 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -93,6 +93,7 @@ async-trait = "*"
+ aws-lc-rs = { version = "*", default-features = false }
+ base64 = "*"
+ blake3 = "*"
++blake2 = "0.10"
+ bytes = "*"
+ chrono = "*"
+ dashmap = "*"
+diff --git a/src/client_proxy_chain.rs b/src/client_proxy_chain.rs
+index af09fde..f19fec7 100644
+--- a/src/client_proxy_chain.rs
++++ b/src/client_proxy_chain.rs
+@@ -41,6 +41,9 @@ pub enum InitialHopEntry {
+     /// Connects directly to the next hop's proxy or final destination.
+     Direct(Arc<dyn SocketConnector>),
+     Wireguard(Arc<dyn SocketConnector>),
++    /// A protocol that is its own transport (Hysteria2): it opens streams to
++    /// the next target itself, and carries no UDP.
++    Tunnel(Arc<dyn SocketConnector>),
+ 
+     /// Proxy connection - socket + protocol setup paired together.
+     /// Socket connects to proxy_location, then protocol wraps the stream.
+@@ -55,6 +58,7 @@ impl std::fmt::Debug for InitialHopEntry {
+         match self {
+             InitialHopEntry::Direct(socket) => f.debug_tuple("Direct").field(socket).finish(),
+             InitialHopEntry::Wireguard(socket) => f.debug_tuple("Wireguard").field(socket).finish(),
++            InitialHopEntry::Tunnel(socket) => f.debug_tuple("Tunnel").field(socket).finish(),
+             InitialHopEntry::Proxy { socket, proxy } => f
+                 .debug_struct("Proxy")
+                 .field("socket", socket)
+@@ -69,6 +73,7 @@ impl InitialHopEntry {
+     pub fn supports_udp(&self) -> bool {
+         match self {
+             InitialHopEntry::Direct(_) | InitialHopEntry::Wireguard(_) => true,
++            InitialHopEntry::Tunnel(_) => false,
+             InitialHopEntry::Proxy { proxy, .. } => proxy.supports_udp_over_tcp(),
+         }
+     }
+@@ -159,6 +164,7 @@ impl ClientProxyChain {
+             socket: match self.initial_hop[initial_index].as_ref() {
+                 InitialHopEntry::Direct(socket)
+                 | InitialHopEntry::Wireguard(socket)
++                | InitialHopEntry::Tunnel(socket)
+                 | InitialHopEntry::Proxy { socket, .. } => socket.clone(),
+             },
+             initial: Some(self.initial_hop[initial_index].clone()),
+@@ -259,7 +265,9 @@ impl ClientProxyChain {
+             .first()
+             .and_then(|entry| match entry.as_ref() {
+                 InitialHopEntry::Direct(socket) => socket.bind_interface(),
+-                InitialHopEntry::Proxy { .. } | InitialHopEntry::Wireguard(_) => None,
++                InitialHopEntry::Proxy { .. }
++                | InitialHopEntry::Wireguard(_)
++                | InitialHopEntry::Tunnel(_) => None,
+             })
+     }
+ 
+@@ -322,7 +330,9 @@ impl ClientProxyChain {
+ 
+         // Connect based on initial hop type
+         let mut result = match entry {
+-            InitialHopEntry::Direct(socket) | InitialHopEntry::Wireguard(socket) => {
++            InitialHopEntry::Direct(socket)
++            | InitialHopEntry::Wireguard(socket)
++            | InitialHopEntry::Tunnel(socket) => {
+                 // Socket connects to first subsequent proxy (or final target)
+                 debug!(
+                     "Initial hop: {entry:?} -> {}",
+@@ -449,7 +459,9 @@ impl ClientProxyChain {
+             );
+ 
+             match entry {
+-                InitialHopEntry::Direct(socket) | InitialHopEntry::Wireguard(socket) => {
++                InitialHopEntry::Direct(socket)
++                | InitialHopEntry::Wireguard(socket)
++                | InitialHopEntry::Tunnel(socket) => {
+                     debug!("Chain UDP: {entry:?}");
+                     socket.connect_udp_bidirectional(resolver, target).await
+                 }
+@@ -503,7 +515,9 @@ impl ClientProxyChain {
+ 
+             // Build the chain: initial -> intermediates -> final (UDP)
+             match entry {
+-                InitialHopEntry::Direct(socket) | InitialHopEntry::Wireguard(socket) => {
++                InitialHopEntry::Direct(socket)
++                | InitialHopEntry::Wireguard(socket)
++                | InitialHopEntry::Tunnel(socket) => {
+                     // Determine first target after initial hop
+                     let first_target: ResolvedLocation =
+                         if let Some(first) = intermediate_proxies.first() {
+diff --git a/src/config/types/client.rs b/src/config/types/client.rs
+index 56bab9a..421b7ed 100644
+--- a/src/config/types/client.rs
++++ b/src/config/types/client.rs
+@@ -343,6 +343,8 @@ impl<'de> Deserialize<'de> for ClientConfig {
+         let transport = fields.transport.unwrap_or_else(|| {
+             if fields.protocol.is_wireguard() {
+                 Transport::Udp
++            } else if fields.protocol.is_hysteria2() {
++                Transport::Quic
+             } else {
+                 Transport::Tcp
+             }
+@@ -539,6 +541,15 @@ pub enum ClientProxyConfig {
+         #[serde(default, skip_serializing_if = "Option::is_none")]
+         padding_scheme: Option<Vec<String>>,
+     },
++    /// Hysteria2 client. Its QUIC connection to `address` is the transport, so
++    /// it is only valid at hop 0; TLS for it comes from `quic_settings`.
++    #[serde(alias = "hy2")]
++    Hysteria2 {
++        password: String,
++        /// Salamander obfuscation of every UDP datagram, keyed by this password.
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        salamander_password: Option<String>,
++    },
+     /// NaiveProxy client protocol (HTTP/2 CONNECT with padding)
+     #[serde(alias = "naive")]
+     Naiveproxy {
+@@ -561,6 +572,10 @@ impl ClientProxyConfig {
+         matches!(self, ClientProxyConfig::Direct)
+     }
+ 
++    pub fn is_hysteria2(&self) -> bool {
++        matches!(self, Self::Hysteria2 { .. })
++    }
++
+     /// Returns the protocol name for display/error messages
+     pub fn protocol_name(&self) -> &str {
+         match self {
+@@ -581,6 +596,7 @@ impl ClientProxyConfig {
+             ClientProxyConfig::PortForward => "PortForward",
+             ClientProxyConfig::Anytls { .. } => "AnyTLS",
+             ClientProxyConfig::Naiveproxy { .. } => "NaiveProxy",
++            ClientProxyConfig::Hysteria2 { .. } => "Hysteria2",
+         }
+     }
+ }
+diff --git a/src/config/validate.rs b/src/config/validate.rs
+index 19616dd..ffd1ed3 100644
+--- a/src/config/validate.rs
++++ b/src/config/validate.rs
+@@ -1259,6 +1259,12 @@ fn validate_client_config(
+             }
+         }
+     }
++    if client_config.protocol.is_hysteria2() && client_config.transport != Transport::Quic {
++        return Err(std::io::Error::new(
++            std::io::ErrorKind::InvalidInput,
++            "Hysteria2 requires QUIC transport",
++        ));
++    }
+     if client_config.transport != Transport::Tcp && client_config.tcp_settings.is_some() {
+         return Err(std::io::Error::new(
+             std::io::ErrorKind::InvalidInput,
+diff --git a/src/hysteria2_client.rs b/src/hysteria2_client.rs
+new file mode 100644
+index 0000000..f93a972
+--- /dev/null
++++ b/src/hysteria2_client.rs
+@@ -0,0 +1,638 @@
++//! Hysteria2 client (apernet/hysteria, core/internal/protocol).
++//!
++//! One QUIC connection per server is authenticated once over HTTP/3 and then
++//! carries every TCP connection as a bidirectional stream that opens with a
++//! TCPRequest frame. Salamander, when configured, masks each UDP datagram of
++//! that connection.
++
++use std::fmt;
++use std::io::{self, IoSliceMut};
++use std::net::SocketAddr;
++use std::pin::Pin;
++use std::sync::Arc;
++use std::task::{Context, Poll, ready};
++use std::time::Duration;
++
++use async_trait::async_trait;
++use blake2::digest::consts::U32;
++use blake2::{Blake2b, Digest};
++use log::debug;
++use quinn::udp::{RecvMeta, Transmit};
++use quinn::{AsyncUdpSocket, UdpPoller};
++use rand::RngExt;
++use tokio::io::AsyncReadExt;
++use tokio_util::task::AbortOnDropHandle;
++
++use crate::address::{Address, NetLocation, ResolvedLocation};
++use crate::async_stream::{AsyncMessageStream, AsyncStream};
++use crate::config::{ClientConfig, ClientProxyConfig, GlobalLimits};
++use crate::quic_stream::QuicStream;
++use crate::resolver::Resolver;
++use crate::tcp::socket_connector::SocketConnector;
++
++const FRAME_TYPE_TCP_REQUEST: u64 = 0x401;
++const STATUS_AUTH_OK: u16 = 233;
++const MAX_MESSAGE_LENGTH: u64 = 2048;
++const MAX_PADDING_LENGTH: u64 = 4096;
++// HTTP/3 H3_GENERAL_PROTOCOL_ERROR, what the reference client closes with
++const CLOSE_PROTOCOL_ERROR: u32 = 0x101;
++const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
++const LIVENESS_WAIT: Duration = Duration::from_secs(2);
++const PADDING_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
++const SALT_LEN: usize = 8;
++
++pub struct Connector {
++    server: NetLocation,
++    server_name: String,
++    password: String,
++    salamander: Option<Arc<[u8]>>,
++    client_config: quinn::ClientConfig,
++    memory_bytes: usize,
++    bind_interface: Option<String>,
++    session: tokio::sync::Mutex<Option<Session>>,
++}
++
++impl fmt::Debug for Connector {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("Hysteria2")
++            .field("server", &self.server)
++            .finish()
++    }
++}
++
++struct Session {
++    connection: quinn::Connection,
++    _endpoint: quinn::Endpoint,
++    // serves the server's HTTP/3 control streams and holds the request sender,
++    // whose drop would close the connection
++    _h3: AbortOnDropHandle<()>,
++}
++
++impl Connector {
++    pub fn from_config(config: &ClientConfig, limits: GlobalLimits) -> io::Result<Self> {
++        let ClientProxyConfig::Hysteria2 {
++            password,
++            salamander_password,
++        } = &config.protocol
++        else {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidInput,
++                "not a Hysteria2 client config",
++            ));
++        };
++        let crate::config::ClientQuicConfig {
++            key_exchange_groups,
++            verify,
++            server_fingerprints,
++            sni_hostname,
++            alpn_protocols,
++            key,
++            cert,
++        } = config.quic_settings.clone().unwrap_or_default();
++
++        let sni = if sni_hostname.is_unspecified() {
++            config.address.address().hostname().map(ToString::to_string)
++        } else {
++            sni_hostname.into_option()
++        };
++        let alpn = if alpn_protocols.is_unspecified() {
++            vec!["h3".to_owned()]
++        } else {
++            alpn_protocols.into_vec()
++        };
++        let tls = crate::rustls_config_util::try_create_client_config(
++            verify,
++            server_fingerprints.into_vec(),
++            alpn,
++            sni.is_some(),
++            key.zip(cert)
++                .map(|(key, cert)| (key.into_bytes(), cert.into_bytes())),
++            false,
++            &key_exchange_groups,
++        )?;
++        let rustls::SupportedCipherSuite::Tls13(suite) =
++            rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256
++        else {
++            return Err(io::Error::other("TLS 1.3 cipher suite unavailable"));
++        };
++        let crypto = quinn::crypto::rustls::QuicClientConfig::with_initial(
++            Arc::new(tls),
++            suite
++                .quic_suite()
++                .ok_or_else(|| io::Error::other("no QUIC suite"))?,
++        )
++        .map_err(io::Error::other)?;
++
++        let mut transport = quinn::TransportConfig::default();
++        let memory_bytes =
++            crate::resources::configure_quic_transport_with_limits(&mut transport, limits);
++        transport
++            // the server opens no streams of its own but HTTP/3's control and QPACK ones
++            .max_concurrent_bidi_streams(0_u32.into())
++            .max_concurrent_uni_streams(16_u32.into())
++            .keep_alive_interval(Some(Duration::from_secs(10)))
++            .max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()))
++            .datagram_receive_buffer_size(None);
++        if salamander_password.is_some() {
++            // every datagram grows by its salt
++            let mut mtu = quinn::MtuDiscoveryConfig::default();
++            mtu.upper_bound(1452 - SALT_LEN as u16);
++            transport.mtu_discovery_config(Some(mtu));
++        }
++        let mut client_config = quinn::ClientConfig::new(Arc::new(crypto));
++        client_config.transport_config(Arc::new(transport));
++
++        let server_name = sni.unwrap_or_else(|| match config.address.address() {
++            Address::Hostname(host) => host.clone(),
++            address => address.to_string(),
++        });
++        Ok(Self {
++            server: config.address.clone(),
++            server_name,
++            password: password.clone(),
++            salamander: salamander_password
++                .as_ref()
++                .map(|key| Arc::from(key.as_bytes())),
++            client_config,
++            memory_bytes,
++            bind_interface: config.bind_interface.clone().into_option(),
++            session: tokio::sync::Mutex::new(None),
++        })
++    }
++
++    /// The authenticated connection, established once and shared by every stream.
++    async fn connection(&self, resolver: &Arc<dyn Resolver>) -> io::Result<quinn::Connection> {
++        let mut session = self.session.lock().await;
++        if let Some(current) = session.as_ref()
++            && current.connection.close_reason().is_none()
++        {
++            return Ok(current.connection.clone());
++        }
++        *session = None;
++        let fresh = self.establish(resolver).await?;
++        let connection = fresh.connection.clone();
++        *session = Some(fresh);
++        Ok(connection)
++    }
++
++    async fn forget(&self, connection: &quinn::Connection) {
++        let mut session = self.session.lock().await;
++        if session
++            .as_ref()
++            .is_some_and(|current| current.connection.stable_id() == connection.stable_id())
++        {
++            *session = None;
++        }
++    }
++
++    async fn establish(&self, resolver: &Arc<dyn Resolver>) -> io::Result<Session> {
++        let addresses = crate::resolver::resolve_addresses(resolver, &self.server).await?;
++        let mut last_error = io::Error::other("no address for the Hysteria2 server");
++        for address in addresses {
++            match tokio::time::timeout(HANDSHAKE_TIMEOUT, self.establish_at(address)).await {
++                Ok(Ok(session)) => return Ok(session),
++                Ok(Err(error)) => last_error = error,
++                Err(_) => {
++                    last_error =
++                        io::Error::new(io::ErrorKind::TimedOut, "Hysteria2 handshake timed out")
++                }
++            }
++            debug!("Hysteria2 connection to {address} failed: {last_error}");
++        }
++        Err(last_error)
++    }
++
++    async fn establish_at(&self, address: SocketAddr) -> io::Result<Session> {
++        let socket =
++            crate::socket_util::new_udp_socket(address.is_ipv6(), self.bind_interface.clone())?
++                .into_std()?;
++        let memory = crate::resources::try_quic_memory(self.memory_bytes)
++            .ok_or_else(|| crate::resources::quic_memory_exhausted(self.memory_bytes))?;
++        let mut socket = crate::quic_endpoint::socket_with_memory(socket, memory)?;
++        if let Some(key) = &self.salamander {
++            socket = Arc::new(Salamander {
++                inner: socket,
++                key: key.clone(),
++            });
++        }
++        let endpoint = quinn::Endpoint::new_with_abstract_socket(
++            quinn::EndpointConfig::default(),
++            None,
++            socket,
++            Arc::new(quinn::TokioRuntime),
++        )?;
++        let connection = endpoint
++            .connect_with(self.client_config.clone(), address, &self.server_name)
++            .map_err(io::Error::other)?
++            .await
++            .map_err(io::Error::other)?;
++        match self.authenticate(&connection).await {
++            Ok(h3) => Ok(Session {
++                connection,
++                _endpoint: endpoint,
++                _h3: h3,
++            }),
++            Err(error) => {
++                connection.close(CLOSE_PROTOCOL_ERROR.into(), b"");
++                Err(error)
++            }
++        }
++    }
++
++    async fn authenticate(
++        &self,
++        connection: &quinn::Connection,
++    ) -> io::Result<AbortOnDropHandle<()>> {
++        let (mut driver, mut sender) =
++            h3::client::new(h3_quinn::Connection::new(connection.clone()))
++                .await
++                .map_err(io::Error::other)?;
++        let request = http::Request::post("https://hysteria/auth")
++            .header("Hysteria-Auth", &self.password)
++            // 0: the client does not know its bandwidth, so the server uses its own control
++            .header("Hysteria-CC-RX", "0")
++            .header("Hysteria-Padding", padding(256, 2048))
++            .body(())
++            .map_err(io::Error::other)?;
++        let auth = async {
++            let mut stream = sender
++                .send_request(request)
++                .await
++                .map_err(io::Error::other)?;
++            stream.finish().await.map_err(io::Error::other)?;
++            let response = stream.recv_response().await.map_err(io::Error::other)?;
++            Ok::<_, io::Error>(response.status().as_u16())
++        };
++        let status = tokio::select! {
++            status = auth => status?,
++            error = driver.wait_idle() => {
++                return Err(io::Error::other(format!(
++                    "Hysteria2 connection closed during authentication: {error}"
++                )));
++            }
++        };
++        if status != STATUS_AUTH_OK {
++            return Err(io::Error::new(
++                io::ErrorKind::PermissionDenied,
++                format!("Hysteria2 server refused the password (HTTP {status})"),
++            ));
++        }
++        Ok(AbortOnDropHandle::new(tokio::spawn(async move {
++            let _sender = sender;
++            let _ = driver.wait_idle().await;
++        })))
++    }
++
++    async fn open(connection: &quinn::Connection, address: &str) -> Result<QuicStream, OpenError> {
++        let (mut send, mut recv) = connection
++            .open_bi()
++            .await
++            .map_err(|error| OpenError::Connection(io::Error::other(error)))?;
++        send.write_all(&tcp_request(address))
++            .await
++            .map_err(|error| OpenError::Connection(error.into()))?;
++        read_tcp_response(&mut recv).await?;
++        Ok(QuicStream::from(send, recv))
++    }
++}
++
++impl Connector {
++    /// A server that went away without closing (restarted, or the network
++    /// changed under the client) leaves a connection that looks open until its
++    /// idle timeout. A live server acknowledges the request at once even when
++    /// the target is slow to answer, so silence after it means the connection
++    /// is dead: close it, and the caller dials a fresh one.
++    async fn open_watched(
++        connection: &quinn::Connection,
++        address: &str,
++    ) -> Result<QuicStream, OpenError> {
++        let heard = connection.stats().udp_rx.datagrams;
++        let patience = (connection.rtt() * 4).max(LIVENESS_WAIT);
++        let open = Self::open(connection, address);
++        tokio::pin!(open);
++        tokio::select! {
++            result = &mut open => return result,
++            _ = tokio::time::sleep(patience) => {}
++        }
++        if connection.stats().udp_rx.datagrams == heard {
++            connection.close(CLOSE_PROTOCOL_ERROR.into(), b"");
++            return Err(OpenError::Connection(io::Error::new(
++                io::ErrorKind::TimedOut,
++                "Hysteria2 server stopped answering",
++            )));
++        }
++        open.await
++    }
++}
++
++enum OpenError {
++    /// the connection is gone; a fresh one may carry the request
++    Connection(io::Error),
++    /// the server answered for this request
++    Request(io::Error),
++}
++
++impl From<io::Error> for OpenError {
++    fn from(error: io::Error) -> Self {
++        OpenError::Request(error)
++    }
++}
++
++#[async_trait]
++impl SocketConnector for Connector {
++    async fn connect(
++        &self,
++        resolver: &Arc<dyn Resolver>,
++        target: &ResolvedLocation,
++    ) -> io::Result<Box<dyn AsyncStream>> {
++        let address = wire_address(target.location());
++        let mut retried = false;
++        loop {
++            let connection = self.connection(resolver).await?;
++            match Self::open_watched(&connection, &address).await {
++                Ok(stream) => return Ok(Box::new(stream)),
++                Err(OpenError::Request(error)) => return Err(error),
++                Err(OpenError::Connection(error)) => {
++                    // a connection that died while idle (a network change, the
++                    // server restarting) is only noticed here: dial once more
++                    self.forget(&connection).await;
++                    if retried || connection.close_reason().is_none() {
++                        return Err(error);
++                    }
++                    debug!("Hysteria2 connection lost, reconnecting: {error}");
++                    retried = true;
++                }
++            }
++        }
++    }
++
++    async fn connect_udp_bidirectional(
++        &self,
++        _resolver: &Arc<dyn Resolver>,
++        _target: ResolvedLocation,
++    ) -> io::Result<Box<dyn AsyncMessageStream>> {
++        Err(io::Error::new(
++            io::ErrorKind::Unsupported,
++            "UDP over Hysteria2 is not supported",
++        ))
++    }
++
++    fn bind_interface(&self) -> Option<&str> {
++        self.bind_interface.as_deref()
++    }
++}
++
++fn wire_address(location: &NetLocation) -> String {
++    match location.address() {
++        Address::Ipv6(ip) => format!("[{ip}]:{}", location.port()),
++        _ => location.to_string(),
++    }
++}
++
++/// a printable padding in [min, max), as the reference implementation sends
++fn padding(min: usize, max: usize) -> String {
++    let mut rng = rand::rng();
++    let len = rng.random_range(min..max);
++    (0..len)
++        .map(|_| PADDING_CHARS[rng.random_range(0..PADDING_CHARS.len())] as char)
++        .collect()
++}
++
++fn put_varint(out: &mut Vec<u8>, value: u64) {
++    if value < 1 << 6 {
++        out.push(value as u8);
++    } else if value < 1 << 14 {
++        out.extend_from_slice(&((value as u16) | 0x4000).to_be_bytes());
++    } else if value < 1 << 30 {
++        out.extend_from_slice(&((value as u32) | 0x8000_0000).to_be_bytes());
++    } else {
++        out.extend_from_slice(&(value | 0xc000_0000_0000_0000).to_be_bytes());
++    }
++}
++
++fn tcp_request(address: &str) -> Vec<u8> {
++    let padding = padding(64, 512);
++    let mut out = Vec::with_capacity(16 + address.len() + padding.len());
++    put_varint(&mut out, FRAME_TYPE_TCP_REQUEST);
++    put_varint(&mut out, address.len() as u64);
++    out.extend_from_slice(address.as_bytes());
++    put_varint(&mut out, padding.len() as u64);
++    out.extend_from_slice(padding.as_bytes());
++    out
++}
++
++async fn read_varint(recv: &mut quinn::RecvStream) -> io::Result<u64> {
++    let first = recv.read_u8().await?;
++    let mut value = u64::from(first & 0x3f);
++    for _ in 1..1usize << (first >> 6) {
++        value = (value << 8) | u64::from(recv.read_u8().await?);
++    }
++    Ok(value)
++}
++
++/// status, message and padding; anything but status 0 is the server refusing
++/// to reach the target, with its reason in the message
++async fn read_tcp_response(recv: &mut quinn::RecvStream) -> Result<(), OpenError> {
++    let status = recv.read_u8().await.map_err(OpenError::Connection)?;
++    let message_len = read_varint(recv).await?;
++    if message_len > MAX_MESSAGE_LENGTH {
++        return Err(io::Error::other("Hysteria2 response message too long").into());
++    }
++    let mut message = vec![0; message_len as usize];
++    AsyncReadExt::read_exact(recv, &mut message).await?;
++    let padding_len = read_varint(recv).await?;
++    if padding_len > MAX_PADDING_LENGTH {
++        return Err(io::Error::other("Hysteria2 response padding too long").into());
++    }
++    let mut padding = vec![0; padding_len as usize];
++    AsyncReadExt::read_exact(recv, &mut padding).await?;
++    if status != 0 {
++        return Err(io::Error::new(
++            io::ErrorKind::ConnectionRefused,
++            format!(
++                "Hysteria2 server could not connect: {}",
++                String::from_utf8_lossy(&message)
++            ),
++        )
++        .into());
++    }
++    Ok(())
++}
++
++/// Salamander: every datagram is an 8-byte random salt followed by the packet
++/// XORed with BLAKE2b-256(password || salt), repeated.
++#[derive(Debug)]
++struct Salamander {
++    inner: Arc<dyn AsyncUdpSocket>,
++    key: Arc<[u8]>,
++}
++
++fn salamander_key(password: &[u8], salt: &[u8]) -> [u8; 32] {
++    let mut hasher = Blake2b::<U32>::new();
++    hasher.update(password);
++    hasher.update(salt);
++    hasher.finalize().into()
++}
++
++/// One receive can hold several datagrams of `stride` bytes (GRO). Each has its
++/// own salt, so each is unmasked on its own and moved up over the salts before it.
++fn unmask(buf: &mut [u8], meta: &mut RecvMeta, password: &[u8]) {
++    let stride = meta.stride.max(1);
++    let (mut read, mut write) = (0, 0);
++    while read < meta.len {
++        let end = (read + stride).min(meta.len);
++        if end - read <= SALT_LEN {
++            break; // a runt carries no packet
++        }
++        let key = salamander_key(password, &buf[read..read + SALT_LEN]);
++        for i in 0..end - read - SALT_LEN {
++            buf[write + i] = buf[read + SALT_LEN + i] ^ key[i % key.len()];
++        }
++        write += end - read - SALT_LEN;
++        read = end;
++    }
++    meta.len = write;
++    meta.stride = stride.saturating_sub(SALT_LEN).max(1);
++}
++
++impl AsyncUdpSocket for Salamander {
++    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
++        self.inner.clone().create_io_poller()
++    }
++
++    fn try_send(&self, transmit: &Transmit<'_>) -> io::Result<()> {
++        let salt: [u8; SALT_LEN] = rand::random();
++        let key = salamander_key(&self.key, &salt);
++        let mut masked = Vec::with_capacity(SALT_LEN + transmit.contents.len());
++        masked.extend_from_slice(&salt);
++        masked.extend(
++            transmit
++                .contents
++                .iter()
++                .enumerate()
++                .map(|(i, byte)| byte ^ key[i % key.len()]),
++        );
++        self.inner.try_send(&Transmit {
++            destination: transmit.destination,
++            ecn: transmit.ecn,
++            contents: &masked,
++            segment_size: None,
++            src_ip: transmit.src_ip,
++        })
++    }
++
++    fn poll_recv(
++        &self,
++        cx: &mut Context<'_>,
++        bufs: &mut [IoSliceMut<'_>],
++        meta: &mut [RecvMeta],
++    ) -> Poll<io::Result<usize>> {
++        let count = ready!(self.inner.poll_recv(cx, bufs, meta))?;
++        for (buf, meta) in bufs.iter_mut().zip(meta.iter_mut()).take(count) {
++            unmask(buf, meta, &self.key);
++        }
++        Poll::Ready(Ok(count))
++    }
++
++    fn local_addr(&self) -> io::Result<SocketAddr> {
++        self.inner.local_addr()
++    }
++
++    // one salt per datagram: segmentation offload would send several under one
++    fn max_transmit_segments(&self) -> usize {
++        1
++    }
++
++    fn max_receive_segments(&self) -> usize {
++        self.inner.max_receive_segments()
++    }
++
++    fn may_fragment(&self) -> bool {
++        self.inner.may_fragment()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn varints_use_the_shortest_form() {
++        let mut out = Vec::new();
++        put_varint(&mut out, FRAME_TYPE_TCP_REQUEST);
++        assert_eq!(out, [0x44, 0x01]);
++        out.clear();
++        put_varint(&mut out, 37);
++        assert_eq!(out, [37]);
++        out.clear();
++        put_varint(&mut out, 16384);
++        assert_eq!(out, [0x80, 0x00, 0x40, 0x00]);
++    }
++
++    #[test]
++    fn tcp_request_layout() {
++        let request = tcp_request("example.com:443");
++        assert_eq!(&request[..2], &[0x44, 0x01]);
++        assert_eq!(request[2] as usize, "example.com:443".len());
++        assert_eq!(&request[3..18], b"example.com:443");
++        let (len, rest) = if request[18] & 0xc0 == 0x40 {
++            (
++                (u16::from_be_bytes([request[18], request[19]]) & 0x3fff) as usize,
++                &request[20..],
++            )
++        } else {
++            (request[18] as usize, &request[19..])
++        };
++        assert!((64..512).contains(&len));
++        assert_eq!(rest.len(), len);
++        assert!(rest.iter().all(|b| PADDING_CHARS.contains(b)));
++    }
++
++    #[test]
++    fn ipv6_targets_are_bracketed() {
++        let location = NetLocation::from_ip_addr("2001:db8::1".parse().unwrap(), 443);
++        assert_eq!(wire_address(&location), "[2001:db8::1]:443");
++    }
++
++    fn masked(password: &[u8], packet: &[u8], salt: [u8; SALT_LEN]) -> Vec<u8> {
++        let key = salamander_key(password, &salt);
++        let mut out = salt.to_vec();
++        out.extend(packet.iter().enumerate().map(|(i, b)| b ^ key[i % 32]));
++        out
++    }
++
++    fn meta(len: usize, stride: usize) -> RecvMeta {
++        let mut meta = RecvMeta::default();
++        meta.len = len;
++        meta.stride = stride;
++        meta
++    }
++
++    #[test]
++    fn salamander_unmasks_each_coalesced_datagram() {
++        let password = b"obfs-secret";
++        let first: Vec<u8> = (0..100u8).collect();
++        let second: Vec<u8> = (100..150u8).collect();
++        let mut buf = masked(password, &first, [1; SALT_LEN]);
++        buf.extend(masked(password, &second, [2; SALT_LEN]));
++        let mut meta = meta(buf.len(), 100 + SALT_LEN);
++        unmask(&mut buf, &mut meta, password);
++        assert_eq!(meta.len, 150);
++        assert_eq!(meta.stride, 100);
++        assert_eq!(&buf[..100], &first[..]);
++        assert_eq!(&buf[100..150], &second[..]);
++    }
++
++    #[test]
++    fn salamander_matches_the_reference_key() {
++        // blake2b-256("pw" || 8 zero bytes), as hysteria's salamander derives it
++        let key = salamander_key(b"pw", &[0; SALT_LEN]);
++        let mut hasher = Blake2b::<U32>::new();
++        hasher.update(b"pw\0\0\0\0\0\0\0\0");
++        assert_eq!(key, <[u8; 32]>::from(hasher.finalize()));
++        let mut runt = vec![0u8; SALT_LEN];
++        let mut meta = meta(runt.len(), runt.len());
++        unmask(&mut runt, &mut meta, b"pw");
++        assert_eq!(meta.len, 0);
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index 25ad6ed..f0441f3 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -68,6 +68,7 @@ pub mod dns;
+ mod h2mux;
+ mod http2;
+ mod http_handler;
++mod hysteria2_client;
+ mod hysteria2_server;
+ mod listener_tasks;
+ mod mixed_handler;
+diff --git a/src/main.rs b/src/main.rs
+index f0611b8..371e7ff 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -12,6 +12,7 @@ mod dns;
+ mod h2mux;
+ mod http2;
+ mod http_handler;
++mod hysteria2_client;
+ mod hysteria2_server;
+ mod listener_tasks;
+ mod logging;
+diff --git a/src/tcp/chain_builder.rs b/src/tcp/chain_builder.rs
+index 7cad238..d4a5815 100644
+--- a/src/tcp/chain_builder.rs
++++ b/src/tcp/chain_builder.rs
+@@ -31,8 +31,9 @@ pub(crate) fn supports_udp_offline(chain: &crate::config::ClientChain) -> std::i
+         };
+         supports_udp |= config.protocol.is_direct()
+             || config.protocol.is_wireguard()
+-            || ProxyConnectorImpl::from_config(config.clone(), resolver.clone())?
+-                .is_some_and(|proxy| proxy.supports_udp_over_tcp());
++            || (!config.protocol.is_hysteria2()
++                && ProxyConnectorImpl::from_config(config.clone(), resolver.clone())?
++                    .is_some_and(|proxy| proxy.supports_udp_over_tcp()));
+     }
+     Ok(supports_udp)
+ }
+@@ -112,6 +113,10 @@ pub(crate) fn build_client_proxy_chain_with_limits(
+                 })?;
+                 return Ok(InitialHopEntry::Wireguard(connector));
+             }
++            if config.protocol.is_hysteria2() {
++                let connector = crate::hysteria2_client::Connector::from_config(config, limits)?;
++                return Ok(InitialHopEntry::Tunnel(Arc::new(connector)));
++            }
+             // Find the first proxy address for QUIC socket configuration
+             let target_address = find_first_proxy_address(&hops, config);
+ 
+@@ -149,6 +154,9 @@ pub(crate) fn build_client_proxy_chain_with_limits(
+                     if config.transport == crate::config::Transport::Quic && crate::xhttp::connector::contains(&config.protocol) {
+                         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "XHTTP H3 is only supported at hop 0"));
+                     }
++                    if config.protocol.is_hysteria2() {
++                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Hysteria2 is only supported at hop 0"));
++                    }
+                     // Subsequent hops MUST NOT have direct protocol
+                     if config.protocol.is_direct() {
+                         return Err(std::io::Error::new(
+diff --git a/src/tcp/tcp_client_handler_factory.rs b/src/tcp/tcp_client_handler_factory.rs
+index 5a1cadc..9837a83 100644
+--- a/src/tcp/tcp_client_handler_factory.rs
++++ b/src/tcp/tcp_client_handler_factory.rs
+@@ -57,6 +57,12 @@ pub fn create_tcp_client_handler(
+                 "WireGuard is a network connector and is only supported at hop 0",
+             ));
+         }
++        ClientProxyConfig::Hysteria2 { .. } => {
++            return Err(std::io::Error::new(
++                std::io::ErrorKind::InvalidInput,
++                "Hysteria2 is a network connector and is only supported at hop 0",
++            ));
++        }
+         ClientProxyConfig::Direct => {
+             return Err(std::io::Error::new(
+                 std::io::ErrorKind::InvalidInput,

@@ -1,0 +1,570 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 17:17:40 +0000
+Subject: [PATCH 2/2] xhttp client: shape requests like newer Xray
+
+Newer Xray servers can expect packet-up data in numbered headers
+(X-Data-N) or cookies (x_data_N) instead of the body, GET uploads, the
+session id and sequence number in a header, cookie or query, and the
+padding under its own key and placement. Fronts that refuse request bodies
+answer a body with 413, and a server looking elsewhere for the ids answers
+400.
+
+New client options, all defaulting to the current behaviour:
+uplink_http_method, uplink_data_placement, uplink_data_key,
+uplink_chunk_size, session_placement/session_key, seq_placement/seq_key,
+x_padding_obfs_mode, x_padding_placement, x_padding_key, x_padding_header.
+The path keeps its trailing slash only when an id rides in it, and the
+padding URL is the path before the ids, as in Xray. Checked against an
+Xray server for every placement.
+---
+ src/config/types/xhttp.rs | 112 ++++++++++++++
+ src/xhttp/client.rs       |  38 +++--
+ src/xhttp/wire.rs         | 304 ++++++++++++++++++++++++++++++++++++--
+ 3 files changed, 430 insertions(+), 24 deletions(-)
+
+diff --git a/src/config/types/xhttp.rs b/src/config/types/xhttp.rs
+index c767edc..85f162c 100644
+--- a/src/config/types/xhttp.rs
++++ b/src/config/types/xhttp.rs
+@@ -29,6 +29,46 @@ pub enum XhttpVersion {
+     H3,
+ }
+ 
++/// Where a client puts its session id or packet sequence number.
++#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
++#[serde(rename_all = "lowercase")]
++pub enum XhttpPlacement {
++    #[default]
++    Path,
++    Query,
++    Header,
++    Cookie,
++}
++
++/// Where packet-up carries its uplink data. Header and cookie placements
++/// base64url-encode it in numbered chunks, for fronts that refuse bodies.
++#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
++#[serde(rename_all = "lowercase")]
++pub enum XhttpDataPlacement {
++    #[default]
++    Body,
++    Auto,
++    Header,
++    Cookie,
++}
++
++impl XhttpDataPlacement {
++    pub fn in_body(self) -> bool {
++        matches!(self, Self::Body | Self::Auto)
++    }
++}
++
++/// Where the request padding goes when padding obfuscation is on.
++#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
++#[serde(rename_all = "kebab-case")]
++pub enum XhttpPaddingPlacement {
++    #[default]
++    QueryInHeader,
++    Header,
++    Query,
++    Cookie,
++}
++
+ #[derive(Debug, Clone, Deserialize, Serialize)]
+ #[serde(untagged)]
+ pub enum XhttpRange {
+@@ -242,6 +282,34 @@ pub struct XhttpClientConfig {
+     pub packet_pipeline_depth: usize,
+     #[serde(default)]
+     pub headers: BTreeMap<String, String>,
++    /// Method of upload requests; POST unless set. GET only for packet-up.
++    #[serde(default)]
++    pub uplink_http_method: Option<String>,
++    #[serde(default)]
++    pub uplink_data_placement: XhttpDataPlacement,
++    /// Base name of the data chunks: X-Data for headers, x_data for cookies.
++    #[serde(default)]
++    pub uplink_data_key: Option<String>,
++    /// Encoded bytes per data chunk: 3000-4000 in headers, 2048-3072 in cookies.
++    #[serde(default)]
++    pub uplink_chunk_size: XhttpRange,
++    #[serde(default)]
++    pub session_placement: XhttpPlacement,
++    #[serde(default)]
++    pub session_key: Option<String>,
++    #[serde(default)]
++    pub seq_placement: XhttpPlacement,
++    #[serde(default)]
++    pub seq_key: Option<String>,
++    /// Padding under its own key and placement instead of the Referer query.
++    #[serde(default)]
++    pub x_padding_obfs_mode: bool,
++    #[serde(default)]
++    pub x_padding_key: Option<String>,
++    #[serde(default)]
++    pub x_padding_header: Option<String>,
++    #[serde(default)]
++    pub x_padding_placement: XhttpPaddingPlacement,
+     #[serde(default)]
+     pub limits: XhttpLimits,
+     #[serde(default)]
+@@ -296,8 +364,52 @@ impl XhttpClientConfig {
+                 ));
+             }
+         }
++        let packet_up = self.mode == XhttpMode::PacketUp;
++        if let Some(method) = &self.uplink_http_method {
++            let method = http::Method::from_bytes(method.to_ascii_uppercase().as_bytes())
++                .map_err(io::Error::other)?;
++            if method == http::Method::GET && !packet_up {
++                return Err(invalid("XHTTP GET uploads require packet-up mode"));
++            }
++        }
++        if !self.uplink_data_placement.in_body() && !packet_up {
++            return Err(invalid(
++                "XHTTP header and cookie uplink data require packet-up mode",
++            ));
++        }
++        // chunks under 64 bytes are raised to 64, as xray does
++        self.uplink_chunk_size.bounds((64, 64), false)?;
++        let keys = [
++            (self.session_placement, self.session_key.as_deref()),
++            (self.seq_placement, self.seq_key.as_deref()),
++        ];
++        for (placement, key) in keys {
++            if placement == XhttpPlacement::Header
++                && let Some(key) = key
++            {
++                http::HeaderName::try_from(key).map_err(io::Error::other)?;
++            }
++        }
++        for key in [
++            self.uplink_data_key.as_deref(),
++            self.x_padding_header.as_deref(),
++        ]
++        .into_iter()
++        .flatten()
++        {
++            http::HeaderName::try_from(key).map_err(io::Error::other)?;
++        }
+         Ok(())
+     }
++
++    pub fn uplink_method(&self) -> http::Method {
++        self.uplink_http_method
++            .as_deref()
++            .and_then(|method| {
++                http::Method::from_bytes(method.to_ascii_uppercase().as_bytes()).ok()
++            })
++            .unwrap_or(http::Method::POST)
++    }
+ }
+ 
+ #[derive(Debug, Clone, Deserialize, Serialize)]
+diff --git a/src/xhttp/client.rs b/src/xhttp/client.rs
+index b57b471..0581282 100644
+--- a/src/xhttp/client.rs
++++ b/src/xhttp/client.rs
+@@ -534,13 +534,13 @@ impl Client {
+         Duration::from_secs(self.config.limits.response_header_timeout_secs)
+     }
+ 
+-    fn request(
++    fn request<B>(
+         &self,
+         session: &str,
+         sequence: Option<u64>,
+         upload: bool,
+-        body: Body,
+-    ) -> io::Result<Request<Body>> {
++        body: B,
++    ) -> io::Result<Request<B>> {
+         let mut request = wire::request(
+             &self.config,
+             &self.path,
+@@ -691,15 +691,29 @@ impl Client {
+                             done = inflight.next(), if !inflight.is_empty() => window.acknowledge(done.unwrap()?),
+                         }
+                     };
+-                    let mut request = self.request(
+-                        session,
+-                        Some(sequence),
+-                        true,
+-                        Body::Chunks(chunks.into_iter().map(|chunk| chunk.into_bytes()).collect()),
+-                    )?;
+-                    request
+-                        .headers_mut()
+-                        .insert(http::header::CONTENT_LENGTH, size.into());
++                    let chunks: std::collections::VecDeque<_> =
++                        chunks.into_iter().map(|chunk| chunk.into_bytes()).collect();
++                    let mut request = self.request(session, Some(sequence), true, ())?;
++                    let body = if self.config.uplink_data_placement.in_body() {
++                        request
++                            .headers_mut()
++                            .insert(http::header::CONTENT_LENGTH, size.into());
++                        Body::Chunks(chunks)
++                    } else {
++                        let payload: Vec<u8> = chunks
++                            .iter()
++                            .flat_map(|chunk| chunk.iter().copied())
++                            .collect();
++                        wire::place_payload(&self.config, &mut request, &payload)?;
++                        // what net/http sends for a bodiless upload
++                        if request.method() != http::Method::GET {
++                            request
++                                .headers_mut()
++                                .insert(http::header::CONTENT_LENGTH, 0.into());
++                        }
++                        Body::Empty
++                    };
++                    let mut request = request.map(|_| body);
+                     let (written, mut uploaded) = UploadSignal::channel();
+                     request.extensions_mut().insert(written);
+                     next_post_at = tokio::time::Instant::now()
+diff --git a/src/xhttp/wire.rs b/src/xhttp/wire.rs
+index f966161..1620e1c 100644
+--- a/src/xhttp/wire.rs
++++ b/src/xhttp/wire.rs
+@@ -4,7 +4,10 @@ use base64::Engine;
+ use http::{HeaderMap, Method, Request, StatusCode};
+ use subtle::ConstantTimeEq;
+ 
+-use crate::config::xhttp::{XhttpClientConfig, XhttpMode, XhttpServerConfig};
++use crate::config::xhttp::{
++    XhttpClientConfig, XhttpDataPlacement, XhttpMode, XhttpPaddingPlacement, XhttpPlacement,
++    XhttpServerConfig,
++};
+ 
+ const PATH_ESCAPE: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+     .remove(b'-')
+@@ -45,6 +48,37 @@ impl Path {
+             path.request("", None).parse().map_err(io::Error::other)?;
+         Ok(path)
+     }
++    /// A client path: the ids that ride in it, then the query (the profile's
++    /// own first). The trailing slash is xray's, present only when ids may
++    /// ride in the path.
++    pub fn client(&self, segments: &[&str], slash: bool, query: &[String]) -> String {
++        let base = if slash {
++            self.base.as_str()
++        } else {
++            self.base
++                .strip_suffix('/')
++                .filter(|base| !base.is_empty())
++                .unwrap_or("/")
++        };
++        let mut path = percent_encoding::utf8_percent_encode(base, PATH_ESCAPE).to_string();
++        for (index, segment) in segments.iter().enumerate() {
++            if index > 0 || !path.ends_with('/') {
++                path.push('/');
++            }
++            path.push_str(segment);
++        }
++        let mut first = true;
++        for part in std::iter::once(&self.query)
++            .filter(|query| !query.is_empty())
++            .chain(query)
++        {
++            path.push(if first { '?' } else { '&' });
++            path.push_str(part);
++            first = false;
++        }
++        path
++    }
++
+     pub fn request(&self, session: &str, sequence: Option<u64>) -> String {
+         let mut path = format!(
+             "{}{session}",
+@@ -75,20 +109,100 @@ pub fn request(
+     upload: bool,
+ ) -> io::Result<Request<()>> {
+     let scheme = if secure { "https" } else { "http" };
+-    let uri = format!("{scheme}://{authority}{}", path.request(session, sequence));
+-    let mut request = Request::builder()
+-        .method(if upload { Method::POST } else { Method::GET })
+-        .uri(uri);
++    let sequence_text = sequence.map(|sequence| sequence.to_string());
++    let mut segments = Vec::new();
++    let mut query = Vec::new();
++    let mut headers = Vec::new();
++    let mut cookies = Vec::new();
++    // keys default as xray's: X-Session/X-Seq in headers, x_session/x_seq elsewhere
++    let meta = [
++        (
++            config.session_placement,
++            config.session_key.as_deref(),
++            ("X-Session", "x_session"),
++            session,
++        ),
++        (
++            config.seq_placement,
++            config.seq_key.as_deref(),
++            ("X-Seq", "x_seq"),
++            sequence_text.as_deref().unwrap_or(""),
++        ),
++    ];
++    for (placement, key, defaults, value) in meta {
++        if value.is_empty() {
++            continue;
++        }
++        let key =
++            key.filter(|key| !key.is_empty())
++                .unwrap_or(if placement == XhttpPlacement::Header {
++                    defaults.0
++                } else {
++                    defaults.1
++                });
++        match placement {
++            XhttpPlacement::Path => segments.push(value),
++            XhttpPlacement::Query => query.push(format!("{key}={value}")),
++            XhttpPlacement::Header => headers.push((key, value.to_owned())),
++            XhttpPlacement::Cookie => cookies.push(format!("{key}={value}")),
++        }
++    }
++    // xray ends the path with a slash only when an id rides in it
++    let slash = config.session_placement == XhttpPlacement::Path
++        || config.seq_placement == XhttpPlacement::Path;
++    let padding_len = sample(config.x_padding_bytes.bounds((100, 1000), false)?).max(1) as usize;
++    let padding = "X".repeat(padding_len);
++    let mut padding_header = None;
++    if !config.x_padding_obfs_mode {
++        padding_header = Some(("referer", "x_padding"));
++    } else {
++        let padding_key = config
++            .x_padding_key
++            .as_deref()
++            .filter(|key| !key.is_empty())
++            .unwrap_or("x_padding");
++        let header = config
++            .x_padding_header
++            .as_deref()
++            .filter(|header| !header.is_empty())
++            .unwrap_or("X-Padding");
++        match config.x_padding_placement {
++            XhttpPaddingPlacement::QueryInHeader => padding_header = Some((header, padding_key)),
++            XhttpPaddingPlacement::Header => headers.push((header, padding.clone())),
++            XhttpPaddingPlacement::Query => query.push(format!("{padding_key}={padding}")),
++            XhttpPaddingPlacement::Cookie => cookies.push(format!("{padding_key}={padding}")),
++        }
++    }
++    // xray pads with the url as it was before the ids went in
++    let path_only = path.client(&[], slash, &[]);
++    let path_only = path_only
++        .split_once('?')
++        .map_or(path_only.as_str(), |(bare, _)| bare);
++    let uri = format!(
++        "{scheme}://{authority}{}",
++        path.client(&segments, slash, &query)
++    );
++    let method = if upload {
++        config.uplink_method()
++    } else {
++        Method::GET
++    };
++    let mut request = Request::builder().method(method).uri(uri);
+     for (name, value) in &config.headers {
+         request = request.header(name, value);
+     }
+-    let padding =
+-        "X".repeat(sample(config.x_padding_bytes.bounds((100, 1000), false)?).max(1) as usize);
+-    let base = percent_encoding::utf8_percent_encode(&path.base, PATH_ESCAPE);
+-    request = request.header(
+-        "referer",
+-        format!("{scheme}://{authority}{base}?x_padding={padding}"),
+-    );
++    if let Some((header, key)) = padding_header {
++        request = request.header(
++            header,
++            format!("{scheme}://{authority}{path_only}?{key}={padding}"),
++        );
++    }
++    for (name, value) in headers {
++        request = request.header(name, value);
++    }
++    if !cookies.is_empty() {
++        request = request.header(http::header::COOKIE, cookies.join("; "));
++    }
+     let mut request = request.body(()).map_err(io::Error::other)?;
+     if upload && sequence.is_none() && !config.no_grpc_header {
+         request.headers_mut().insert(
+@@ -99,6 +213,67 @@ pub fn request(
+     Ok(request)
+ }
+ 
++/// Puts a packet-up payload where the profile wants it. Returns false when
++/// it belongs in the body, which the caller then sends as usual.
++pub fn place_payload(
++    config: &XhttpClientConfig,
++    request: &mut Request<()>,
++    payload: &[u8],
++) -> io::Result<bool> {
++    let cookie = match config.uplink_data_placement {
++        XhttpDataPlacement::Body | XhttpDataPlacement::Auto => return Ok(false),
++        XhttpDataPlacement::Header => false,
++        XhttpDataPlacement::Cookie => true,
++    };
++    let key = config
++        .uplink_data_key
++        .as_deref()
++        .filter(|key| !key.is_empty())
++        .unwrap_or(if cookie { "x_data" } else { "X-Data" });
++    let default = if cookie { (2048, 3072) } else { (3000, 4000) };
++    let (min, max) = config.uplink_chunk_size.bounds(default, false)?;
++    let range = (min.max(64), max.max(64));
++    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
++    let mut rest = encoded.as_str();
++    let mut cookies = Vec::new();
++    let mut index = 0;
++    while !rest.is_empty() {
++        let size = (sample(range) as usize).min(rest.len());
++        let (chunk, tail) = rest.split_at(size);
++        rest = tail;
++        if cookie {
++            cookies.push(format!("{key}_{index}={chunk}"));
++        } else {
++            let name =
++                http::HeaderName::try_from(format!("{key}-{index}")).map_err(io::Error::other)?;
++            request.headers_mut().insert(
++                name,
++                http::HeaderValue::from_str(chunk).map_err(io::Error::other)?,
++            );
++        }
++        index += 1;
++    }
++    if !cookies.is_empty() {
++        let mut all = request
++            .headers()
++            .get(http::header::COOKIE)
++            .and_then(|value| value.to_str().ok())
++            .map(str::to_owned)
++            .unwrap_or_default();
++        for cookie in cookies {
++            if !all.is_empty() {
++                all.push_str("; ");
++            }
++            all.push_str(&cookie);
++        }
++        request.headers_mut().insert(
++            http::header::COOKIE,
++            http::HeaderValue::from_str(&all).map_err(io::Error::other)?,
++        );
++    }
++    Ok(true)
++}
++
+ #[derive(Debug, PartialEq, Eq)]
+ pub enum Kind {
+     Options,
+@@ -504,6 +679,111 @@ mod tests {
+             );
+         }
+     }
++    fn shaped(extra: serde_json::Value) -> XhttpClientConfig {
++        let mut value = serde_json::json!({"mode":"packet-up","protocol":{"type":"socks"}});
++        value
++            .as_object_mut()
++            .unwrap()
++            .extend(extra.as_object().unwrap().clone());
++        serde_json::from_value(value).unwrap()
++    }
++
++    #[test]
++    fn ids_go_where_the_profile_puts_them() {
++        let path = Path::new("/xh?ed=1").unwrap();
++        let config = shaped(serde_json::json!({}));
++        let req = request(&config, &path, "a.test", true, "s1", Some(7), true).unwrap();
++        assert_eq!(req.uri(), "https://a.test/xh/s1/7?ed=1");
++        let referer = req.headers()["referer"].to_str().unwrap();
++        assert!(referer.starts_with("https://a.test/xh/?x_padding=X"));
++
++        let config = shaped(serde_json::json!({
++            "session_placement":"header","seq_placement":"query","seq_key":"n"
++        }));
++        let req = request(&config, &path, "a.test", true, "s1", Some(7), true).unwrap();
++        // no id rides in the path, so it keeps no trailing slash
++        assert_eq!(req.uri(), "https://a.test/xh?ed=1&n=7");
++        assert_eq!(req.headers()["x-session"], "s1");
++
++        let config = shaped(serde_json::json!({
++            "session_placement":"cookie","seq_placement":"path","uplink_http_method":"get"
++        }));
++        let req = request(&config, &path, "a.test", true, "s1", Some(7), true).unwrap();
++        assert_eq!(req.uri(), "https://a.test/xh/7?ed=1");
++        assert_eq!(req.headers()["cookie"], "x_session=s1");
++        assert_eq!(req.method(), Method::GET);
++        config.validate().unwrap();
++    }
++
++    #[test]
++    fn obfuscated_padding_uses_its_own_key_and_place() {
++        let path = Path::new("/xh").unwrap();
++        let padded = |extra| {
++            let config = shaped(extra);
++            request(&config, &path, "a.test", true, "s", Some(0), true).unwrap()
++        };
++        let request = padded(serde_json::json!({
++            "x_padding_obfs_mode":true,"x_padding_placement":"header",
++            "x_padding_header":"X-Pad","x_padding_bytes":"5-5"
++        }));
++        assert_eq!(request.headers()["x-pad"], "XXXXX");
++        assert!(request.headers().get("referer").is_none());
++        let request = padded(serde_json::json!({
++            "x_padding_obfs_mode":true,"x_padding_bytes":"3-3"
++        }));
++        assert_eq!(
++            request.headers()["x-padding"],
++            "https://a.test/xh/?x_padding=XXX"
++        );
++        let request = padded(serde_json::json!({
++            "x_padding_obfs_mode":true,"x_padding_placement":"query",
++            "x_padding_key":"p","x_padding_bytes":"2-2"
++        }));
++        assert_eq!(request.uri(), "https://a.test/xh/s/0?p=XX");
++        let request = padded(serde_json::json!({
++            "x_padding_obfs_mode":true,"x_padding_placement":"cookie","x_padding_bytes":"1-1",
++            "session_placement":"cookie"
++        }));
++        assert_eq!(request.headers()["cookie"], "x_session=s; x_padding=X");
++    }
++
++    #[test]
++    fn payload_outside_the_body_reads_back_as_the_server_reads_it() {
++        let path = Path::new("/xh").unwrap();
++        let payload: Vec<u8> = (0..5000u32).map(|i| (i * 7) as u8).collect();
++        for placement in ["header", "cookie"] {
++            let config = shaped(serde_json::json!({
++                "uplink_data_placement":placement,"uplink_chunk_size":"100-300",
++                "session_placement":"cookie"
++            }));
++            config.validate().unwrap();
++            let mut request = request(&config, &path, "a.test", true, "s", Some(1), true).unwrap();
++            assert!(place_payload(&config, &mut request, &payload).unwrap());
++            if placement == "header" {
++                assert!(request.headers().len() > 20);
++                assert!(request.headers()["x-data-0"].len() <= 300);
++            } else {
++                let cookie = request.headers()["cookie"].to_str().unwrap();
++                assert!(cookie.starts_with("x_session=s; x_data_0="));
++            }
++            // the shoes server reads X-Data, as xray does by default; cookies
++            // here take xray's default key, x_data
++            if placement == "header" {
++                assert_eq!(header_payload(request.headers()).unwrap(), payload);
++            }
++        }
++        let config = shaped(serde_json::json!({}));
++        let mut request = request(&config, &path, "a.test", true, "s", Some(1), true).unwrap();
++        assert!(!place_payload(&config, &mut request, &payload).unwrap());
++        // out-of-body data and get uploads need packet-up
++        for extra in [
++            serde_json::json!({"mode":"stream-up","uplink_data_placement":"header"}),
++            serde_json::json!({"mode":"auto","uplink_http_method":"GET"}),
++        ] {
++            assert!(shaped(extra).validate().is_err());
++        }
++    }
++
+     #[test]
+     fn default_payload_concatenates_header_and_cookie() {
+         let mut headers = HeaderMap::new();
