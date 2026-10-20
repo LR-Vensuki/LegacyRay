@@ -18,3 +18,7 @@ order before building:
   or cookies, the upload method, where the session id, the sequence number
   and the padding go. Servers behind fronts that refuse request bodies
   answer anything else with 413 or 400.
+- `0003` puts the headers Xray adds to every XHTTP request on ours: a
+  desktop Chrome fetch (User-Agent, Sec-CH-UA, Sec-Fetch-*, Accept and the
+  rest) unless the profile names its own user agent. Without them the
+  requests carried no user agent at all.
