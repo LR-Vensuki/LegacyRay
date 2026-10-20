@@ -34,6 +34,10 @@ extern char **environ;
 #define ENGINE_CONFIG_MAX (16 * 1024)
 /* an a4 needs a moment to map a large binary and parse its configuration */
 #define ENGINE_READY_MS 8000
+/* a restart reuses a configuration that already worked, so it gets less, and
+   a failed one is tried again a second later rather than given up on */
+#define ENGINE_RESTART_READY_MS 3000
+#define ENGINE_RETRY_MS 1000L
 #define ENGINE_RESTARTS_PER_WINDOW 3
 #define ENGINE_RESTART_WINDOW_MS 60000L
 
@@ -176,8 +180,8 @@ static int port_answers(int port) {
     return ok;
 }
 
-static int wait_ready(engine_backend_t *e) {
-    long deadline = now_ms() + ENGINE_READY_MS;
+static int wait_ready(engine_backend_t *e, long budget_ms) {
+    long deadline = now_ms() + budget_ms;
     while (now_ms() < deadline) {
         if (!child_alive(e)) return -1;
         if (port_answers(e->port)) return 0;
@@ -244,7 +248,7 @@ int engine_backend_start(engine_backend_t *e, const vl_server_t *server,
             set_reason(reason, reason_cap, "the engine could not be started");
             break;
         }
-        if (wait_ready(e) == 0) {
+        if (wait_ready(e, ENGINE_READY_MS) == 0) {
             free(config);
             e->active = 1;
             e->restarts = 0;
@@ -271,12 +275,14 @@ void engine_backend_stop(engine_backend_t *e) {
     e->active = 0;
     e->port = 0;
     e->restarts = 0;
+    e->next_try_ms = 0;
 }
 
 int engine_backend_keep_alive(engine_backend_t *e) {
     if (!e || !e->active) return 0;
     if (child_alive(e)) return 1;
     long now = now_ms();
+    if (now < e->next_try_ms) return 1;
     if (now - e->window_started_ms > ENGINE_RESTART_WINDOW_MS) {
         e->window_started_ms = now;
         e->restarts = 0;
@@ -284,12 +290,16 @@ int engine_backend_keep_alive(engine_backend_t *e) {
     if (e->restarts < ENGINE_RESTARTS_PER_WINDOW) {
         e->restarts++;
         /* same configuration, same port: the loop's upstream stays valid */
-        if (spawn_engine(e) == 0 && wait_ready(e) == 0) {
+        if (spawn_engine(e) == 0 && wait_ready(e, ENGINE_RESTART_READY_MS) == 0) {
             fprintf(stderr, "legacyrayd: engine restarted (%d in this minute)\n",
                     e->restarts);
             return 1;
         }
         end_child(e);
+        if (e->restarts < ENGINE_RESTARTS_PER_WINDOW) {
+            e->next_try_ms = now_ms() + ENGINE_RETRY_MS;
+            return 1;
+        }
     }
     fprintf(stderr, "legacyrayd: engine keeps exiting, giving up\n");
     engine_backend_stop(e);
