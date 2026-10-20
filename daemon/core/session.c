@@ -399,6 +399,7 @@ sess_status_t session_init_after_greet(session_t *s,
 }
 
 static void queue_socks_reply(session_t *s, uint8_t code) {
+    if (s->no_socks_reply) return;
     uint8_t rep[10];
     size_t rn = 0;
     socks5_build_reply(code, rep, sizeof rep, &rn);
@@ -466,6 +467,78 @@ static sess_status_t begin_vless_dest(session_t *s, const vless_dest_t *dest,
     return SESS_OK;
 }
 
+/* the start for the upstreams that are not vless. socks5 and http send their
+   handshake and leave the payload to the caller, which feeds it once they
+   answer; trojan and shadowsocks carry the first payload bytes in their
+   request and the session relays at once */
+static sess_status_t begin_upstream_dest(session_t *s, const vless_dest_t *dest,
+                                         const uint8_t *payload, size_t payload_len,
+                                         size_t *payload_used_out) {
+    size_t payload_used = 0;
+    if (payload_len > sizeof s->client_stage) payload_len = sizeof s->client_stage;
+    if (s->proto == VL_PROTO_SOCKS5) {
+        session_set_trace_host(s, dest);
+        s->u.s5c.dest = *dest;
+        s->u.s5c.state = S5C_ST_INIT;
+
+        uint8_t req[512];
+        size_t reqlen = 0;
+        int rs = s5c_make_request(&s->u.s5c, req, sizeof req, &reqlen);
+        if (rs != S5C_OK) { s->state = SESS_ERROR; return SESS_ERR; }
+
+        push_remote(s, req, reqlen);
+        if (s->state == SESS_ERROR) return SESS_ERR;
+        s->state = SESS_VLESS_RESP;
+    } else if (s->proto == VL_PROTO_HTTP || s->proto == VL_PROTO_HTTPS) {
+        s->u.hc.dest = *dest;
+        s->u.hc.state = HC_ST_INIT;
+
+        uint8_t req[1024];
+        size_t reqlen = 0;
+        int rs = hc_make_request(&s->u.hc, req, sizeof req, &reqlen);
+        if (rs != HC_OK) { s->state = SESS_ERROR; return SESS_ERR; }
+
+        push_remote(s, req, reqlen);
+        if (s->state == SESS_ERROR) return SESS_ERR;
+        s->state = SESS_VLESS_RESP;
+    } else if (s->proto == VL_PROTO_TROJAN) {
+        session_set_trace_host(s, dest);
+        s->u.tc.dest = *dest;
+
+        uint8_t req[1024];
+        size_t reqlen = 0;
+        int rs = trojan_client_build_request(&s->u.tc, payload, payload_len, req, sizeof req, &reqlen);
+        if (rs != TR_OK) { s->state = SESS_ERROR; return SESS_ERR; }
+
+        push_remote(s, req, reqlen);
+        if (s->state == SESS_ERROR) return SESS_ERR;
+        payload_used = payload_len;
+        s->state = SESS_RELAY;
+/* trojan has no distinct response header, so ack the local socks client now */
+        queue_socks_reply(s, SOCKS5_REP_OK);
+    } else if (s->proto == VL_PROTO_SHADOWSOCKS) {
+        session_set_trace_host(s, dest);
+        s->u.sc.dest = *dest;
+
+        uint8_t req[16384];
+        size_t reqlen = 0;
+        int rs = ss_client_build_request(&s->u.sc, payload, payload_len, req, sizeof req, &reqlen);
+        if (rs != SS_OK) { s->state = SESS_ERROR; return SESS_ERR; }
+
+        push_remote(s, req, reqlen);
+        if (s->state == SESS_ERROR) return SESS_ERR;
+        payload_used = payload_len;
+        s->state = SESS_RELAY;
+/* shadowsocks has no distinct response header, so ack the local socks client now */
+        queue_socks_reply(s, SOCKS5_REP_OK);
+    } else {
+        s->state = SESS_ERROR;
+        return SESS_ERR;
+    }
+    if (payload_used_out) *payload_used_out = payload_used;
+    return SESS_OK;
+}
+
 sess_status_t session_start_from_socks_dest(session_t *s,
                                             const vless_dest_t *dest,
                                             const uint8_t *payload,
@@ -481,8 +554,10 @@ sess_status_t session_start_from_transparent_dest(session_t *s,
                                                   size_t payload_len,
                                                   size_t *payload_used_out) {
     if (!s || !dest) return SESS_ERR_ARG;
-    if (s->proto != VL_PROTO_VLESS) return SESS_ERR_ARG;
-    return begin_vless_dest(s, dest, payload, payload_len, payload_used_out, 0);
+    s->no_socks_reply = 1;
+    if (s->proto == VL_PROTO_VLESS)
+        return begin_vless_dest(s, dest, payload, payload_len, payload_used_out, 0);
+    return begin_upstream_dest(s, dest, payload, payload_len, payload_used_out);
 }
 
 static sess_status_t do_greeting(session_t *s, size_t *consumed) {
@@ -518,86 +593,16 @@ static sess_status_t do_request(session_t *s) {
         return SESS_ERR;
     }
 
-    if (s->proto == VL_PROTO_VLESS) {
-        const uint8_t *payload = s->client_stage + used;
-        size_t payload_len = s->client_stage_len - used;
-        size_t payload_used = 0;
-        if (begin_vless_dest(s, &dest, payload, payload_len, &payload_used, 1) != SESS_OK)
-            return SESS_ERR;
-        size_t eaten = used + payload_used;
-        memmove(s->client_stage, s->client_stage + eaten, s->client_stage_len - eaten);
-        s->client_stage_len -= eaten;
-    } else if (s->proto == VL_PROTO_SOCKS5) {
-        session_set_trace_host(s, &dest);
-        s->u.s5c.dest = dest;
-        s->u.s5c.state = S5C_ST_INIT;
-
-        uint8_t req[512];
-        size_t reqlen = 0;
-        int rs = s5c_make_request(&s->u.s5c, req, sizeof req, &reqlen);
-        if (rs != S5C_OK) { s->state = SESS_ERROR; return SESS_ERR; }
-
-        push_remote(s, req, reqlen);
-        if (s->state == SESS_ERROR) return SESS_ERR;
-
-        memmove(s->client_stage, s->client_stage + used, s->client_stage_len - used);
-        s->client_stage_len -= used;
-
-        s->state = SESS_VLESS_RESP;
-    } else if (s->proto == VL_PROTO_HTTP || s->proto == VL_PROTO_HTTPS) {
-        s->u.hc.dest = dest;
-        s->u.hc.state = HC_ST_INIT;
-
-        uint8_t req[1024];
-        size_t reqlen = 0;
-        int rs = hc_make_request(&s->u.hc, req, sizeof req, &reqlen);
-        if (rs != HC_OK) { s->state = SESS_ERROR; return SESS_ERR; }
-
-        push_remote(s, req, reqlen);
-        if (s->state == SESS_ERROR) return SESS_ERR;
-
-        memmove(s->client_stage, s->client_stage + used, s->client_stage_len - used);
-        s->client_stage_len -= used;
-
-        s->state = SESS_VLESS_RESP;
-    } else if (s->proto == VL_PROTO_TROJAN) {
-        session_set_trace_host(s, &dest);
-        s->u.tc.dest = dest;
-
-        const uint8_t *payload = s->client_stage + used;
-        size_t payload_len = s->client_stage_len - used;
-        uint8_t req[1024];
-        size_t reqlen = 0;
-        int rs = trojan_client_build_request(&s->u.tc, payload, payload_len, req, sizeof req, &reqlen);
-        if (rs != TR_OK) { s->state = SESS_ERROR; return SESS_ERR; }
-
-        push_remote(s, req, reqlen);
-        if (s->state == SESS_ERROR) return SESS_ERR;
-
-        s->client_stage_len = 0;
-        s->state = SESS_RELAY;
-/* trojan has no distinct response header, so ack the local socks client now */
-        queue_socks_reply(s, SOCKS5_REP_OK);
-    } else if (s->proto == VL_PROTO_SHADOWSOCKS) {
-        session_set_trace_host(s, &dest);
-        s->u.sc.dest = dest;
-
-        const uint8_t *payload = s->client_stage + used;
-        size_t payload_len = s->client_stage_len - used;
-        uint8_t req[16384];
-        size_t reqlen = 0;
-        int rs = ss_client_build_request(&s->u.sc, payload, payload_len, req, sizeof req, &reqlen);
-        if (rs != SS_OK) { s->state = SESS_ERROR; return SESS_ERR; }
-
-        push_remote(s, req, reqlen);
-        if (s->state == SESS_ERROR) return SESS_ERR;
-
-        s->client_stage_len = 0;
-        s->state = SESS_RELAY;
-/* shadowsocks has no distinct response header, so ack the local socks client now */
-        queue_socks_reply(s, SOCKS5_REP_OK);
-    }
-
+    const uint8_t *payload = s->client_stage + used;
+    size_t payload_len = s->client_stage_len - used;
+    size_t payload_used = 0;
+    sess_status_t br = s->proto == VL_PROTO_VLESS
+        ? begin_vless_dest(s, &dest, payload, payload_len, &payload_used, 1)
+        : begin_upstream_dest(s, &dest, payload, payload_len, &payload_used);
+    if (br != SESS_OK) return SESS_ERR;
+    size_t eaten = used + payload_used;
+    memmove(s->client_stage, s->client_stage + eaten, s->client_stage_len - eaten);
+    s->client_stage_len -= eaten;
     return SESS_OK;
 }
 
@@ -720,51 +725,60 @@ sess_status_t session_pump_remote(session_t *s) {
                 deliver_client(s, tmp + app_off, (size_t)n - app_off);
                 if (s->state == SESS_ERROR) return SESS_ERR;
             } else if (s->proto == VL_PROTO_SOCKS5) {
-                size_t consumed = 0;
-                uint8_t out[1024];
-                size_t out_len = 0;
-                int rs = s5c_feed(&s->u.s5c, tmp, (size_t)n, &consumed, out, sizeof out, &out_len);
-                if (rs == S5C_NEED_MORE) return SESS_OK;
-                if (rs != S5C_OK) {
-                    uint8_t rep[10]; size_t rn = 0;
-                    socks5_build_reply(SOCKS5_REP_GENERAL_FAIL, rep, sizeof rep, &rn);
-                    q_append(s->to_client, &s->to_client_len, sizeof s->to_client, rep, rn);
-                    s->state = SESS_ERROR;
-                    return SESS_ERR;
-                }
-
-                if (out_len > 0) {
-                    push_remote(s, out, out_len);
-                    if (s->state == SESS_ERROR) return SESS_ERR;
+/* gather the proxy's replies until a whole one is in: a reply cut across
+   reads used to be dropped, which stalled or failed the connection */
+                size_t take = (size_t)n;
+                if (take > sizeof s->up_stage - s->up_stage_len)
+                    take = sizeof s->up_stage - s->up_stage_len;
+                memcpy(s->up_stage + s->up_stage_len, tmp, take);
+                s->up_stage_len += take;
+                while (s->u.s5c.state != S5C_ST_OPEN) {
+                    size_t consumed = 0;
+                    uint8_t out[1024];
+                    size_t out_len = 0;
+                    int rs = s5c_feed(&s->u.s5c, s->up_stage, s->up_stage_len, &consumed,
+                                      out, sizeof out, &out_len);
+                    if (rs == S5C_NEED_MORE) {
+                        if (s->up_stage_len == sizeof s->up_stage) rs = S5C_ERR_PROTO;
+                        else break;
+                    }
+                    if (rs != S5C_OK) {
+                        queue_socks_reply(s, SOCKS5_REP_GENERAL_FAIL);
+                        s->state = SESS_ERROR;
+                        return SESS_ERR;
+                    }
+                    memmove(s->up_stage, s->up_stage + consumed, s->up_stage_len - consumed);
+                    s->up_stage_len -= consumed;
+                    if (out_len > 0) {
+                        push_remote(s, out, out_len);
+                        if (s->state == SESS_ERROR) return SESS_ERR;
+                    }
                 }
 
                 if (s->u.s5c.state == S5C_ST_OPEN) {
-                    uint8_t rep[10]; size_t rn = 0;
-                    socks5_build_reply(SOCKS5_REP_OK, rep, sizeof rep, &rn);
-                    q_append(s->to_client, &s->to_client_len, sizeof s->to_client, rep, rn);
+                    queue_socks_reply(s, SOCKS5_REP_OK);
                     s->state = SESS_RELAY;
-
-                    if (consumed < (size_t)n) {
+/* whatever followed the reply is the destination talking already */
+                    if (s->up_stage_len > 0)
                         q_append(s->to_client, &s->to_client_len, sizeof s->to_client,
-                                 tmp + consumed, (size_t)n - consumed);
-                    }
+                                 s->up_stage, s->up_stage_len);
+                    if (take < (size_t)n)
+                        q_append(s->to_client, &s->to_client_len, sizeof s->to_client,
+                                 tmp + take, (size_t)n - take);
+                    s->up_stage_len = 0;
                 }
             } else if (s->proto == VL_PROTO_HTTP || s->proto == VL_PROTO_HTTPS) {
                 size_t consumed = 0;
                 int rs = hc_feed(&s->u.hc, tmp, (size_t)n, &consumed);
                 if (rs == HC_NEED_MORE) return SESS_OK;
                 if (rs != HC_OK) {
-                    uint8_t rep[10]; size_t rn = 0;
-                    socks5_build_reply(SOCKS5_REP_GENERAL_FAIL, rep, sizeof rep, &rn);
-                    q_append(s->to_client, &s->to_client_len, sizeof s->to_client, rep, rn);
+                    queue_socks_reply(s, SOCKS5_REP_GENERAL_FAIL);
                     s->state = SESS_ERROR;
                     return SESS_ERR;
                 }
 
                 if (s->u.hc.state == HC_ST_OPEN) {
-                    uint8_t rep[10]; size_t rn = 0;
-                    socks5_build_reply(SOCKS5_REP_OK, rep, sizeof rep, &rn);
-                    q_append(s->to_client, &s->to_client_len, sizeof s->to_client, rep, rn);
+                    queue_socks_reply(s, SOCKS5_REP_OK);
                     s->state = SESS_RELAY;
 
                     if (consumed < (size_t)n) {

@@ -616,6 +616,8 @@ static void reap_opening_conns(loop_t *lp) {
                               c->open_pass[0] ? c->open_pass : NULL);
         }
         if (ir != SESS_OK) {
+            fprintf(stderr, "legacyrayd: session start failed (%s, proto %d)\n",
+                    c->transparent ? "redirected" : "socks", (int)c->open_proto);
             if (c->open_vt) c->open_vt->close(th);
             if (c->remote_fd >= 0) close(c->remote_fd);
             if (c->local_fd >= 0) close(c->local_fd);

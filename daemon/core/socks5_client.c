@@ -131,6 +131,7 @@ int s5c_feed(socks5_client_t *c, const uint8_t *in, size_t in_len, size_t *consu
         if (atyp == 1) {
             req_len = 10;
         } else if (atyp == 3) {
+            if (in_len < 5) return S5C_NEED_MORE;
             req_len = 7 + in[4];
         } else if (atyp == 4) {
             req_len = 22;
