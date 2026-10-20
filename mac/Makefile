@@ -109,7 +109,7 @@ $(foreach s,$(C_SRC) $(filter %.c,$(CORE_SRC)),$(eval $(call compile_c,$(s))))
 $(foreach s,$(ZBAR_SRC),$(eval $(call compile_zbar,$(s))))
 
 RESOURCES := Resources/LegacyRay.icns Resources/install-helper.sh Resources/uninstall-helper.sh \
-             Resources/com.legacyray.daemon.plist ../app/Resources/denim.png \
+             Resources/com.legacyray.daemon.plist Resources/status-globe.png ../app/Resources/denim.png \
              ../app/Resources/denim@2x.png ../app/Resources/click.wav ../app/Resources/clunk.wav \
              ../app/Resources/tick.wav ../app/Resources/THIRD_PARTY_LICENSES.txt ../LICENSE
 

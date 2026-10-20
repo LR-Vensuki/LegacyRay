@@ -160,6 +160,8 @@ app/, tweaks/, layout/  версия для iPhone — docs/README-ios.md
 
 GPL‑2.0 (как у senko), см. `LICENSE`. Сторонние компоненты — в
 `app/Resources/THIRD_PARTY_LICENSES.txt`: OpenSSL, libssh2 (BSD‑3), ZBar
-(LGPL‑2.1), cJSON (MIT), корневые сертификаты Mozilla (MPL 2.0). Геоданные
+(LGPL‑2.1), cJSON (MIT), корневые сертификаты Mozilla (MPL 2.0). Значок в строке
+меню на OS X — из бесплатного набора [Glyphish](http://glyphish.com) (Joseph Wain,
+CC BY 3.0 US). Геоданные
 (v2fly domain-list-community, ipverse) не входят в пакет — скачиваются по
 запросу.

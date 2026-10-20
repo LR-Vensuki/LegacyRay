@@ -8,6 +8,15 @@ The feature set follows vless-core-app by notfence; no code from it is used.
 The components below keep their own licenses.
 
 ========================================================================
+Glyphish free icons (the OS X menu bar icon) - CC BY 3.0 US
+========================================================================
+
+The globe in the OS X menu bar was created by Joseph Wain and downloaded
+from http://glyphish.com. It is licensed under the Creative Commons
+Attribution 3.0 United States License:
+http://creativecommons.org/licenses/by/3.0/us/
+
+========================================================================
 OpenSSL 3.5 (legacyrayd) - Apache License 2.0
 ========================================================================
 

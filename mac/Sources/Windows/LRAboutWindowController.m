@@ -46,10 +46,10 @@
                [NSColor colorWithCalibratedWhite:0.3f alpha:1], NSCenterTextAlignment);
     LRDrawText(@LR_DEVELOPER, NSMakeRect(20, top + 32, NSWidth(b) - 40, 17), [NSFont boldSystemFontOfSize:12],
                [NSColor colorWithCalibratedWhite:0.2f alpha:1], NSCenterTextAlignment);
-    NSString *text = L(@"VLESS, Reality, Trojan, Shadowsocks, SOCKS and AmneziaWG for the whole Mac. A fork of senko (GPL-2.0); the network core comes from it, the rest is new. OpenSSL, libssh2, ZBar and cJSON inside.");
+    NSString *text = L(@"VLESS, Reality, Trojan, Shadowsocks, SOCKS and AmneziaWG for the whole Mac. A fork of senko (GPL-2.0); the network core comes from it, the rest is new. OpenSSL, libssh2, ZBar and cJSON inside. Menu bar icon by Glyphish (glyphish.com), CC BY 3.0.");
     NSMutableParagraphStyle *p = [[[NSMutableParagraphStyle alloc] init] autorelease];
     [p setAlignment:NSCenterTextAlignment];
-    [text drawWithRect:NSMakeRect(30, top + 58, NSWidth(b) - 60, 60) options:NSStringDrawingUsesLineFragmentOrigin
+    [text drawWithRect:NSMakeRect(30, top + 58, NSWidth(b) - 60, 74) options:NSStringDrawingUsesLineFragmentOrigin
             attributes:[NSDictionary dictionaryWithObjectsAndKeys:[NSFont systemFontOfSize:11], NSFontAttributeName,
                         [NSColor colorWithCalibratedWhite:0.4f alpha:1], NSForegroundColorAttributeName,
                         p, NSParagraphStyleAttributeName, nil]];

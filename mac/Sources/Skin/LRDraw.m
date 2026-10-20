@@ -527,44 +527,38 @@ NSImage *LRGlyphList(CGFloat side, NSColor *ink) {
     return LRSystemGlyph(NSImageNameListViewTemplate, side, ink);
 }
 
-/* the icon in miniature: the stitched square and the L. off it is an
-   outline, on it is a solid tile with the L cut out of it */
+/* the globe from glyphish (glyphish.com, cc by 3.0, credited in about).
+   off and connecting are the globe faded, on is the globe whole, a fault
+   takes a bite out of its corner and puts a dot in it */
 NSImage *LRStatusItemImage(int state) {
     NSString *key = [NSString stringWithFormat:@"tile.status.%d", state];
     NSImage *img = LRCached(key);
     if (img) return img;
+    static NSImage *globe = nil;
+    if (!globe) {
+        NSString *path = [[NSBundle mainBundle] pathForResource:@"status-globe" ofType:@"png"];
+        globe = path ? [[NSImage alloc] initWithContentsOfFile:path] : nil;
+    }
+    NSImage *art = globe;
     img = LRImageWithSize(NSMakeSize(18, 18), YES, ^(CGContextRef ctx, CGRect r) {
-        CGRect box = CGRectMake(2, 1.5f, 14, 14);
-        CGMutablePathRef ell = CGPathCreateMutable();
-        /* the L: a stem and a foot */
-        CGPathAddRect(ell, NULL, CGRectMake(6.5f, 4.5f, 2.2f, 8));
-        CGPathAddRect(ell, NULL, CGRectMake(6.5f, 10.3f, 5.5f, 2.2f));
-        if (state == 2) {
-            CGContextSetRGBFillColor(ctx, 0, 0, 0, 1);
-            LRAddRoundRect(ctx, box, 3.5f);
-            CGContextFillPath(ctx);
-            CGContextSetBlendMode(ctx, kCGBlendModeClear);
-            CGContextAddPath(ctx, ell);
-            CGContextFillPath(ctx);
+        CGFloat alpha = state == 0 ? 0.4f : state == 1 ? 0.6f : 1;
+        if (art) {
+            [[NSGraphicsContext currentContext] setImageInterpolation:NSImageInterpolationHigh];
+            [art drawInRect:NSMakeRect(1, 1, 16, 16) fromRect:NSZeroRect operation:NSCompositeSourceOver
+                   fraction:alpha respectFlipped:YES hints:nil];
         } else {
-            CGFloat alpha = state == 1 ? 0.55f : 1;
+            /* a bundle without the art still shows something to click */
             CGContextSetRGBStrokeColor(ctx, 0, 0, 0, alpha);
-            CGContextSetLineWidth(ctx, 1.3f);
-            LRAddRoundRect(ctx, CGRectInset(box, 0.65f, 0.65f), 3);
-            CGContextStrokePath(ctx);
-            CGContextSetRGBFillColor(ctx, 0, 0, 0, alpha);
-            CGContextAddPath(ctx, ell);
-            CGContextFillPath(ctx);
-            if (state == 3) {
-                /* a fault: the corner of the tile torn off */
-                CGContextSetBlendMode(ctx, kCGBlendModeClear);
-                CGContextFillEllipseInRect(ctx, CGRectMake(11, 0, 7, 7));
-                CGContextSetBlendMode(ctx, kCGBlendModeNormal);
-                CGContextSetRGBFillColor(ctx, 0, 0, 0, 1);
-                CGContextFillEllipseInRect(ctx, CGRectMake(12.5f, 1.5f, 4, 4));
-            }
+            CGContextSetLineWidth(ctx, 1.5f);
+            CGContextStrokeEllipseInRect(ctx, CGRectMake(2, 2, 14, 14));
         }
-        CGPathRelease(ell);
+        if (state == 3) {
+            CGContextSetBlendMode(ctx, kCGBlendModeClear);
+            CGContextFillEllipseInRect(ctx, CGRectMake(11, 0, 7, 7));
+            CGContextSetBlendMode(ctx, kCGBlendModeNormal);
+            CGContextSetRGBFillColor(ctx, 0, 0, 0, 1);
+            CGContextFillEllipseInRect(ctx, CGRectMake(12.5f, 1.5f, 4, 4));
+        }
     });
     [img setTemplate:YES];
     LRCache(key, img);
