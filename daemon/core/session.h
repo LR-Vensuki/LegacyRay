@@ -63,6 +63,10 @@ typedef struct {
     uint8_t to_remote[SESS_BUF];
     size_t  to_remote_len;
     int     to_remote_raw;
+/* the tail of to_remote that waits until a socks5 or http upstream accepted
+   the connection: client bytes sent before its reply would be read as the
+   next handshake message */
+    size_t  to_remote_hold;
 
 /* track vision framing so direct mode can splice raw bytes safely */
     int            vision_on;
@@ -151,6 +155,17 @@ sess_status_t session_pump_remote(session_t *s);
 
 /* drain queued client output without exposing the internal buffer */
 size_t session_take_client(session_t *s, uint8_t *out, size_t cap);
+
+/* how many bytes may be read from the remote now without the client queue
+   overflowing; 0 while the client has not taken what is already queued */
+size_t session_remote_room(const session_t *s);
+
+/* bytes queued for the remote that can be written now */
+size_t session_remote_pending(const session_t *s);
+
+/* how many client bytes the session can take in one feed without refusing
+   any: none while its remote queue is too full for one more read */
+size_t session_client_room(const session_t *s);
 
 /* close only after errors or a drained remote eof */
 int session_is_done(const session_t *s);
