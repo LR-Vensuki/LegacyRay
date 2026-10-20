@@ -1071,10 +1071,11 @@ static void LRSetOpensAtLogin(BOOL on) {
     LRForm *f = [self form];
     LRDaemonSettings *ds = DS();
     __block LRPreferencesController *me = self;
+    /* 0 is automatic: the provider's own interval, twice a day without one */
     NSInteger hours = [ds integerForKey:@"sub_refresh_hours" fallback:0];
-    NSArray *hourValues = [NSArray arrayWithObjects:@"0", @"6", @"12", @"24", @"48", @"168", nil];
-    NSArray *hourNames = [NSArray arrayWithObjects:L(@"Off"), L(@"Every 6 hours"), L(@"Every 12 hours"),
-                          L(@"Every day"), L(@"Every 2 days"), L(@"Every week"), nil];
+    NSArray *hourValues = [NSArray arrayWithObjects:@"0", @"6", @"12", @"24", @"48", @"168", @"-1", nil];
+    NSArray *hourNames = [NSArray arrayWithObjects:L(@"Automatic"), L(@"Every 6 hours"), L(@"Every 12 hours"),
+                          L(@"Every day"), L(@"Every 2 days"), L(@"Every week"), L(@"Off"), nil];
     NSUInteger hi = [hourValues indexOfObject:[NSString stringWithFormat:@"%ld", (long)hours]];
     [f addLabel:L(@"Auto-update subscriptions") popup:hourNames selected:hi == NSNotFound ? 0 : (NSInteger)hi
         changed:^(NSInteger i) {
