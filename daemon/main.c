@@ -304,6 +304,7 @@ static int run_managed(const char *ctl_path, const char *config_path,
     /* a crash can leave either rule set behind, and only the go backend
        installs none of them */
     if (!go_backend_supported()) c_backend_clear_stale();
+    engine_backend_clear_stale(&dc.engine);
 
     static ctl_server_t cs;
     if (ctl_server_init(&cs, ctl_path, daemon_ctl_apply, &dc) != CTLS_OK) {

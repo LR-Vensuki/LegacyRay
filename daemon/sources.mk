@@ -15,7 +15,7 @@ CORE_SRC = core/vless.c core/b64.c core/config.c core/rules.c core/dns_msg.c \
            core/blake2b256.c
 DAEMON_SRC = dialer.c loop.c core/sniff.c pf_natlook.c ctl_server.c daemon_ctl.c storefile.c netwatch.c geo_ctl.c \
              settings.c status.c routing.c routing_exec.c routing_fwd.c pf_table.c \
-             c_backend.c mac_sysproxy.c go_config.c go_backend.c awg_utun.c awg_route.c awg_pfroute.c \
+             c_backend.c mac_sysproxy.c go_config.c go_backend.c engine_config.c engine_backend.c awg_utun.c awg_route.c awg_pfroute.c \
              legacy_ios.c proc_detach.c main.c
 AWGD_SRC   = senkoawgd.c awg_utun.c awg_route.c awg_pfroute.c core/awg_config.c \
              core/awg_handshake.c core/awg_tunnel.c core/b64.c core/reality_crypto.c \

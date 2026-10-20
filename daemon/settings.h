@@ -76,6 +76,7 @@ typedef struct {
     int      bypass_lan;     /* lan, link-local and cgnat skip the tunnel */
     int      sub_panel_title; /* a refresh always takes the panel's name */
     int      prefer_chacha;   /* ask servers for chacha20, cheap on armv7 */
+    int      engine_core;     /* profiles the rust engine carries go through it, when installed */
     char     xray_version[16];   /* claimed in the reality session id */
     char     sub_user_agent[SETTINGS_VALUE_MAX]; /* default subscription UA */
     int      kill_switch;     /* udp that is not dns stays off the wire while up */
