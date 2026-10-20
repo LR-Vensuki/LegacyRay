@@ -1,0 +1,170 @@
+#define _DEFAULT_SOURCE
+
+#include "session.h"
+#include "socks5_client.h"
+#include "transport.h"
+
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+static int g_fail = 0;
+static void ok(const char *what, int cond) {
+    if (cond) return;
+    g_fail++;
+    fprintf(stderr, "FAIL %s\n", what);
+}
+
+static void nonblock(int fd) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+}
+
+static size_t drain(int fd, uint8_t *buf, size_t cap) {
+    ssize_t n = read(fd, buf, cap);
+    return n > 0 ? (size_t)n : 0;
+}
+
+/* a client that answers socks at once sends its first bytes before the
+   upstream proxy has replied; they must reach the proxy only after its
+   connect reply, never as the next handshake message */
+static void test_socks5_upstream_holds_client_bytes(void) {
+    int sv[2];
+    uint8_t got[4096];
+    size_t n, consumed = 0;
+    session_t *s = calloc(1, sizeof *s);
+    static const uint8_t request[] = { 0x05, 0x01, 0x00, 0x03, 11, 'e', 'x', 'a', 'm', 'p',
+                                       'l', 'e', '.', 'c', 'o', 'm', 0x01, 0xbb };
+    static const uint8_t hello[] = { 0x16, 0x03, 0x01, 0x00, 0x05, 'h', 'e', 'l', 'l', 'o' };
+    uint8_t first[sizeof request + sizeof hello];
+
+    ok("alloc", s != NULL);
+    ok("pair", socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    nonblock(sv[0]);
+    nonblock(sv[1]);
+    void *th = transport_tcp.open(sv[0], NULL);
+    ok("session", session_init_after_greet(s, &transport_tcp, th, VL_PROTO_SOCKS5,
+                                           NULL, NULL, NULL, NULL) == SESS_OK);
+
+    memcpy(first, request, sizeof request);
+    memcpy(first + sizeof request, hello, sizeof hello);
+    ok("feed request and hello", session_feed_client(s, first, sizeof first, &consumed) == SESS_OK);
+    ok("all taken", consumed == sizeof first);
+    n = drain(sv[1], got, sizeof got);
+    ok("only the greeting went out", n == 3 && got[0] == 0x05 && got[1] == 0x01 && got[2] == 0x00);
+
+    /* more client bytes while the proxy is still silent stay held too */
+    ok("feed more", session_feed_client(s, (const uint8_t *)"more", 4, &consumed) == SESS_OK &&
+                    consumed == 4);
+    ok("nothing more went out", drain(sv[1], got, sizeof got) == 0);
+    ok("held bytes are not pending", session_remote_pending(s) == 0);
+
+    ok("method reply", write(sv[1], "\x05\x00", 2) == 2);
+    ok("pump", session_pump_remote(s) == SESS_OK);
+    n = drain(sv[1], got, sizeof got);
+    if (n != sizeof request || memcmp(got, request, sizeof request)) { fprintf(stderr, "n=%zu:", n); for (size_t i = 0; i < n; ++i) fprintf(stderr, " %02x", got[i]); fprintf(stderr, "\n"); }
+    ok("then the connect request alone", n == sizeof request &&
+                                         memcmp(got, request, sizeof request) == 0);
+
+    ok("connect reply", write(sv[1], "\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00", 10) == 10);
+    ok("pump relay", session_pump_remote(s) == SESS_OK);
+    ok("relay", s->state == SESS_RELAY);
+    n = drain(sv[1], got, sizeof got);
+    ok("then the client bytes, in order", n == sizeof hello + 4 &&
+                                          memcmp(got, hello, sizeof hello) == 0 &&
+                                          memcmp(got + sizeof hello, "more", 4) == 0);
+
+    ok("feed after relay", session_feed_client(s, (const uint8_t *)"live", 4, &consumed) == SESS_OK);
+    n = drain(sv[1], got, sizeof got);
+    ok("relay bytes go straight out", n == 4 && memcmp(got, "live", 4) == 0);
+
+    transport_tcp.close(th);
+    close(sv[0]);
+    close(sv[1]);
+    free(s);
+}
+
+/* the same for an http connect upstream */
+static void test_http_upstream_holds_client_bytes(void) {
+    int sv[2];
+    uint8_t got[4096];
+    size_t n, consumed = 0;
+    session_t *s = calloc(1, sizeof *s);
+    static const uint8_t request[] = { 0x05, 0x01, 0x00, 0x01, 192, 0, 2, 1, 0x01, 0xbb };
+    uint8_t first[sizeof request + 5];
+
+    ok("alloc http", s != NULL);
+    ok("pair http", socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    nonblock(sv[0]);
+    nonblock(sv[1]);
+    void *th = transport_tcp.open(sv[0], NULL);
+    ok("session http", session_init_after_greet(s, &transport_tcp, th, VL_PROTO_HTTP,
+                                                NULL, NULL, NULL, NULL) == SESS_OK);
+    memcpy(first, request, sizeof request);
+    memcpy(first + sizeof request, "hello", 5);
+    ok("feed http", session_feed_client(s, first, sizeof first, &consumed) == SESS_OK &&
+                    consumed == sizeof first);
+    n = drain(sv[1], got, sizeof got);
+    got[n < sizeof got ? n : sizeof got - 1] = 0;
+    ok("only the connect request went out",
+       n > 0 && strncmp((char *)got, "CONNECT 192.0.2.1:443", 21) == 0 &&
+       strstr((char *)got, "hello") == NULL);
+
+    static const char reply[] = "HTTP/1.1 200 Connection established\r\n\r\n";
+    ok("http reply", write(sv[1], reply, sizeof reply - 1) == (ssize_t)(sizeof reply - 1));
+    ok("pump http", session_pump_remote(s) == SESS_OK && s->state == SESS_RELAY);
+    n = drain(sv[1], got, sizeof got);
+    ok("then the client bytes", n == 5 && memcmp(got, "hello", 5) == 0);
+
+    transport_tcp.close(th);
+    close(sv[0]);
+    close(sv[1]);
+    free(s);
+}
+
+/* a session whose remote queue is full says so, so the loop stops reading */
+static void test_client_room(void) {
+    session_t *s = calloc(1, sizeof *s);
+    ok("room alloc", s != NULL);
+    ok("empty queue has room", session_client_room(s) == 8192);
+    s->to_remote_len = sizeof s->to_remote - 4096;
+    ok("nearly full queue has none", session_client_room(s) == 0);
+    s->to_remote_hold = 100;
+    ok("held bytes are not pending", session_remote_pending(s) == sizeof s->to_remote - 4096 - 100);
+    free(s);
+}
+
+/* socks numbers ipv6 as 4, vless as 3 (which is a domain in socks) */
+static void test_socks5_ipv6_address_type(void) {
+    socks5_client_t c;
+    vless_dest_t dest;
+    uint8_t out[64];
+    size_t out_len = 0, consumed = 0;
+    memset(&dest, 0, sizeof dest);
+    dest.atyp = VLESS_ADDR_IPV6;
+    dest.host_addr[0] = 0x20;
+    dest.host_addr[1] = 0x01;
+    dest.port = 443;
+    s5c_init(&c, NULL, NULL, &dest);
+    ok("v6 greeting", s5c_make_request(&c, out, sizeof out, &out_len) == S5C_OK);
+    ok("v6 method reply", s5c_feed(&c, (const uint8_t *)"\x05\x00", 2, &consumed, out,
+                                   sizeof out, &out_len) == S5C_OK);
+    ok("v6 connect", out_len == 22 && out[3] == 0x04 && out[4] == 0x20 && out[5] == 0x01 &&
+                     out[20] == 0x01 && out[21] == 0xbb);
+}
+
+int main(void) {
+    test_socks5_ipv6_address_type();
+    test_socks5_upstream_holds_client_bytes();
+    test_http_upstream_holds_client_bytes();
+    test_client_room();
+    if (g_fail) {
+        fprintf(stderr, "%d check(s) failed\n", g_fail);
+        return 1;
+    }
+    puts("all session upstream checks passed");
+    return 0;
+}

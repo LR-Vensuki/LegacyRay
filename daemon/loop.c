@@ -1097,6 +1097,27 @@ static void service_direct(loop_t *lp, loop_conn_t *c, short local_re, short rem
     }
 }
 
+/* client bytes the session refused wait in prebuf, ahead of any new read */
+static int feed_backlog(loop_conn_t *c) {
+    size_t off = 0;
+    while (off < c->prebuf_len) {
+        size_t consumed = 0;
+        sess_status_t fr = session_feed_client(&c->sess, c->prebuf + off,
+                                               c->prebuf_len - off, &consumed);
+        if (fr != SESS_OK) {
+            if (c->sess.state == SESS_ERROR) return -1;
+            break;
+        }
+        if (consumed == 0) break;
+        off += consumed;
+    }
+    if (off > 0) {
+        memmove(c->prebuf, c->prebuf + off, c->prebuf_len - off);
+        c->prebuf_len -= off;
+    }
+    return 0;
+}
+
 static void service_conn(loop_t *lp, loop_conn_t *c,
                          short local_re, short remote_re) {
     if (c->direct) {
@@ -1108,10 +1129,16 @@ static void service_conn(loop_t *lp, loop_conn_t *c,
     if (remote_re & (POLLIN | POLLOUT | POLLHUP | POLLERR)) {
         session_pump_remote(&c->sess);
     }
+    if (c->prebuf_len > 0 && feed_backlog(c) != 0) {
+        drop_conn(lp, c);
+        return;
+    }
 
-    if (local_re & POLLIN) {
+/* read only what the session can take: a refused tail used to be lost */
+    size_t room = c->prebuf_len == 0 ? session_client_room(&c->sess) : 0;
+    if ((local_re & POLLIN) && room > 0) {
         uint8_t buf[8192];
-        ssize_t n = read(c->local_fd, buf, sizeof buf);
+        ssize_t n = read(c->local_fd, buf, room < sizeof buf ? room : sizeof buf);
         if (n > 0) {
             lp->bytes_up += (uint64_t)n;
             size_t off = 0;
@@ -1124,9 +1151,10 @@ static void service_conn(loop_t *lp, loop_conn_t *c,
                         drop_conn(lp, c);
                         return;
                     }
-                    break;
                 }
-                if (consumed == 0) { /* session backpressured */
+                if (fr != SESS_OK || consumed == 0) { /* session backpressured */
+                    memcpy(c->prebuf, buf + off, (size_t)n - off);
+                    c->prebuf_len = (size_t)n - off;
                     session_pump_remote(&c->sess);
                     break;
                 }
@@ -1264,8 +1292,10 @@ size_t loop_prepare(loop_t *lp, struct pollfd *pfd, size_t cap) {
         if (c->sess.state == SESS_VISION_FIRST)
             session_pump_remote(&c->sess);
 
-/* poll the local socket and pending output */
-        short lev = POLLIN;
+/* poll the local socket and pending output; a session with no room for
+   another read, or a backlog of refused bytes, waits for its remote */
+        short lev = 0;
+        if (c->prebuf_len == 0 && session_client_room(&c->sess) > 0) lev |= POLLIN;
         if (c->pend_off < c->pend_len) lev |= POLLOUT;
         pfd[nf].fd = c->local_fd;
         pfd[nf].events = lev;
@@ -1273,9 +1303,10 @@ size_t loop_prepare(loop_t *lp, struct pollfd *pfd, size_t cap) {
         map[nf] = c; is_remote[nf] = 0;
         nf++;
 
-        /* poll remote writes only when needed */
-        short ev = POLLIN;
-        if (c->sess.to_remote_len > 0) ev |= POLLOUT;
+        /* poll remote writes only when needed, and reads only while the
+           client queue has room: a full one would spin the loop */
+        short ev = session_remote_room(&c->sess) > 0 ? POLLIN : 0;
+        if (session_remote_pending(&c->sess) > 0) ev |= POLLOUT;
         else if (c->sess.vt && c->sess.vt->want_write && c->sess.th &&
                  c->sess.vt->want_write(c->sess.th))
             ev |= POLLOUT;

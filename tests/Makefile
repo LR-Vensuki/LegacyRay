@@ -59,6 +59,7 @@ HOST_TESTS += test_dialer
 HOST_TESTS += test_sniff
 HOST_TESTS += test_loop_route
 HOST_TESTS += test_engine_config
+HOST_TESTS += test_session_upstream
 
 all: test
 
@@ -81,6 +82,7 @@ test: $(HOST_TESTS)
 	./test_ctl_server
 	./test_autoconnect
 	./test_session_direct
+	./test_session_upstream
 	./test_config_compat
 	./test_transport_ws
 	./test_store_contract
@@ -235,6 +237,17 @@ test_session_direct: test_session_direct.c $(CORE)/session.c $(CORE)/socks5.c $(
 	      $(CORE)/socks5_client.c $(CORE)/http_client.c $(CORE)/vision.c \
 	      $(CORE)/trojan_client.c $(CORE)/shadowsocks_client.c $(CORE)/reality_crypto.c \
 	      $(TRACE) $(REPLAY) $(UPLOAD) -o $@ $(TLS_LDFLAGS)
+
+test_session_upstream: test_session_upstream.c $(CORE)/session.c $(CORE)/session.h $(CORE)/socks5.c \
+              $(NET_SAFE) $(CORE)/vless.c $(CORE)/vless_conn.c $(CORE)/socks5_client.c \
+              $(CORE)/http_client.c $(CORE)/vision.c $(CORE)/trojan_client.c \
+              $(CORE)/shadowsocks_client.c $(CORE)/reality_crypto.c $(CORE)/transport_tcp.c \
+              $(TRACE) $(REPLAY) $(UPLOAD)
+	$(CC) $(CFLAGS) $(TLS_CFLAGS) test_session_upstream.c $(CORE)/session.c \
+	      $(CORE)/socks5.c $(NET_SAFE) $(CORE)/vless.c $(CORE)/vless_conn.c \
+	      $(CORE)/socks5_client.c $(CORE)/http_client.c $(CORE)/vision.c \
+	      $(CORE)/trojan_client.c $(CORE)/shadowsocks_client.c $(CORE)/reality_crypto.c \
+	      $(CORE)/transport_tcp.c $(TRACE) $(REPLAY) $(UPLOAD) -o $@ $(TLS_LDFLAGS)
 
 test_trojan: test_trojan.c $(CORE)/trojan_client.c $(CFG_SRC)
 	$(CC) $(CFLAGS) $(TLS_CFLAGS) test_trojan.c $(CORE)/trojan_client.c $(CFG_SRC) -o $@ $(TLS_LDFLAGS)

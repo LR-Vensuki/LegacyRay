@@ -65,7 +65,31 @@ static void request_upstream_direct(session_t *s, const char *why, int mark_tran
     }
 }
 
+static void flush_remote(session_t *s);
+
+/* a socks5 or http upstream is still answering its handshake */
+static int upstream_handshake_pending(const session_t *s) {
+    return s->state == SESS_VLESS_RESP &&
+           (s->proto == VL_PROTO_SOCKS5 || s->proto == VL_PROTO_HTTP ||
+            s->proto == VL_PROTO_HTTPS);
+}
+
+/* handshake bytes go ahead of the held client bytes, whole or not at all */
+static size_t push_before_hold(session_t *s, const uint8_t *buf, size_t len) {
+    size_t at = s->to_remote_len - s->to_remote_hold;
+    if (len > sizeof s->to_remote - s->to_remote_len) {
+        s->state = SESS_ERROR;
+        return 0;
+    }
+    memmove(s->to_remote + at + len, s->to_remote + at, s->to_remote_hold);
+    memcpy(s->to_remote + at, buf, len);
+    s->to_remote_len += len;
+    flush_remote(s);
+    return len;
+}
+
 static size_t push_remote_mode(session_t *s, const uint8_t *buf, size_t len, int raw) {
+    if (s->to_remote_hold > 0 && !raw) return push_before_hold(s, buf, len);
     if (s->to_remote_len > 0) {
         if (s->to_remote_raw != raw) return 0;
         return q_append(s->to_remote, &s->to_remote_len, sizeof s->to_remote, buf, len);
@@ -112,9 +136,10 @@ static long now_ms(void) {
 
 static void flush_remote(session_t *s) {
     size_t off = 0;
-    while (off < s->to_remote_len) {
+    size_t ready = s->to_remote_len - s->to_remote_hold;
+    while (off < ready) {
         int w = transport_write_mode(s, s->to_remote + off,
-                                     s->to_remote_len - off,
+                                     ready - off,
                                      s->to_remote_raw);
         if (w > 0) { off += (size_t)w; continue; }
         if (w == TRANSPORT_WANT_WRITE || w == TRANSPORT_WANT_READ) break;
@@ -193,6 +218,12 @@ static sess_status_t send_vision_first(session_t *s,
 
 /* wrap client bytes atomically so backpressure cannot split a vision block */
 static size_t push_app(session_t *s, const uint8_t *buf, size_t len) {
+    if (upstream_handshake_pending(s)) {
+        size_t took = q_append(s->to_remote, &s->to_remote_len, sizeof s->to_remote,
+                               buf, len);
+        s->to_remote_hold += took;
+        return took;
+    }
     if (s->proto == VL_PROTO_SHADOWSOCKS) {
         if (len == 0) return 0;
         size_t free_rm = sizeof s->to_remote - s->to_remote_len;
@@ -640,7 +671,7 @@ sess_status_t session_pump_remote(session_t *s) {
 
 /* drain all readable records in one pump (avoid empty/truncated body) */
     for (;;) {
-        size_t room = sizeof s->to_client - s->to_client_len;
+        size_t room = session_remote_room(s);
         if (room == 0) return SESS_OK;
 
         uint8_t tmp[SESS_BUF];
@@ -743,6 +774,12 @@ sess_status_t session_pump_remote(session_t *s) {
                 }
             }
 
+/* the upstream took the connection: what the client sent meanwhile goes out */
+            if (s->state == SESS_RELAY && s->to_remote_hold > 0) {
+                s->to_remote_hold = 0;
+                flush_remote(s);
+                if (s->state == SESS_ERROR) return SESS_ERR;
+            }
 /* flush bytes parked during response parsing when relay mode starts */
             if (s->state == SESS_RELAY && s->client_stage_len > 0) {
                 push_staged_client(s);
@@ -791,6 +828,31 @@ size_t session_take_client(session_t *s, uint8_t *out, size_t cap) {
     }
     s->to_client_len -= take;
     return take;
+}
+
+size_t session_remote_room(const session_t *s) {
+    size_t room;
+    if (!s) return 0;
+    room = sizeof s->to_client - s->to_client_len;
+/* shadowsocks decrypts every whole chunk it holds at once, and plaintext is
+   never longer than its ciphertext: what is staged plus the next read must
+   fit the client queue, or the tail of a download is dropped */
+    if (s->proto == VL_PROTO_SHADOWSOCKS)
+        room = s->u.sc.dec_stage_len < room ? room - s->u.sc.dec_stage_len : 0;
+    return room;
+}
+
+size_t session_remote_pending(const session_t *s) {
+    return s ? s->to_remote_len - s->to_remote_hold : 0;
+}
+
+/* one read of up to 8 kb, plus the most framing a block of it can gain
+   (vision padding is the largest) */
+size_t session_client_room(const session_t *s) {
+    size_t free_rm;
+    if (!s) return 0;
+    free_rm = sizeof s->to_remote - s->to_remote_len;
+    return free_rm >= 8192 + VISION_MAX_OVERHEAD + 64 ? 8192 : 0;
 }
 
 int session_is_done(const session_t *s) {

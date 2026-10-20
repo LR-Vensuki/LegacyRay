@@ -46,7 +46,12 @@ static int format_connect(socks5_client_t *c, uint8_t *out, size_t cap, size_t *
     out[len++] = 0x05; /* version 5 */
     out[len++] = 0x01; /* cmd connect */
     out[len++] = 0x00; /* rsv */
-    out[len++] = (uint8_t)c->dest.atyp;
+    /* socks numbers address types its own way: 1 ipv4, 3 domain, 4 ipv6,
+       where vless has 1, 2, 3 */
+    if (c->dest.atyp == VLESS_ADDR_IPV4) out[len++] = 0x01;
+    else if (c->dest.atyp == VLESS_ADDR_DOMAIN) out[len++] = 0x03;
+    else if (c->dest.atyp == VLESS_ADDR_IPV6) out[len++] = 0x04;
+    else return S5C_ERR_PROTO;
 
     if (c->dest.atyp == VLESS_ADDR_IPV4) {
         memcpy(out + len, c->dest.host_addr, 4);
