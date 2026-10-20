@@ -19,6 +19,8 @@ if [ "${SENKO_UPDATE:-0}" != "1" ]; then
   if [ -S /var/tmp/legacyrayd.sock ] && [ -x /usr/bin/legacyrayctl ]; then
     /usr/bin/legacyrayctl DISCONNECT >/dev/null 2>&1 || true
   fi
+  # the supervisor of a daemon started without launchd restarts it otherwise
+  [ -x /usr/bin/legacyray-kick ] && /usr/bin/legacyray-kick --stop-supervisor >/dev/null 2>&1 || true
   "$LAUNCHCTL" unload "$PLIST" >/dev/null 2>&1 || true
   killall -TERM legacyrayd >/dev/null 2>&1 || true
   sleep 1

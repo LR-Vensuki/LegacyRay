@@ -401,7 +401,7 @@ static int wait_sock_down(int tenths) {
 }
 
 /* start legacyrayd without launchd */
-static int spawn_legacyrayd_direct(void) {
+static int spawn_legacyrayd_direct(pid_t *out) {
     const char *bin = senko_daemon_path();
     char *argv[] = {
         (char *)bin,
@@ -447,12 +447,194 @@ static int spawn_legacyrayd_direct(void) {
         return -1;
     }
 
+    if (out) *out = pid;
     return 0;
+}
+
+/* launchd's KeepAlive job is how legacyrayd normally runs. when launchd does
+   not take the job (some ios 6 jailbreaks lose its socket after boot) the
+   daemon used to be started bare from here, and its first crash or jetsam kill
+   left the phone without one until the app was opened again. the supervisor
+   is this binary again, resident, doing for that daemon what KeepAlive would.
+   its pid file is locked for as long as it runs, which is how a stop tells a
+   live supervisor from a stale file */
+#define SUPERVISE_PID SENKO_SUPERVISE_PID
+/* the job's ThrottleInterval, and how far a crash loop backs off */
+#define SUPERVISE_GAP_MIN_S 3
+#define SUPERVISE_GAP_MAX_S 60
+/* a daemon that ran this long was not crash looping */
+#define SUPERVISE_STEADY_S 60
+
+static const char *senko_kick_self_path(void);
+
+static volatile sig_atomic_t supervise_stop;
+static volatile pid_t supervise_child;
+
+static void supervise_on_term(int sig) {
+    (void)sig;
+    supervise_stop = 1;
+    pid_t child = supervise_child;
+    if (child > 0) (void)kill(child, SIGTERM);
+}
+
+static void supervise_klog_exit(pid_t pid, int status, long ran, int wait) {
+    char msg[160];
+    if (WIFSIGNALED(status))
+        snprintf(msg, sizeof msg,
+                 "supervisor: legacyrayd %d killed by signal %d after %ld s, "
+                 "restarting in %d s", (int)pid, WTERMSIG(status), ran, wait);
+    else
+        snprintf(msg, sizeof msg,
+                 "supervisor: legacyrayd %d exited with %d after %ld s, "
+                 "restarting in %d s", (int)pid,
+                 WIFEXITED(status) ? WEXITSTATUS(status) : -1, ran, wait);
+    klog(msg);
+}
+
+static int supervise(void) {
+    int fd = open(SUPERVISE_PID, O_RDWR | O_CREAT | O_NOFOLLOW, 0644);
+    if (fd < 0) {
+        klog("supervisor: cannot open its pid file");
+        return 1;
+    }
+    /* the daemon it starts must not hold the lock after it */
+    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        klog("supervisor: another one is already running");
+        close(fd);
+        return 0;
+    }
+    char text[24];
+    int len = snprintf(text, sizeof text, "%d\n", (int)getpid());
+    (void)ftruncate(fd, 0);
+    (void)pwrite(fd, text, (size_t)len, 0);
+
+    /* out of the app's session, so nothing aimed at the app reaches it */
+    (void)setsid();
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = supervise_on_term;
+    sigemptyset(&sa.sa_mask);
+    /* no SA_RESTART: the wait and the pause between starts must return */
+    (void)sigaction(SIGTERM, &sa, NULL);
+    (void)sigaction(SIGINT, &sa, NULL);
+    klog("supervisor: started");
+
+    int gap = SUPERVISE_GAP_MIN_S;
+    while (!supervise_stop) {
+        if (access(senko_daemon_path(), X_OK) != 0) {
+            klog("supervisor: legacyrayd is gone, stopping");
+            break;
+        }
+        struct timeval start, end;
+        gettimeofday(&start, NULL);
+        pid_t child = 0;
+        int status = 0;
+        long ran = 0;
+        if (spawn_legacyrayd_direct(&child) == 0) {
+            supervise_child = child;
+            /* a stop that landed before the pid was known */
+            if (supervise_stop) (void)kill(child, SIGTERM);
+            while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+            supervise_child = 0;
+            gettimeofday(&end, NULL);
+            ran = elapsed_ms(&start, &end) / 1000;
+            if (supervise_stop) break;
+        }
+        if (ran >= SUPERVISE_STEADY_S) gap = SUPERVISE_GAP_MIN_S;
+        int wait = ran < gap ? gap - (int)ran : 0;
+        if (child > 0) supervise_klog_exit(child, status, ran, wait);
+        gap = gap * 2 > SUPERVISE_GAP_MAX_S ? SUPERVISE_GAP_MAX_S : gap * 2;
+        for (unsigned left = (unsigned)wait; left > 0 && !supervise_stop; )
+            left = sleep(left);
+        if (supervise_stop) break;
+        /* launchd took the job after all, or someone started a daemon by
+           hand: a second one would only wait behind it */
+        if (sock_alive()) {
+            klog("supervisor: another legacyrayd answers, stepping down");
+            break;
+        }
+    }
+    (void)ftruncate(fd, 0);
+    close(fd);
+    return 0;
+}
+
+/* 1 when a running supervisor was stopped, 0 when none was running. it takes
+   its daemon down with it */
+static int stop_supervisor(void) {
+    int fd = open(SUPERVISE_PID, O_RDWR | O_NOFOLLOW);
+    if (fd < 0) return 0;
+    (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        close(fd);
+        return 0;
+    }
+    pid_t pid = 0;
+    int stopped = 0;
+    /* the daemon gets three seconds to take its tunnel down on SIGTERM */
+    for (int i = 0; i < 30 && !stopped; ++i) {
+        if (pid <= 1) {
+            char text[24];
+            ssize_t n = pread(fd, text, sizeof text - 1, 0);
+            if (n > 0) {
+                text[n] = '\0';
+                pid = (pid_t)strtol(text, NULL, 10);
+                if (pid > 1) (void)kill(pid, SIGTERM);
+            }
+        }
+        usleep(100000);
+        stopped = flock(fd, LOCK_EX | LOCK_NB) == 0;
+    }
+    if (!stopped && pid > 1) {
+        klog("supervisor did not stop on SIGTERM, killing it");
+        (void)kill(pid, SIGKILL);
+        for (int i = 0; i < 20 && !stopped; ++i) {
+            usleep(100000);
+            stopped = flock(fd, LOCK_EX | LOCK_NB) == 0;
+        }
+    }
+    close(fd);
+    return 1;
+}
+
+/* start the supervisor, which starts the daemon. a supervisor that cannot be
+   started leaves the old bare start, which is still a daemon */
+static int start_supervisor(void) {
+    const char *self = senko_kick_self_path();
+    if (self && access(self, X_OK) == 0) {
+        char *argv[] = { (char *)self, (char *)"--supervise", NULL };
+        posix_spawn_file_actions_t fa;
+        if (posix_spawn_file_actions_init(&fa) == 0) {
+            int rc = posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null",
+                                                      O_RDONLY, 0);
+            if (rc == 0)
+                rc = posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO, SYSTEM_LOG,
+                                                      O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (rc == 0)
+                rc = posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, SYSTEM_LOG,
+                                                      O_WRONLY | O_CREAT | O_APPEND, 0644);
+            pid_t pid = 0;
+            if (rc == 0) rc = posix_spawn(&pid, self, &fa, NULL, argv, environ);
+            posix_spawn_file_actions_destroy(&fa);
+            if (rc == 0) return 0;
+            char msg[128];
+            snprintf(msg, sizeof msg, "supervisor spawn failed (%d: %s)",
+                     rc, strerror(rc));
+            klog(msg);
+        }
+    } else {
+        klog("supervisor: cannot find legacyray-kick itself");
+    }
+    klog("starting legacyrayd unsupervised");
+    return spawn_legacyrayd_direct(NULL);
 }
 
 static void kill_legacyrayd(void) {
     static const char *kills[] = { SENKO_USR_BIN "/killall", "/usr/bin/killall", "/bin/killall", NULL };
     char killbin[64];
+    /* or it starts the daemon again three seconds later */
+    (void)stop_supervisor();
     if (find_bin(kills, killbin, sizeof killbin) != 0) return;
     char *argv[] = { killbin, (char *)"-9", (char *)"legacyrayd", NULL };
     (void)run_argv(argv);
@@ -722,6 +904,7 @@ static void restore_awg_upgrade_state(void) {
 
 static void stop_legacyrayd_for_update(void) {
     char launchctl[64];
+    (void)stop_supervisor();
     static const char *launchctl_paths[] = {
         SENKO_JBROOT "/bin/launchctl", SENKO_USR_BIN "/launchctl",
         "/bin/launchctl", "/usr/bin/launchctl", "/sbin/launchctl",
@@ -906,6 +1089,14 @@ static int ensure_legacyrayd(void) {
         klog("legacyrayd stayed silent, restarting it");
     }
 
+    /* a supervised daemon that is silent, or between restarts. launchd gets
+       its try again, and the supervisor must not start a daemon behind it */
+    if (stop_supervisor()) {
+        klog("stopped the supervisor, trying launchd again");
+        kill_legacyrayd();
+        (void)wait_legacyrayd_down(30);
+    }
+
     char lc[64];
     static const char *lcs[] = {
         SENKO_JBROOT "/bin/launchctl", SENKO_USR_BIN "/launchctl",
@@ -969,7 +1160,7 @@ static int ensure_legacyrayd(void) {
         (void)wait_legacyrayd_down(60);
         (void)wait_sock_down(60);
         unlink(SOCK);
-        if (spawn_legacyrayd_direct() == 0 && wait_sock(120) == 0) {
+        if (start_supervisor() == 0 && wait_sock(120) == 0) {
             klog("up via direct spawn");
             return 0;
         }
@@ -1047,8 +1238,18 @@ int main(int argc, char **argv) {
        stay open in a daemon started from here for as long as it runs */
     for (int fd = 3, max = getdtablesize(); fd < max; ++fd) (void)close(fd);
 
+    /* resident: it must not hold the startup lock, every later kick needs it */
+    if (argc == 2 && strcmp(argv[1], "--supervise") == 0) return supervise();
+
     int kick_lock = acquire_kick_lock();
     if (kick_lock < 0) {
+        /* package scripts stop it before they touch the daemon; waiting on a
+           stuck lock must not leave it restarting one behind them */
+        if (argc == 2 && strcmp(argv[1], "--stop-supervisor") == 0) {
+            klog("could not lock daemon startup");
+            (void)stop_supervisor();
+            return 0;
+        }
 /* awg control must not die behind a stuck lock; timeouts below are short */
         if (argc == 2 && strcmp(argv[1], "--awg-stop") == 0) {
             klog("could not lock daemon startup");
@@ -1072,6 +1273,10 @@ int main(int argc, char **argv) {
         int rc = awg_stop();
         if (rc != 0) fputs("error amneziawg stop timeout\n", stdout);
         return rc == 0 ? 0 : 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--stop-supervisor") == 0) {
+        (void)stop_supervisor();
+        return 0;
     }
     if (argc == 2 && strcmp(argv[1], "--awg-status") == 0) return awg_status();
     if (argc == 3 && strcmp(argv[1], "--awg") == 0) return awg_start(argv[2]) == 0 ? 0 : 1;

@@ -613,6 +613,25 @@ static const char *proc_state(const char *pid_path, char *out, size_t cap) {
     return out;
 }
 
+/* which of the two ways the daemon runs. the supervisor means launchd did not
+   take the job on this phone and the kick had to start the daemon itself */
+static const char *parent_state(char *out, size_t cap) {
+    long parent = (long)getppid();
+    FILE *f = fopen(SENKO_SUPERVISE_PID, "r");
+    long supervisor = 0;
+    if (f) {
+        if (fscanf(f, "%ld", &supervisor) != 1) supervisor = 0;
+        fclose(f);
+    }
+    if (supervisor > 1 && supervisor == parent)
+        snprintf(out, cap, "kick supervisor (pid %ld), launchd did not start it", parent);
+    else if (parent == 1)
+        snprintf(out, cap, "launchd");
+    else
+        snprintf(out, cap, "pid %ld", parent);
+    return out;
+}
+
 static const char *file_state(const char *path, char *out, size_t cap) {
     struct stat st;
     if (lstat(path, &st) != 0) {
@@ -821,6 +840,8 @@ int daemon_ctl_diag(void *ctx, char *buf, size_t cap, size_t *len) {
              proc_state("/var/run/legacyrayawgd.pid", scratch, sizeof scratch));
     diag_add(buf, cap, &off, "proc.senko_kick", "%s",
              kick_state(scratch, sizeof scratch));
+    diag_add(buf, cap, &off, "proc.parent", "%s",
+             parent_state(scratch, sizeof scratch));
     diag_add(buf, cap, &off, "substrate.tlsfix", "%s",
              file_state(SENKO_SUBSTRATE_DIR "/legacyraytlsfix.dylib", scratch, sizeof scratch));
     diag_add(buf, cap, &off, "substrate.status", "%s",

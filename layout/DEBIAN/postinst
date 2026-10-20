@@ -81,6 +81,9 @@ fi
 
 # the in-app updater runs this script itself and restarts the daemon after
 if [ "${SENKO_UPDATE:-0}" != "1" ]; then
+  # a daemon the kick started without launchd has a supervisor that would
+  # start it again behind launchd's back
+  [ -x "$KICK" ] && "$KICK" --stop-supervisor >/dev/null 2>&1 || true
   "$LAUNCHCTL" unload "$PLIST" >/dev/null 2>&1 || true
   killall -TERM legacyrayd >/dev/null 2>&1 || true
   sleep 1
