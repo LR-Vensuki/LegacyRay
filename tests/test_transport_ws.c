@@ -229,6 +229,8 @@ static void *upgrade_server(void *arg) {
         req[len] = '\0';
         if (strstr(req, "\r\n\r\n")) break;
     }
+    /* xray's early-data setting never reaches the server as part of the path */
+    if (strncmp(req, "GET /ws HTTP/1.1\r\n", 18) != 0) return NULL;
     if (header_value(req, "Sec-WebSocket-Key", key, sizeof key) == 0 &&
         accept_for_key(key, accept, sizeof accept) == 0)
         (void)write_response(fd, accept);
@@ -245,7 +247,7 @@ static void *open_with_budget(int sv[2], int budget_ms) {
     transport_tls_cfg_t cfg;
     memset(&cfg, 0, sizeof cfg);
     cfg.ws_host = "cdn.example";
-    cfg.path = "/ws";
+    cfg.path = "/ws?ed=2048";
     cfg.handshake_ms = budget_ms;
     return transport_ws_tcp.open(sv[0], &cfg);
 }
