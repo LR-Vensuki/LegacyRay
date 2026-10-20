@@ -1009,5 +1009,5 @@ static void rh_close(void *handle) {
 }
 
 const transport_vt_t transport_reality = {
-    rh_open, rh_read, rh_write, rh_raw_write, rh_close, rh_want_write, NULL
+    rh_open, rh_read, rh_write, rh_raw_write, rh_close, rh_want_write, NULL, NULL
 };

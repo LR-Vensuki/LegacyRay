@@ -29,6 +29,10 @@ typedef struct {
    caller can dial again. zero leaves the handshake to the first read/write.
    only the websocket transports use it */
     int handshake_ms;
+/* the carrier speaks http/2 over this tls (xhttp, grpc): offer only h2, as
+   xray and grpc do. a server that picked http/1.1 would read the h2 preface
+   as a broken request, and grpc servers refuse a handshake without h2 */
+    int alpn_h2;
 } transport_tls_cfg_t;
 
 typedef struct transport_vt {
@@ -50,6 +54,11 @@ typedef struct transport_vt {
 
 /* half close after the relay drained cleanly; optional (http/2 end stream) */
     void (*shutdown)(void *h);
+
+/* 1 while the transport takes no bytes until the peer sends something (an
+   http/2 window or stream slot), so the loop waits for input instead of
+   spinning on a writable socket; optional */
+    int (*blocked)(void *h);
 } transport_vt_t;
 
 extern const transport_vt_t transport_tcp; /* plain tcp transport */

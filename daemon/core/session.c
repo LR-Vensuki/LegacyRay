@@ -846,6 +846,10 @@ size_t session_remote_pending(const session_t *s) {
     return s ? s->to_remote_len - s->to_remote_hold : 0;
 }
 
+int session_remote_blocked(const session_t *s) {
+    return s && s->vt && s->vt->blocked && s->th && s->vt->blocked(s->th);
+}
+
 /* one read of up to 8 kb, plus the most framing a block of it can gain
    (vision padding is the largest) */
 size_t session_client_room(const session_t *s) {

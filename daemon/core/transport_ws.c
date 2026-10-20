@@ -600,6 +600,7 @@ const transport_vt_t transport_ws_tcp = {
     NULL,
     ws_close,
     ws_want_write,
+    NULL,
     NULL
 };
 
@@ -610,6 +611,7 @@ const transport_vt_t transport_ws_reality = {
     NULL,
     ws_close,
     ws_want_write,
+    NULL,
     NULL
 };
 
@@ -620,5 +622,6 @@ const transport_vt_t transport_ws_tls = {
     NULL,
     ws_close,
     ws_want_write,
+    NULL,
     NULL
 };

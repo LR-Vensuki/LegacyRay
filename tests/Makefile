@@ -42,7 +42,7 @@ HOST_TESTS = test_ctl_server test_autoconnect test_session_direct test_config_co
              test_pf_natlook test_reality_crypto test_tls13_kdf \
              test_tls13_keysched test_tls13_record test_tls_clienthello test_vision \
              test_transport_pick test_awg_config test_awg_handshake test_awg_tunnel test_awg_route \
-             test_xray_json test_url_headers test_grpc_core test_transport_grpc test_hpack \
+             test_xray_json test_url_headers test_grpc_core test_transport_grpc test_transport_xhttp test_hpack \
              test_app_proxy test_go_config test_net_safe test_legacy_ios \
              test_subinfo test_profiles test_amnezia_bundle test_happ_links \
              test_b64 test_traffic test_loop_traffic test_rules
@@ -105,6 +105,7 @@ test: $(HOST_TESTS)
 	./test_url_headers
 	./test_grpc_core
 	./test_transport_grpc
+	./test_transport_xhttp
 	./test_hpack
 	./test_app_proxy
 	./test_go_config
@@ -296,6 +297,22 @@ test_transport_grpc: test_transport_grpc.c $(CORE)/transport_pick.c $(CFG_SRC) \
                      $(CORE)/tls13_keysched.c $(CORE)/tls13_record.c \
                      $(CORE)/tls13_transcript.c $(CORE)/tls13_handshake.c $(TRACE) $(REPLAY) $(UPLOAD) $(CORE)/grpc_core.c
 	$(CC) $(CFLAGS) $(TLS_CFLAGS) test_transport_grpc.c $(CORE)/transport_pick.c \
+	      $(CFG_SRC) \
+	      $(CORE)/transport_tcp.c $(CORE)/transport_tls.c $(CORE)/frag.c $(CORE)/transport_ws.c \
+	      $(CORE)/transport_xhttp.c $(CORE)/hpack.c \
+	      $(CORE)/reality_handshake.c $(CORE)/reality_crypto.c $(CORE)/reality_auth.c \
+	      $(CORE)/tls_clienthello.c $(CORE)/tls13_kdf.c $(CORE)/tls13_keysched.c \
+	      $(CORE)/tls13_record.c $(CORE)/tls13_transcript.c $(CORE)/tls13_handshake.c \
+	      $(TRACE) $(REPLAY) $(UPLOAD) $(CORE)/grpc_core.c $(TLS_LDFLAGS) -o $@
+
+test_transport_xhttp: test_transport_xhttp.c $(CORE)/transport_pick.c $(CFG_SRC) \
+                     $(CORE)/transport_tcp.c $(CORE)/transport_tls.c $(CORE)/frag.c \
+                     $(CORE)/transport_ws.c $(CORE)/transport_xhttp.c $(CORE)/hpack.c $(CORE)/reality_handshake.c \
+                     $(CORE)/reality_crypto.c $(CORE)/reality_auth.c \
+                     $(CORE)/tls_clienthello.c $(CORE)/tls13_kdf.c \
+                     $(CORE)/tls13_keysched.c $(CORE)/tls13_record.c \
+                     $(CORE)/tls13_transcript.c $(CORE)/tls13_handshake.c $(TRACE) $(REPLAY) $(UPLOAD) $(CORE)/grpc_core.c
+	$(CC) $(CFLAGS) $(TLS_CFLAGS) test_transport_xhttp.c $(CORE)/transport_pick.c \
 	      $(CFG_SRC) \
 	      $(CORE)/transport_tcp.c $(CORE)/transport_tls.c $(CORE)/frag.c $(CORE)/transport_ws.c \
 	      $(CORE)/transport_xhttp.c $(CORE)/hpack.c \
