@@ -18,6 +18,7 @@ typedef struct {
 /* restarts after the engine died on its own, within the current window */
     int   restarts;
     long  window_started_ms;
+    long  next_try_ms;   /* after a restart that failed */
 /* where the binary and its configuration live; NULL takes the installed
    paths. host tests point them at a scratch directory */
     const char *bin;

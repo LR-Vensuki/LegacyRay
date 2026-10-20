@@ -2,8 +2,9 @@
 SUBSTRATE_DIR=/Library/MobileSubstrate/DynamicLibraries
 case "$1" in
   remove|purge)
-    killall -9 legacyrayd legacyrayawgd >/dev/null 2>&1 || true
+    killall -9 legacyrayd legacyrayawgd legacyray-engine >/dev/null 2>&1 || true
     rm -f /var/tmp/legacyrayd.sock /var/tmp/legacyrayd.token /var/run/legacyray-pf.conf
+    rm -f /var/run/legacyray-engine.yaml /var/run/legacyray-engine.pid
     rm -f "$SUBSTRATE_DIR/legacyraytlsfix.dylib" "$SUBSTRATE_DIR/legacyraytlsfix.plist" \
           "$SUBSTRATE_DIR/legacyraystatus.dylib" "$SUBSTRATE_DIR/legacyraystatus.plist"
     rm -f /var/mobile/Library/Preferences/com.legacyray.status.state \

@@ -22,7 +22,7 @@ if [ "${SENKO_UPDATE:-0}" != "1" ]; then
   "$LAUNCHCTL" unload "$PLIST" >/dev/null 2>&1 || true
   killall -TERM legacyrayd >/dev/null 2>&1 || true
   sleep 1
-  killall -9 legacyrayd legacyrayawgd >/dev/null 2>&1 || true
+  killall -9 legacyrayd legacyrayawgd legacyray-engine >/dev/null 2>&1 || true
   if [ -f /var/run/legacyray-pf.conf ]; then
     for pfctl in /sbin/pfctl /usr/sbin/pfctl; do
       [ -x "$pfctl" ] && { "$pfctl" -q -F all >/dev/null 2>&1 || true; break; }
