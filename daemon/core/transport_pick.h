@@ -11,6 +11,9 @@ extern "C" {
 /* share one picker so ws links behave identically in both daemon modes */
 const transport_vt_t *transport_for_server(const vl_server_t *s);
 
+/* the server's xhttp knobs as the transport takes them */
+transport_xhttp_opts_t transport_xhttp_opts(const vl_server_t *s);
+
 #ifdef __cplusplus
 }
 #endif

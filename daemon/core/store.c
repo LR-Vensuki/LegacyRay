@@ -31,7 +31,11 @@ static int same_server(const vl_server_t *a, const vl_server_t *b) {
         && strcmp(a->path, b->path) == 0
         && strcmp(a->ws_host, b->ws_host) == 0
         && strcmp(a->mode, b->mode) == 0
-        && strcmp(a->encryption, b->encryption) == 0;
+        && strcmp(a->encryption, b->encryption) == 0
+        && a->xh_pad_min == b->xh_pad_min
+        && a->xh_pad_max == b->xh_pad_max
+        && a->xh_post_max == b->xh_post_max
+        && a->xh_no_grpc == b->xh_no_grpc;
 }
 
 static int section_seen(const int *order, size_t n, int id) {
@@ -603,6 +607,56 @@ static int pct_encode(const char *src, char *dst, size_t cap) {
     return (int)o;
 }
 
+/* "&extra=" with the xhttp knobs as xray's json, every byte outside the
+   unreserved set escaped so other clients read the link back the same.
+   nothing is added while every knob is at xray's default */
+static int append_xh_extra(const vl_server_t *s, char *buf, size_t cap, size_t *off) {
+    static const char hex[] = "0123456789ABCDEF";
+    char json[160];
+    size_t j = 0, o = *off;
+    int sep = 0;
+
+    if (s->net != VL_NET_XHTTP ||
+        (!s->xh_pad_max && !s->xh_post_max && !s->xh_no_grpc))
+        return 0;
+    j += (size_t)snprintf(json + j, sizeof json - j, "{");
+    if (s->xh_pad_max) {
+        j += (size_t)snprintf(json + j, sizeof json - j, "\"xPaddingBytes\":\"%lu-%lu\"",
+                              (unsigned long)s->xh_pad_min, (unsigned long)s->xh_pad_max);
+        sep = 1;
+    }
+    if (s->xh_post_max) {
+        j += (size_t)snprintf(json + j, sizeof json - j, "%s\"scMaxEachPostBytes\":%lu",
+                              sep ? "," : "", (unsigned long)s->xh_post_max);
+        sep = 1;
+    }
+    if (s->xh_no_grpc)
+        j += (size_t)snprintf(json + j, sizeof json - j, "%s\"noGRPCHeader\":true",
+                              sep ? "," : "");
+    j += (size_t)snprintf(json + j, sizeof json - j, "}");
+    if (j >= sizeof json) return -1;
+
+    if (o + 7 >= cap) return -1;
+    memcpy(buf + o, "&extra=", 7);
+    o += 7;
+    for (size_t i = 0; i < j; ++i) {
+        unsigned char c = (unsigned char)json[i];
+        int plain = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                    (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~';
+        if (o + (plain ? 1 : 3) >= cap) return -1;
+        if (plain) {
+            buf[o++] = (char)c;
+        } else {
+            buf[o++] = '%';
+            buf[o++] = hex[c >> 4];
+            buf[o++] = hex[c & 0xf];
+        }
+    }
+    buf[o] = '\0';
+    *off = o;
+    return 0;
+}
+
 static int build_link(const vl_server_t *s, char *buf, size_t cap) {
     if (s->proto == VL_PROTO_SOCKS5 || s->proto == VL_PROTO_HTTP || s->proto == VL_PROTO_HTTPS) {
         const char *scheme = (s->proto == VL_PROTO_SOCKS5) ? "socks5" :
@@ -759,6 +813,7 @@ static int build_link(const vl_server_t *s, char *buf, size_t cap) {
         if (m < 0 || (size_t)m >= cap - off) return -1;
         off += (size_t)m;
     }
+    if (append_xh_extra(s, buf, cap, &off) != 0) return -1;
     if (s->insecure) {
         int m = snprintf(buf + off, cap - off, "&allowInsecure=1");
         if (m < 0 || (size_t)m >= cap - off) return -1;

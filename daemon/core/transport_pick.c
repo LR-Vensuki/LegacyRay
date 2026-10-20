@@ -1,6 +1,8 @@
 #include "transport_pick.h"
 #include "reality_handshake.h"
 
+#include <string.h>
+
 const transport_vt_t *transport_for_server(const vl_server_t *s) {
     if (!s) return NULL;
 
@@ -49,4 +51,15 @@ const transport_vt_t *transport_for_server(const vl_server_t *s) {
         case VL_SEC_REALITY: return &transport_reality;
         default:             return NULL;
     }
+}
+
+transport_xhttp_opts_t transport_xhttp_opts(const vl_server_t *s) {
+    transport_xhttp_opts_t o;
+    memset(&o, 0, sizeof o);
+    if (!s || s->net != VL_NET_XHTTP) return o;
+    o.pad_min = s->xh_pad_min;
+    o.pad_max = s->xh_pad_max;
+    o.post_max = s->xh_post_max;
+    o.no_grpc = s->xh_no_grpc;
+    return o;
 }

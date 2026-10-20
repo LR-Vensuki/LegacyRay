@@ -355,6 +355,12 @@ void loop_set_tls(loop_t *lp, const char *sni, const char *fingerprint,
     lp->tls_cfg.insecure = lp->insecure;
 }
 
+void loop_set_xhttp(loop_t *lp, const transport_xhttp_opts_t *xh) {
+    if (!lp) return;
+    if (xh) lp->tls_cfg.xh = *xh;
+    else memset(&lp->tls_cfg.xh, 0, sizeof lp->tls_cfg.xh);
+}
+
 /* a connection's buffers run to a couple of hundred kilobytes, so a slot is
    only allocated while it is in use. a fixed array of them kept tens of
    megabytes resident in a daemon on a phone with 256 MB in all */
@@ -688,6 +694,7 @@ loop_status_t loop_set_server(loop_t *lp, const transport_vt_t *vt,
 
     loop_set_tls(lp, sni, fingerprint, reality_pbk, reality_sid, path, ws_host,
                  xhttp_mode, peer_host, insecure);
+    loop_set_xhttp(lp, NULL); /* the caller sets the new server's, if any */
 
     lp->active = 1; /* accept clients again */
     return LOOP_OK;
@@ -773,6 +780,7 @@ static void fill_open_fields(loop_t *lp, loop_conn_t *c) {
     c->open_tls_cfg.xhttp_mode = c->open_xhttp_mode;
     c->open_tls_cfg.peer_host = c->open_peer_host;
     c->open_tls_cfg.insecure = c->open_insecure;
+    c->open_tls_cfg.xh = lp->tls_cfg.xh;
     c->open_tls_cfg.handshake_ms = LOOP_OPEN_HANDSHAKE_MS;
 }
 

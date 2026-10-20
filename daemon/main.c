@@ -130,6 +130,10 @@ static int run_single(const char *link, int port) {
     }
     loop_set_tls(&lp, srv.sni, srv.fp, srv.pbk, srv.sid, srv.path, srv.ws_host,
                  srv.mode, srv.host, srv.insecure);
+    {
+        transport_xhttp_opts_t xh = transport_xhttp_opts(&srv);
+        loop_set_xhttp(&lp, &xh);
+    }
 
     install_signals();
     fprintf(stderr, "legacyrayd: socks5 on 127.0.0.1:%u -> %s:%u (%s)\n",

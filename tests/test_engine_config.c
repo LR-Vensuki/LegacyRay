@@ -129,6 +129,18 @@ int main(int argc, char **argv) {
     assert(strcmp(str(p, "host"), "cdn.example.com") == 0);
     cJSON_Delete(root);
 
+    /* the profile's extra reaches the engine; defaults stay unset */
+    root = render("vless://11111111-1111-4111-8111-111111111111@example.com:443"
+                  "?type=xhttp&security=reality&sni=cdn.example.com"
+                  "&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=ab&path=%2Fxh"
+                  "&extra=%7B%22xPaddingBytes%22%3A%2250-60%22%2C%22scMaxEachPostBytes%22"
+                  "%3A4096%2C%22noGRPCHeader%22%3Atrue%7D", "203.0.113.7", json, sizeof json);
+    p = inner(inner(chain_of(root)));
+    assert(strcmp(str(p, "x_padding_bytes"), "50-60") == 0);
+    assert(cJSON_GetObjectItem(p, "sc_max_each_post_bytes")->valueint == 4096);
+    assert(cJSON_IsTrue(cJSON_GetObjectItem(p, "no_grpc_header")));
+    cJSON_Delete(root);
+
     /* vless + tls + xhttp: the engine picks the alpn itself (h2 only) */
     root = render("vless://11111111-1111-4111-8111-111111111111@example.com:443"
                   "?type=xhttp&security=tls&sni=cdn.example.com&path=%2Fxh",
@@ -140,6 +152,8 @@ int main(int argc, char **argv) {
     assert(strcmp(str(p, "http_version"), "h2") == 0);
     assert(strcmp(str(p, "mode"), "auto") == 0);
     assert(strcmp(str(p, "host"), "cdn.example.com") == 0);
+    assert(cJSON_GetObjectItem(p, "x_padding_bytes") == NULL);
+    assert(cJSON_GetObjectItem(p, "no_grpc_header") == NULL);
     cJSON_Delete(root);
 
     /* other query parameters of a websocket path stay, early data goes */

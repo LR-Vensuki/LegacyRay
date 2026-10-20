@@ -183,6 +183,14 @@ static void put_carrier(eout_t *o, const vl_server_t *s) {
         /* behind tls or reality xray speaks h2; in the clear, http/1.1 */
         put(o, ",");
         put_key(o, "http_version", s->security == VL_SEC_NONE ? "h1" : "h2");
+        /* what the server holds its clients to, when the profile says */
+        if (s->xh_pad_max)
+            putf(o, ",\"x_padding_bytes\":\"%lu-%lu\"",
+                 (unsigned long)s->xh_pad_min, (unsigned long)s->xh_pad_max);
+        if (s->xh_post_max)
+            putf(o, ",\"sc_max_each_post_bytes\":%lu", (unsigned long)s->xh_post_max);
+        if (s->xh_no_grpc)
+            put(o, ",\"no_grpc_header\":true");
         put(o, ",\"protocol\":");
         put_proxy(o, s);
         put(o, "}");

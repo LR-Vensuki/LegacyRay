@@ -2,6 +2,7 @@
 #include "b64.h"
 #include "happ.h"
 #include "profiles.h"
+#include "third_party/cJSON.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -377,6 +378,69 @@ static void copy_remark(const char *src, size_t src_len, char *dst, size_t cap) 
     dst[n] = '\0';
 }
 
+/* xray's Int32Range: 500, "500", "100-1000" or {"from":100,"to":1000} */
+static int j_range(const cJSON *v, uint32_t *lo, uint32_t *hi) {
+    long a, b;
+    if (cJSON_IsNumber(v)) {
+        if (v->valuedouble < 0 || v->valuedouble > 1e9) return -1;
+        a = b = (long)v->valuedouble;
+    } else if (cJSON_IsString(v) && v->valuestring) {
+        char *end;
+        a = strtol(v->valuestring, &end, 10);
+        if (end == v->valuestring) return -1;
+        if (*end == '-') {
+            const char *rest = end + 1;
+            b = strtol(rest, &end, 10);
+            if (end == rest) return -1;
+        } else {
+            b = a;
+        }
+        if (*end != '\0') return -1;
+    } else if (cJSON_IsObject(v)) {
+        const cJSON *f = cJSON_GetObjectItemCaseSensitive(v, "from");
+        const cJSON *t = cJSON_GetObjectItemCaseSensitive(v, "to");
+        if (!cJSON_IsNumber(f) || !cJSON_IsNumber(t)) return -1;
+        if (f->valuedouble < 0 || t->valuedouble > 1e9) return -1;
+        a = (long)f->valuedouble;
+        b = (long)t->valuedouble;
+    } else {
+        return -1;
+    }
+    if (a < 0 || b < a || b > 1000000000L) return -1;
+    *lo = (uint32_t)a;
+    *hi = (uint32_t)b;
+    return 0;
+}
+
+/* the xhttp knobs a server holds its clients to. xray reads them both at the
+   top of xhttpSettings and inside its "extra", which is also what a share
+   link carries. a zero upper bound is xray's "use the default" */
+static void xh_extra_apply(vl_server_t *s, const cJSON *o) {
+    uint32_t lo, hi;
+    const cJSON *v;
+    if (!cJSON_IsObject(o)) return;
+    if (j_range(cJSON_GetObjectItemCaseSensitive(o, "xPaddingBytes"), &lo, &hi) == 0 &&
+        hi > 0) {
+        s->xh_pad_min = lo;
+        s->xh_pad_max = hi;
+    }
+    if (j_range(cJSON_GetObjectItemCaseSensitive(o, "scMaxEachPostBytes"), &lo, &hi) == 0 &&
+        lo > 0)
+        s->xh_post_max = lo; /* a post at the low end passes any check the server makes */
+    v = cJSON_GetObjectItemCaseSensitive(o, "noGRPCHeader");
+    if (cJSON_IsBool(v)) s->xh_no_grpc = cJSON_IsTrue(v) ? 1 : 0;
+}
+
+static void apply_link_extra(vl_server_t *s, const char *v, size_t vlen) {
+    char json[4096];
+    cJSON *o;
+    if (url_percent_decode(v, vlen, json, sizeof json) < 0) return;
+    o = cJSON_Parse(json);
+    if (!o) return;
+    xh_extra_apply(s, o);
+    cJSON_Delete(o);
+}
+
 static void assign_kv(vl_server_t *s,
                       const char *k, size_t klen,
                       const char *v, size_t vlen) {
@@ -437,6 +501,8 @@ static void assign_kv(vl_server_t *s,
         copy_query_value(v, vlen, s->obfs, sizeof s->obfs);
     } else if (KEY_IS("obfs-password") || KEY_IS("obfs_password")) {
         copy_query_value(v, vlen, s->obfs_password, sizeof s->obfs_password);
+    } else if (KEY_IS("extra")) {
+        apply_link_extra(s, v, vlen);
     }
 
     #undef KEY_IS
@@ -885,8 +951,6 @@ const char *cfg_reject_reason(const char *blob, size_t blob_len,
     return NULL;
 }
 
-#include "third_party/cJSON.h"
-
 static int jstr_copy(const cJSON *obj, const char *key, char *dst, size_t cap) {
     const cJSON *v;
     if (!obj || !key || !dst || cap == 0) return -1;
@@ -1212,6 +1276,8 @@ static int xray_outbound_to_server(const cJSON *ob, const char *remarks,
             (void)jstr_copy(xh, "path", s->path, sizeof s->path);
             (void)jstr_copy(xh, "mode", s->mode, sizeof s->mode);
             (void)jstr_copy(xh, "host", s->ws_host, sizeof s->ws_host);
+            xh_extra_apply(s, xh);
+            xh_extra_apply(s, cJSON_GetObjectItemCaseSensitive(xh, "extra"));
         }
         if (s->net == VL_NET_GRPC && cJSON_IsObject(gr))
             (void)jstr_copy(gr, "serviceName", s->path, sizeof s->path);
