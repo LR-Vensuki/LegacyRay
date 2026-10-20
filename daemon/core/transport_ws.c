@@ -404,6 +404,11 @@ static int ws_write(void *handle, const uint8_t *buf, size_t len) {
     if (pr < 0) return pr;
 
     if (len == 0) return 0;
+/* one frame per write, as big as the frame buffer and a 16-bit length hold;
+   the caller sends the rest with the next write. a whole 64 kb queue used
+   to fail the write */
+    if (len > sizeof(h->tx_buf) - 8) len = sizeof(h->tx_buf) - 8;
+    if (len > 0xffff) len = 0xffff;
 
     size_t header_size = 0;
     h->tx_buf[0] = 0x82;
@@ -431,33 +436,20 @@ static int ws_write(void *handle, const uint8_t *buf, size_t len) {
         h->tx_buf[header_size + i] = buf[i] ^ mask[i % 4];
     }
 
+/* once the frame is built every byte of it is taken: what the socket did
+   not accept waits in tx_pending and goes out before the next frame. saying
+   fewer were taken made the caller send them again in a new frame, so the
+   peer got them twice and the stream broke */
     int w = h->sub_vt->write(h->sub_h, h->tx_buf, header_size + len);
-    if (w < 0) {
-        if (w == TRANSPORT_WANT_WRITE) {
-            memcpy(h->tx_pending, h->tx_buf, header_size + len);
-            h->tx_pending_len = header_size + len;
-            h->tx_pending_off = 0;
-            return TRANSPORT_WANT_WRITE;
-        }
-        return w;
-    }
-
-    if ((size_t)w >= header_size) {
-        size_t consumed = (size_t)w - header_size;
-        if (consumed < len) {
-            size_t rem = (header_size + len) - (size_t)w;
-            memcpy(h->tx_pending, h->tx_buf + w, rem);
-            h->tx_pending_len = rem;
-            h->tx_pending_off = 0;
-        }
-        return (int)consumed;
-    } else {
+    if (w < 0 && w != TRANSPORT_WANT_WRITE) return w;
+    if (w < 0) w = 0;
+    if ((size_t)w < header_size + len) {
         size_t rem = (header_size + len) - (size_t)w;
         memcpy(h->tx_pending, h->tx_buf + w, rem);
         h->tx_pending_len = rem;
         h->tx_pending_off = 0;
-        return TRANSPORT_WANT_WRITE;
     }
+    return (int)len;
 }
 
 static int ws_read(void *handle, uint8_t *buf, size_t len) {
