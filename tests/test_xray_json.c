@@ -117,7 +117,13 @@ static const char k_array_cfg[] =
     "        \"xhttpSettings\": {"
     "          \"path\": \"/api/\","
     "          \"mode\": \"packet-up\","
-    "          \"host\": \"host.example\""
+    "          \"host\": \"host.example\","
+    "          \"extra\": {"
+    "            \"xPaddingBytes\": \"200-300\","
+    "            \"scMaxEachPostBytes\": \"8000-9000\","
+    "            \"noGRPCHeader\": true,"
+    "            \"xmux\": { \"maxConcurrency\": \"16-32\" }"
+    "          }"
     "        }"
     "      }"
     "    }]"
@@ -337,6 +343,11 @@ int main(void) {
        strcmp(srv[3].ws_host, "host.example") == 0 &&
        strcmp(srv[3].sni, "sni.example") == 0 &&
        strcmp(srv[3].remark, "XHTTP node") == 0);
+    ok("xhttp extra: the server's padding, post size and grpc header",
+       n >= 4 && srv[3].xh_pad_min == 200 && srv[3].xh_pad_max == 300 &&
+       srv[3].xh_post_max == 8000 && srv[3].xh_no_grpc == 1);
+    ok("ws nodes carry no xhttp knobs",
+       n >= 5 && srv[4].xh_pad_max == 0 && srv[4].xh_post_max == 0);
 
     ok("xray trojan over ws",
        n >= 5 && srv[4].proto == VL_PROTO_TROJAN &&

@@ -32,12 +32,14 @@ typedef struct {
 
 typedef struct {
     int post;
+    int grpc_ct; /* content-type: application/grpc in the headers */
     char path[2048];
     size_t data; /* bytes of the data frames that follow on the stream */
     size_t biggest_frame;
 } request_t;
 
-static int start(xh_test_t *t, const char *path, const char *mode) {
+static int start_opts(xh_test_t *t, const char *path, const char *mode,
+                      const transport_xhttp_opts_t *xh) {
     memset(t, 0, sizeof *t);
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, t->sv) != 0) return -1;
     nonblock(t->sv[0]);
@@ -47,11 +49,16 @@ static int start(xh_test_t *t, const char *path, const char *mode) {
     cfg.path = path;
     cfg.ws_host = "front.example";
     cfg.xhttp_mode = mode;
+    if (xh) cfg.xh = *xh;
     t->th = transport_xhttp_tcp.open(t->sv[0], &cfg);
     if (!t->th) return -1;
     uint8_t none = 0;
     transport_xhttp_tcp.write(t->th, &none, 0); /* flushes the queued preface */
     return 0;
+}
+
+static int start(xh_test_t *t, const char *path, const char *mode) {
+    return start_opts(t, path, mode, NULL);
 }
 
 static void stop(xh_test_t *t) {
@@ -116,6 +123,8 @@ static int next_request(xh_test_t *t, request_t *r) {
             if (p[2] != 0x04) return -1; /* :path, name from the static table */
             if (senko_hpack_string(p + 3, plen - 3, r->path, sizeof r->path, &used) != 0)
                 return -1;
+            for (size_t i = 0; i + 16 <= plen; ++i)
+                if (memcmp(p + i, "application/grpc", 16) == 0) r->grpc_ct = 1;
         } else if (f[3] == 0 && sid && stream == sid) {
             r->data += plen;
             if (plen > r->biggest_frame) r->biggest_frame = plen;
@@ -125,13 +134,18 @@ static int next_request(xh_test_t *t, request_t *r) {
     return sid ? 0 : -1;
 }
 
-/* the padding sits in the query, 100-1000 bytes as xray servers require */
-static int padding_ok(const char *path) {
+/* the padding sits in the query, within the range the server requires */
+static int padding_in(const char *path, size_t lo, size_t hi) {
     const char *p = strstr(path, "x_padding=");
     if (!p) return 0;
     p += 10;
     size_t n = strspn(p, "X");
-    return n >= 100 && n <= 1000 && p[n] == 0;
+    return n >= lo && n <= hi && p[n] == 0;
+}
+
+/* xray's default xPaddingBytes */
+static int padding_ok(const char *path) {
+    return padding_in(path, 100, 1000);
 }
 
 static void test_stream_one_path(void) {
@@ -232,11 +246,51 @@ static void test_packet_up_post_slots(void) {
     free(t);
 }
 
+/* a profile's extra: its padding range, a smaller post size, and streamed
+   requests without the grpc content type */
+static void test_profile_knobs(void) {
+    xh_test_t *t = malloc(sizeof *t);
+    request_t r;
+    static uint8_t big[20000];
+    transport_xhttp_opts_t xh;
+    memset(big, 'k', sizeof big);
+    memset(&xh, 0, sizeof xh);
+    xh.pad_min = 20;
+    xh.pad_max = 30;
+    xh.post_max = 4096;
+    ok("knobs open", t && start_opts(t, "/k", "packet-up", &xh) == 0);
+    collect(t);
+    ok("knobs download", next_request(t, &r) == 0 && !r.post);
+    ok("download padding in the profile's range", padding_in(r.path, 20, 30));
+    server_settings(t, 0);
+    ok("posts stop at the server's size",
+       transport_xhttp_tcp.write(t->th, big, sizeof big) == 4096);
+    collect(t);
+    ok("knobs post", next_request(t, &r) == 0 && r.post && r.data == 4096);
+    ok("post padding in the profile's range", padding_in(r.path, 20, 30));
+    stop(t);
+
+    ok("stream-one keeps the grpc type by default", start(t, "/k", "stream-one") == 0);
+    collect(t);
+    ok("default stream-one request", next_request(t, &r) == 0 && r.grpc_ct);
+    stop(t);
+
+    memset(&xh, 0, sizeof xh);
+    xh.no_grpc = 1;
+    ok("no grpc header open", start_opts(t, "/k", "stream-one", &xh) == 0);
+    collect(t);
+    ok("noGRPCHeader drops the grpc type", next_request(t, &r) == 0 && r.post && !r.grpc_ct);
+    ok("and keeps the default padding", padding_ok(r.path));
+    stop(t);
+    free(t);
+}
+
 int main(void) {
     test_stream_one_path();
     test_auto_packet_up();
     test_packet_up_connection_window();
     test_packet_up_post_slots();
+    test_profile_knobs();
     if (g_fail) {
         fprintf(stderr, "%d check(s) failed\n", g_fail);
         return 1;

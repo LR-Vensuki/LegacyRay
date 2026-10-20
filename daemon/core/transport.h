@@ -13,6 +13,14 @@ extern "C" {
 #define TRANSPORT_EOF         (-3) /* close after the peer ends the stream */
 #define TRANSPORT_ERR         (-4) /* close after an unrecoverable failure */
 
+/* the xhttp knobs a server may set (xray's xhttpSettings / "extra"); zero
+   keeps xray's defaults */
+typedef struct {
+    uint32_t pad_min, pad_max; /* x_padding length range, default 100-1000 */
+    uint32_t post_max;         /* largest packet-up body the server takes */
+    int      no_grpc;          /* no grpc content type on streamed requests */
+} transport_xhttp_opts_t;
+
 /* borrow config strings so transport opens can outlive the caller stack */
 typedef struct {
     const char *sni; /* preserve the tls server name */
@@ -33,6 +41,7 @@ typedef struct {
    xray and grpc do. a server that picked http/1.1 would read the h2 preface
    as a broken request, and grpc servers refuse a handshake without h2 */
     int alpn_h2;
+    transport_xhttp_opts_t xh;
 } transport_tls_cfg_t;
 
 typedef struct transport_vt {

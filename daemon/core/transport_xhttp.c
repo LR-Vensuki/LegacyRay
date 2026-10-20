@@ -13,7 +13,7 @@
 #define XH_TX   (32 * 1024)
 #define XH_APP  (64 * 1024)
 #define XH_PKT  16384 /* max packet-up body: one data frame at the default size */
-#define XH_PATH 1800  /* base, session, sequence, query and padding */
+#define XH_PATH 2048  /* base, session, sequence, query and padding */
 /* packet-up posts in flight at once. xray's server holds at most 30 posts
    that wait for the upstream and others refuse more, so stay well under */
 #define XH_POSTS 16
@@ -42,6 +42,9 @@ typedef struct {
     int                   peer_end;
     int                   security_tls; /* 1 if tls/reality (scheme https) */
     int                   grpc; /* use the xray gRPC stream envelope */
+    int                   stream_ct; /* grpc content type on streamed requests */
+    size_t                pad_min, pad_max; /* x_padding length range */
+    size_t                pkt_max; /* largest packet-up body */
 
 /* http/2 response header assembly and failure reporting */
     int                   hdr_wait; /* expecting CONTINUATION */
@@ -187,15 +190,18 @@ static int hpack_idx_name(uint8_t *out, size_t cap, size_t *off,
     return hpack_str(out, cap, off, val);
 }
 
-/* xray servers refuse a request whose x_padding is outside 100-1000 bytes
-   (its default xPaddingBytes); like xray, pick a length in that range */
+/* xray servers refuse a request whose x_padding is outside their
+   xPaddingBytes, 100-1000 bytes unless the profile says otherwise; like xray,
+   pick a length in that range. the cap keeps a request inside XH_PATH */
 #define XH_PAD_MIN 100
 #define XH_PAD_MAX 1000
+#define XH_PAD_CAP 1400
 
-static size_t rand_pad_len(void) {
+static size_t rand_pad_len(const xh_t *h) {
     uint8_t rb[2];
-    if (RAND_bytes(rb, 2) != 1) return XH_PAD_MIN;
-    return XH_PAD_MIN + (((size_t)rb[0] << 8) | rb[1]) % (XH_PAD_MAX - XH_PAD_MIN + 1);
+    size_t span = h->pad_max - h->pad_min + 1;
+    if (RAND_bytes(rb, 2) != 1) return h->pad_min;
+    return h->pad_min + (((size_t)rb[0] << 8) | rb[1]) % span;
 }
 
 static void gen_session_id(char out[48]) {
@@ -268,8 +274,8 @@ static int build_headers(uint8_t *out, size_t cap, size_t *n,
 }
 
 static void path_with_padding(const xh_t *h, const char *path, char *out, size_t cap) {
-    char pad[XH_PAD_MAX + 1];
-    size_t n = rand_pad_len();
+    char pad[XH_PAD_CAP + 1];
+    size_t n = rand_pad_len(h);
     memset(pad, 'X', n);
     pad[n] = 0;
     if (h->query[0])
@@ -648,6 +654,17 @@ static int queue_boot(xh_t *h, const transport_tls_cfg_t *cfg, int sec) {
     h->mode = mode_for_open(cfg, sec == XH_SEC_REALITY);
     h->security_tls = sec != XH_SEC_NONE;
     h->grpc = cfg && cfg->xhttp_mode && strcmp(cfg->xhttp_mode, "grpc") == 0;
+    h->stream_ct = h->grpc || !(cfg && cfg->xh.no_grpc);
+    h->pad_min = XH_PAD_MIN;
+    h->pad_max = XH_PAD_MAX;
+    if (cfg && cfg->xh.pad_max) {
+        h->pad_max = cfg->xh.pad_max < XH_PAD_CAP ? cfg->xh.pad_max : XH_PAD_CAP;
+        h->pad_min = cfg->xh.pad_min < h->pad_max ? cfg->xh.pad_min : h->pad_max;
+        if (h->pad_min == 0) h->pad_min = 1; /* some servers refuse an empty one */
+    }
+    h->pkt_max = XH_PKT;
+    if (cfg && cfg->xh.post_max && cfg->xh.post_max < XH_PKT)
+        h->pkt_max = cfg->xh.post_max;
     h->next_sid = 1;
     h->seq = 0;
     h->peer_win = h->our_win = 65535;
@@ -699,8 +716,8 @@ static int queue_boot(xh_t *h, const transport_tls_cfg_t *cfg, int sec) {
             snprintf(path_pad, sizeof path_pad, "%s", h->base_path);
         else
             path_with_padding(h, h->base_path, path_pad, sizeof path_pad);
-        if (build_headers(block, sizeof block, &blen, 1, path_pad, h->host, 1, 0, 0,
-                          h->security_tls) != 0)
+        if (build_headers(block, sizeof block, &blen, 1, path_pad, h->host, h->stream_ct,
+                          0, 0, h->security_tls) != 0)
             return -1;
         h->up_stream = h->dn_stream = alloc_sid(h); /* stream 1 both ways */
         if (frame_append(h, H2_HEADERS, 0x04, h->up_stream, block, blen) != 0)
@@ -723,8 +740,8 @@ static int queue_boot(xh_t *h, const transport_tls_cfg_t *cfg, int sec) {
 /* keep upload on its own stream for stream-up mode */
         blen = 0;
         path_with_padding(h, path, path_pad, sizeof path_pad);
-        if (build_headers(block, sizeof block, &blen, 1, path_pad, h->host, 1, 0, 0,
-                          h->security_tls) != 0)
+        if (build_headers(block, sizeof block, &blen, 1, path_pad, h->host, h->stream_ct,
+                          0, 0, h->security_tls) != 0)
             return -1;
         h->up_stream = alloc_sid(h);
         if (frame_append(h, H2_HEADERS, 0x04, h->up_stream, block, blen) != 0)
@@ -740,7 +757,7 @@ static int queue_boot(xh_t *h, const transport_tls_cfg_t *cfg, int sec) {
 /* one packet-up post: headers and a single data frame that ends the stream.
    nothing is queued unless both fit */
 static int send_packet(xh_t *h, const uint8_t *buf, size_t len) {
-    if (len == 0 || len > XH_PKT) return -1;
+    if (len == 0 || len > h->pkt_max) return -1;
     char path[XH_PATH], path_pad[XH_PATH];
     snprintf(path, sizeof path, "%s%s/%lld",
              h->base_path, h->session, (long long)h->seq);
@@ -818,7 +835,7 @@ static size_t xh_room(const xh_t *h) {
     if (h->state != XH_ST_OPEN) return 0;
     if (h->mode == XH_MODE_PKT) {
         if (h->posts_open >= post_limit(h)) return 0;
-        room = XH_PKT;
+        room = h->pkt_max;
         if (room > h->peer_win) room = h->peer_win;
         if (room > h->peer_init_win) room = h->peer_init_win;
         return room;

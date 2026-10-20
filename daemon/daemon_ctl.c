@@ -489,6 +489,10 @@ int daemon_ctl_apply(void *ctx, const ctl_action_t *action) {
                     status_set(0);
                     return DCTL_ERR_LOOP;
                 }
+                {
+                    transport_xhttp_opts_t xh = transport_xhttp_opts(s);
+                    loop_set_xhttp(d->loop, &xh);
+                }
             }
 
             if (d->full_device) {
@@ -2006,6 +2010,10 @@ static int prepare_server_probe(daemon_ctl_t *d, const vl_server_t *server,
         if (reason && reason_cap)
             snprintf(reason, reason_cap, "local test proxy could not be prepared");
         return -1;
+    }
+    {
+        transport_xhttp_opts_t xh = transport_xhttp_opts(server);
+        loop_set_xhttp(d->loop, &xh);
     }
     return 0;
 }

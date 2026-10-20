@@ -136,6 +136,20 @@ static int append_stream(json_out_t *j, const vl_server_t *s) {
         append_string(j, s->ws_host[0] ? s->ws_host : s->sni);
         append_raw(j, ",\"mode\":");
         append_string(j, s->mode[0] ? s->mode : "auto");
+        if (s->xh_pad_max) {
+            char range[32];
+            snprintf(range, sizeof range, "%lu-%lu",
+                     (unsigned long)s->xh_pad_min, (unsigned long)s->xh_pad_max);
+            append_raw(j, ",\"xPaddingBytes\":");
+            append_string(j, range);
+        }
+        if (s->xh_post_max) {
+            char n[16];
+            snprintf(n, sizeof n, "%lu", (unsigned long)s->xh_post_max);
+            append_raw(j, ",\"scMaxEachPostBytes\":");
+            append_raw(j, n);
+        }
+        if (s->xh_no_grpc) append_raw(j, ",\"noGRPCHeader\":true");
         append_raw(j, "}");
     }
     append_raw(j, "}");

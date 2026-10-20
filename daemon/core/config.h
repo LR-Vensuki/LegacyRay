@@ -78,6 +78,12 @@ typedef struct {
    core dials one port from it at random and rotates through the rest
    (transport/internet/hysteria/udphop). empty when the link names one port */
     char     port_hop[128];
+/* xhttp knobs from the profile's "extra" (xray's xhttpSettings); zero keeps
+   xray's defaults. a server refuses x_padding outside its xPaddingBytes and a
+   post longer than its scMaxEachPostBytes, so these must match it */
+    uint32_t xh_pad_min, xh_pad_max;
+    uint32_t xh_post_max;
+    int      xh_no_grpc; /* noGRPCHeader: no grpc content type on streams */
 } vl_server_t;
 
 typedef enum {
