@@ -170,9 +170,8 @@ static int run_argv(char *const argv[]) {
     return WEXITSTATUS(st);
 }
 
-static int run_capture_text(char *const argv[], char *out, size_t cap) {
-    if (!argv || !argv[0] || !out || cap == 0) return -1;
-    out[0] = '\0';
+/* the read end of the child's stdout, or -1; stderr goes to /dev/null */
+static int spawn_stdout_pipe(char *const argv[], pid_t *pid_out) {
     int pipefd[2];
     if (pipe(pipefd) != 0) return -1;
 
@@ -200,6 +199,17 @@ static int run_capture_text(char *const argv[], char *out, size_t cap) {
         close(pipefd[0]);
         return -1;
     }
+    *pid_out = pid;
+    return pipefd[0];
+}
+
+static int run_capture_text(char *const argv[], char *out, size_t cap) {
+    if (!argv || !argv[0] || !out || cap == 0) return -1;
+    out[0] = '\0';
+    pid_t pid = 0;
+    int pipefd[2];
+    pipefd[0] = spawn_stdout_pipe(argv, &pid);
+    if (pipefd[0] < 0) return -1;
 
     size_t used = 0;
     int truncated = 0;
@@ -670,6 +680,47 @@ static int launch_job_loaded(const char *launchctl) {
     return run_capture_text(argv, output, sizeof output) == 0;
 }
 
+/* launchd holds the job. "list <label>" above goes through launchd's socket,
+   which some ios 6 jailbreaks never create (no /var/tmp/launchd from boot
+   on), so it fails there for every job; the plain list goes over mach and
+   works everywhere */
+static int launch_job_listed(const char *launchctl) {
+    char *argv[] = { (char *)launchctl, (char *)"list", NULL };
+    pid_t pid = 0;
+    int fd = spawn_stdout_pipe(argv, &pid);
+    if (fd < 0) return 0;
+    const size_t label_len = sizeof LABEL - 1;
+    char line[512];
+    size_t used = 0;
+    int found = 0, overlong = 0;
+    for (;;) {
+        char buf[256];
+        ssize_t n = read(fd, buf, sizeof buf);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        for (ssize_t i = 0; i < n; ++i) {
+            if (buf[i] != '\n') {
+                if (used < sizeof line - 1) line[used++] = buf[i];
+                else overlong = 1;
+                continue;
+            }
+            while (used && (line[used - 1] == '\r' || line[used - 1] == ' ' ||
+                            line[used - 1] == '\t')) --used;
+            /* "pid status label", the label last and whole */
+            if (!overlong && used >= label_len &&
+                memcmp(line + used - label_len, LABEL, label_len) == 0 &&
+                (used == label_len || line[used - label_len - 1] == '\t' ||
+                 line[used - label_len - 1] == ' '))
+                found = 1;
+            used = 0;
+            overlong = 0;
+        }
+    }
+    close(fd);
+    while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+    return found;
+}
+
 static int launch_job_stop(const char *launchctl) {
     char *unload[] = { (char *)launchctl, (char *)"unload",
                        (char *)senko_daemon_plist(), NULL };
@@ -902,15 +953,19 @@ static void restore_awg_upgrade_state(void) {
     (void)awg_start(path);
 }
 
-static void stop_legacyrayd_for_update(void) {
-    char launchctl[64];
-    (void)stop_supervisor();
-    static const char *launchctl_paths[] = {
+static int find_launchctl(char *out, size_t cap) {
+    static const char *paths[] = {
         SENKO_JBROOT "/bin/launchctl", SENKO_USR_BIN "/launchctl",
         "/bin/launchctl", "/usr/bin/launchctl", "/sbin/launchctl",
         "/usr/sbin/launchctl", NULL
     };
-    if (find_bin(launchctl_paths, launchctl, sizeof launchctl) == 0) {
+    return find_bin(paths, out, cap);
+}
+
+static void stop_legacyrayd_for_update(void) {
+    char launchctl[64];
+    (void)stop_supervisor();
+    if (find_launchctl(launchctl, sizeof launchctl) == 0) {
         char *unload[] = { launchctl, (char *)"unload",
                            (char *)senko_daemon_plist(), NULL };
         (void)run_argv(unload);
@@ -928,6 +983,16 @@ static void stop_legacyrayd_for_update(void) {
 static int ensure_legacyrayd(void);
 
 static int restart_legacyrayd_after_update(void) {
+    /* where launchctl cannot unload the job, KeepAlive restarted the old
+       binary while dpkg ran; killing that one is how it picks up the new */
+    char launchctl[64];
+    if (find_launchctl(launchctl, sizeof launchctl) == 0 &&
+        launch_job_listed(launchctl) && legacyrayd_alive()) {
+        klog("launchd kept the job through the update, restarting its daemon");
+        (void)kill_named("legacyrayd", SIGTERM);
+        usleep(700000);
+        kill_legacyrayd();
+    }
     return ensure_legacyrayd();
 }
 
@@ -1098,20 +1163,32 @@ static int ensure_legacyrayd(void) {
     }
 
     char lc[64];
-    static const char *lcs[] = {
-        SENKO_JBROOT "/bin/launchctl", SENKO_USR_BIN "/launchctl",
-        "/bin/launchctl", "/usr/bin/launchctl",
-        "/sbin/launchctl", "/usr/sbin/launchctl", NULL
-    };
-    int have_lc = (find_bin(lcs, lc, sizeof lc) == 0);
+    int have_lc = (find_launchctl(lc, sizeof lc) == 0);
+    int held = have_lc && (launch_job_loaded(lc) || launch_job_listed(lc));
 
     /* a job launchd already holds may still be starting, and waiting for it
        beats racing it. when launchd does not hold the job there is nothing to
        wait for, and the long wait was six seconds of nothing on every launch
        of the app */
-    if (wait_sock(have_lc && launch_job_loaded(lc) ? 60 : 5) == 0) {
+    if (wait_sock(held ? 60 : 5) == 0) {
         klog("already up via launchctl");
         return 0;
+    }
+
+    /* launchd holds the job, so a daemon that is gone or silent comes back
+       by KeepAlive once it is killed. that is the whole restart, and the one
+       that works where launchctl cannot reach launchd: there unload, load
+       and start all fail, and the repair below ended in a daemon started
+       past launchd that nothing restarted */
+    if (held) {
+        kill_legacyrayd();
+        (void)wait_legacyrayd_down(30);
+        /* ThrottleInterval: a daemon that had just started waits 3 s */
+        if (wait_legacyrayd_up(60) == 0 && wait_sock(180) == 0) {
+            klog("up via launchd keepalive");
+            return 0;
+        }
+        klog("launchd holds the job but did not bring legacyrayd back");
     }
 
     const char *bin = senko_daemon_path();
