@@ -486,89 +486,45 @@ static NSString *LRInkKey(NSString *name, CGFloat side, NSColor *ink) {
     return [NSString stringWithFormat:@"glyph.%@.%.1f.%.3f.%.3f.%.3f.%.3f", name, side, v[0], v[1], v[2], v[3]];
 }
 
-NSImage *LRGlyphPlus(CGFloat side, NSColor *ink) {
-    NSString *key = LRInkKey(@"plus", side, ink);
+/* a system template image (black on clear) kept to its own shape, fitted
+   into a side x side square and inked. pdf art may grow, bitmaps only shrink */
+static NSImage *LRSystemGlyph(NSString *name, CGFloat side, NSColor *ink) {
+    NSString *key = LRInkKey(name, side, ink);
     NSImage *img = LRCached(key);
     if (img) return img;
+    NSImage *art = [NSImage imageNamed:name];
+    NSSize n = art ? [art size] : NSZeroSize;
+    if (n.width <= 0 || n.height <= 0) return nil;
+    BOOL vector = NO;
+    for (NSImageRep *rep in [art representations])
+        if ([rep isKindOfClass:[NSPDFImageRep class]]) vector = YES;
+    CGFloat k = MIN(side / n.width, side / n.height);
+    if (!vector) k = MIN(k, 1);
+    NSSize g = NSMakeSize(roundf(n.width * k), roundf(n.height * k));
     NSColor *c = [[ink copy] autorelease];
     img = LRImageWithSize(NSMakeSize(side, side), YES, ^(CGContextRef ctx, CGRect r) {
-        CGFloat w = MAX(2.0f, roundf(side * 0.16f));
-        CGFloat m = side * 0.12f;
+        CGRect box = CGRectMake(floorf((side - g.width) / 2), floorf((side - g.height) / 2), g.width, g.height);
+        [art drawInRect:NSRectFromCGRect(box) fromRect:NSZeroRect operation:NSCompositeSourceOver
+               fraction:1 respectFlipped:YES hints:nil];
+        /* keep the art's coverage, take the ink's colour */
+        CGContextSetBlendMode(ctx, kCGBlendModeSourceIn);
         LRSetFill(ctx, c);
-        CGContextFillRect(ctx, CGRectMake(m, (side - w) / 2, side - m * 2, w));
-        CGContextFillRect(ctx, CGRectMake((side - w) / 2, m, w, side - m * 2));
+        CGContextFillRect(ctx, r);
     });
     LRCache(key, img);
     return img;
+}
+
+NSImage *LRGlyphPlus(CGFloat side, NSColor *ink) {
+    return LRSystemGlyph(NSImageNameAddTemplate, side, ink);
 }
 
 NSImage *LRGlyphGear(CGFloat side, NSColor *ink) {
-    NSString *key = LRInkKey(@"gear", side, ink);
-    NSImage *img = LRCached(key);
-    if (img) return img;
-    NSColor *c = [[ink copy] autorelease];
-    img = LRImageWithSize(NSMakeSize(side, side), YES, ^(CGContextRef ctx, CGRect r) {
-        CGPoint o = CGPointMake(side / 2, side / 2);
-        CGFloat outer = side * 0.48f, inner = side * 0.36f, hole = side * 0.15f;
-        int teeth = 8;
-        CGContextBeginPath(ctx);
-        for (int i = 0; i < teeth * 2; ++i) {
-            /* each tooth a flat top, each gap a flat bottom */
-            CGFloat a0 = (CGFloat)M_PI * 2 * i / (teeth * 2) - (CGFloat)M_PI / (teeth * 2);
-            CGFloat a1 = a0 + (CGFloat)M_PI * 2 / (teeth * 2);
-            CGFloat rad = (i % 2 == 0) ? outer : inner;
-            CGFloat inset = (i % 2 == 0) ? 0.10f : 0;
-            CGPoint p0 = CGPointMake(o.x + cos(a0 + inset) * rad, o.y + sin(a0 + inset) * rad);
-            CGPoint p1 = CGPointMake(o.x + cos(a1 - inset) * rad, o.y + sin(a1 - inset) * rad);
-            if (i == 0) CGContextMoveToPoint(ctx, p0.x, p0.y);
-            else CGContextAddLineToPoint(ctx, p0.x, p0.y);
-            CGContextAddLineToPoint(ctx, p1.x, p1.y);
-        }
-        CGContextClosePath(ctx);
-        CGContextAddEllipseInRect(ctx, CGRectMake(o.x - hole, o.y - hole, hole * 2, hole * 2));
-        LRSetFill(ctx, c);
-        CGContextEOFillPath(ctx);
-    });
-    LRCache(key, img);
-    return img;
+    return LRSystemGlyph(NSImageNameActionTemplate, side, ink);
 }
 
-NSImage *LRGlyphDots(CGFloat side, NSColor *ink) {
-    NSString *key = LRInkKey(@"dots", side, ink);
-    NSImage *img = LRCached(key);
-    if (img) return img;
-    NSColor *c = [[ink copy] autorelease];
-    img = LRImageWithSize(NSMakeSize(side, side), YES, ^(CGContextRef ctx, CGRect r) {
-        CGFloat d = MAX(3.0f, side * 0.2f), gap = (side - d * 3) / 2;
-        LRSetFill(ctx, c);
-        for (int i = 0; i < 3; ++i)
-            CGContextFillEllipseInRect(ctx, CGRectMake(i * (d + gap), (side - d) / 2, d, d));
-    });
-    LRCache(key, img);
-    return img;
-}
-
-NSImage *LRGlyphPulse(CGFloat side, NSColor *ink) {
-    NSString *key = LRInkKey(@"pulse", side, ink);
-    NSImage *img = LRCached(key);
-    if (img) return img;
-    NSColor *c = [[ink copy] autorelease];
-    img = LRImageWithSize(NSMakeSize(side, side), YES, ^(CGContextRef ctx, CGRect r) {
-        CGFloat m = side / 2;
-        LRSetStroke(ctx, c);
-        CGContextSetLineWidth(ctx, MAX(1.6f, side * 0.11f));
-        CGContextSetLineJoin(ctx, kCGLineJoinRound);
-        CGContextSetLineCap(ctx, kCGLineCapRound);
-        CGContextMoveToPoint(ctx, side * 0.04f, m);
-        CGContextAddLineToPoint(ctx, side * 0.30f, m);
-        CGContextAddLineToPoint(ctx, side * 0.40f, side * 0.18f);
-        CGContextAddLineToPoint(ctx, side * 0.56f, side * 0.84f);
-        CGContextAddLineToPoint(ctx, side * 0.66f, m);
-        CGContextAddLineToPoint(ctx, side * 0.96f, m);
-        CGContextStrokePath(ctx);
-    });
-    LRCache(key, img);
-    return img;
+NSImage *LRGlyphList(CGFloat side, NSColor *ink) {
+    return LRSystemGlyph(NSImageNameListViewTemplate, side, ink);
 }
 
 /* the icon in miniature: the stitched square and the L. off it is an

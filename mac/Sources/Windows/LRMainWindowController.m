@@ -190,7 +190,7 @@
     LRBarKey *add = [LRBarKey keyWithGlyph:LRGlyphPlus(13, ink) handler:nil];
     [add setDropMenu:[self importMenu]];
     [add setToolTip:L(@"Add servers")];
-    LRBarKey *list = [LRBarKey keyWithGlyph:LRGlyphDots(16, ink) handler:^(LRBarKey *k) {
+    LRBarKey *list = [LRBarKey keyWithGlyph:LRGlyphList(16, ink) handler:^(LRBarKey *k) {
         [k setDropMenu:[me->_sidebar listMenu]];
     }];
     [list setDropMenu:[_sidebar listMenu]];

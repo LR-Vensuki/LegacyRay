@@ -62,10 +62,9 @@ NSColor *LRColorMix(NSColor *a, NSColor *b, CGFloat t);
 NSColor *LRColorAlpha(NSColor *c, CGFloat alpha);
 void LRFlushSkinCaches(void);
 
-/* glyphs for keys and menus, drawn in ink */
+/* glyphs for keys and menus: the system's own template art, inked */
 NSImage *LRGlyphPlus(CGFloat side, NSColor *ink);
 NSImage *LRGlyphGear(CGFloat side, NSColor *ink);
-NSImage *LRGlyphDots(CGFloat side, NSColor *ink);
-NSImage *LRGlyphPulse(CGFloat side, NSColor *ink);
+NSImage *LRGlyphList(CGFloat side, NSColor *ink);
 /* the menu bar icon: a ray in a ring; template, so the menu bar inks it */
 NSImage *LRStatusItemImage(int state);   /* 0 off, 1 connecting, 2 on, 3 fault */
