@@ -346,27 +346,36 @@ int daemon_ctl_apply(void *ctx, const ctl_action_t *action) {
     switch (action->kind) {
         case CTL_ACT_START: {
             const vl_server_t *s = &action->server;
-/* quic/udp only: no senko transport carries it, so there is nothing to hand
-   the local socks loop. the go core dials it directly with its own bundled
-   hysteria client, which means this profile needs the go backend and the
-   full-device tunnel that owns it */
-            int quic_only = (s->proto == VL_PROTO_HYSTERIA2);
+/* the rust engine takes every profile it can carry, when it is installed and
+   not switched off; the built-in core stays the fallback if it will not run */
+            int engine_can = d->settings.engine_core && engine_config_supports(s) &&
+                             engine_backend_available(&d->engine);
+            int go_wanted = d->full_device &&
+                (d->settings.force_backend == SENKO_BACKEND_GO ||
+                 (d->settings.force_backend == SENKO_BACKEND_AUTO &&
+                  go_backend_supported()));
+/* quic/udp only: no senko transport carries hysteria2. the engine has a
+   client for it behind the same loopback socks port as everything else; the
+   go core dials it with its own bundled client, which needs the go backend
+   and the full-device tunnel that owns it */
+            int quic_only = (s->proto == VL_PROTO_HYSTERIA2) && (go_wanted || !engine_can);
             if (quic_only) {
                 if (!d->full_device) {
-                    fprintf(stderr, "legacyrayd: hysteria2 requires full-device mode\n");
+                    fprintf(stderr, "legacyrayd: hysteria2 requires the engine "
+                                    "or full-device mode\n");
                     status_set(0);
                     return DCTL_ERR_TRANSPORT;
                 }
                 if (d->settings.force_backend == SENKO_BACKEND_C ||
                     d->settings.force_backend == SENKO_BACKEND_APP_PROXY) {
-                    fprintf(stderr, "legacyrayd: hysteria2 requires the go backend, "
-                                    "but the c backend is pinned in settings\n");
+                    fprintf(stderr, "legacyrayd: hysteria2 requires the engine or the go "
+                                    "backend, but the c backend is pinned in settings\n");
                     status_set(0);
                     return DCTL_ERR_TRANSPORT;
                 }
                 if (!go_backend_supported()) {
-                    fprintf(stderr, "legacyrayd: hysteria2 requires the go backend, "
-                                    "unsupported on this device\n");
+                    fprintf(stderr, "legacyrayd: hysteria2 requires the engine or the go "
+                                    "backend, unsupported on this device\n");
                     status_set(0);
                     return DCTL_ERR_TRANSPORT;
                 }
@@ -375,16 +384,9 @@ int daemon_ctl_apply(void *ctx, const ctl_action_t *action) {
 /* a pin is respected even when it cannot work: go_backend_start names the
    reason it will not run on this device, which is the answer the tester came
    for, and is more use than quietly taking the c core instead */
-            int go_attempted = d->full_device &&
-                (quic_only || d->settings.force_backend == SENKO_BACKEND_GO ||
-                 (d->settings.force_backend == SENKO_BACKEND_AUTO &&
-                  go_backend_supported()));
-/* the rust engine takes every profile it can carry, when it is installed and
-   not switched off; the built-in core stays the fallback if it will not run.
-   the go backend has a core of its own and never uses the loop */
-            int use_engine = !quic_only && !go_attempted && d->settings.engine_core &&
-                             engine_config_supports(s) &&
-                             engine_backend_available(&d->engine);
+            int go_attempted = d->full_device && (quic_only || go_wanted);
+/* the go backend has a core of its own and never uses the loop */
+            int use_engine = !quic_only && !go_attempted && engine_can;
             const transport_vt_t *vt = quic_only ? NULL : transport_for_server(s);
             if (!vt && !quic_only && !use_engine) {
                 fprintf(stderr, "legacyrayd: unsupported transport/security for server\n");

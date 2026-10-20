@@ -35,7 +35,12 @@ static int same_server(const vl_server_t *a, const vl_server_t *b) {
         && a->xh_pad_min == b->xh_pad_min
         && a->xh_pad_max == b->xh_pad_max
         && a->xh_post_max == b->xh_post_max
-        && a->xh_no_grpc == b->xh_no_grpc;
+        && a->xh_no_grpc == b->xh_no_grpc
+        && a->insecure == b->insecure
+        && strcmp(a->pin_sha256, b->pin_sha256) == 0
+        && strcmp(a->obfs, b->obfs) == 0
+        && strcmp(a->obfs_password, b->obfs_password) == 0
+        && strcmp(a->port_hop, b->port_hop) == 0;
 }
 
 static int section_seen(const int *order, size_t n, int id) {
