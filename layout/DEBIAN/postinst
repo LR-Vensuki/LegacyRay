@@ -79,17 +79,33 @@ if [ -d "$APP" ]; then
   chmod 755 "$APP" "$APP/LegacyRay" 2>/dev/null || true
 fi
 
+# launchd holds the job but launchctl cannot load it back. some ios 6
+# jailbreaks never create /var/tmp/launchd: there "unload" still reaches
+# launchd while "load" and "list <label>" do not, so unloading dropped the
+# job until the next reboot. a killed daemon comes back by KeepAlive instead,
+# from whatever binary is installed by then
+keep_job() {
+  "$LAUNCHCTL" list 2>/dev/null | grep -q -E '(^|[[:space:]])com\.legacyray\.daemon[[:space:]]*$' &&
+    ! "$LAUNCHCTL" list com.legacyray.daemon >/dev/null 2>&1
+}
+
 # the in-app updater runs this script itself and restarts the daemon after
 if [ "${SENKO_UPDATE:-0}" != "1" ]; then
   # a daemon the kick started without launchd has a supervisor that would
   # start it again behind launchd's back
   [ -x "$KICK" ] && "$KICK" --stop-supervisor >/dev/null 2>&1 || true
-  "$LAUNCHCTL" unload "$PLIST" >/dev/null 2>&1 || true
+  KEEP_JOB=0
+  keep_job && KEEP_JOB=1
+  [ "$KEEP_JOB" = 1 ] || "$LAUNCHCTL" unload "$PLIST" >/dev/null 2>&1 || true
   killall -TERM legacyrayd >/dev/null 2>&1 || true
   sleep 1
   killall -9 legacyrayd >/dev/null 2>&1 || true
-  rm -f /var/tmp/legacyrayd.sock /var/tmp/legacyrayd.token
-  "$LAUNCHCTL" load -w "$PLIST" >/dev/null 2>&1 || "$LAUNCHCTL" load "$PLIST" >/dev/null 2>&1 || true
+  # a kept job is already starting the new daemon, which puts back its own
+  # socket and token
+  if [ "$KEEP_JOB" != 1 ]; then
+    rm -f /var/tmp/legacyrayd.sock /var/tmp/legacyrayd.token
+    "$LAUNCHCTL" load -w "$PLIST" >/dev/null 2>&1 || "$LAUNCHCTL" load "$PLIST" >/dev/null 2>&1 || true
+  fi
   # launchctl exits 0 even when it cannot reach launchd (some ios 6 jailbreaks
   # lose /var/tmp/launchd after boot), and then no daemon ran until the app was
   # opened. the kick starts one itself when launchd did not

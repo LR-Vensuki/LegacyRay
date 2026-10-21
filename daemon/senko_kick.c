@@ -965,7 +965,11 @@ static int find_launchctl(char *out, size_t cap) {
 static void stop_legacyrayd_for_update(void) {
     char launchctl[64];
     (void)stop_supervisor();
-    if (find_launchctl(launchctl, sizeof launchctl) == 0) {
+    /* where launchctl cannot load the job back, unload still reaches launchd
+       and dropped it until the next reboot. KeepAlive restarts the daemon
+       after the update instead (restart_legacyrayd_after_update) */
+    if (find_launchctl(launchctl, sizeof launchctl) == 0 &&
+        !(launch_job_listed(launchctl) && !launch_job_loaded(launchctl))) {
         char *unload[] = { launchctl, (char *)"unload",
                            (char *)senko_daemon_plist(), NULL };
         (void)run_argv(unload);
