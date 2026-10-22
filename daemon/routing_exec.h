@@ -72,6 +72,9 @@ const char *routing_find_pfctl(void);
 /* run a helper to completion and return its exit status, -1 when it never ran */
 int routing_spawn(const char *bin, char *const argv[]);
 
+/* delete whichever ipfw rules numbered lo..hi exist (at most 256 numbers) */
+void routing_ipfw_delete_range(int lo, int hi);
+
 /* scoped routing makes the kernel drop packets that ipfw fwd sends to the
    loopback listener, so every fwd based mode has to turn it off and restore it */
 int  routing_scopedroute_disable(char *prev, size_t cap);

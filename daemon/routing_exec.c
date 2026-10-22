@@ -236,17 +236,6 @@ void routing_scopedroute_restore(const char *prev) {
     (void)routing_spawn(sysctl, argv);
 }
 
-#if defined(LR_MACOS)
-/* os x shares pf with the system: the application firewall, internet sharing
-   and airdrop keep their rules under the com.apple anchor of /etc/pf.conf and
-   enable pf by reference (-E hands out a token, -X gives it back). legacyray
-   does the same, so taking the tunnel down never disables pf under somebody
-   else, and the main ruleset is only ever the stock one */
-static int run_spawn_quiet(const char *bin, char *const argv[]);
-static char g_pf_token[32];
-/* net.inet.ip.forwarding as it was before the first tunnel, put back after */
-static char g_forwarding_prev[8];
-
 /* stdout and stderr of a tool into buf; pfctl says most things on stderr */
 static int capture_all(const char *bin, char *const argv[], char *buf, size_t cap) {
     if (!buf || cap < 2) return -1;
@@ -281,6 +270,17 @@ static int capture_all(const char *bin, char *const argv[], char *buf, size_t ca
     while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
     return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
+
+#if defined(LR_MACOS)
+/* os x shares pf with the system: the application firewall, internet sharing
+   and airdrop keep their rules under the com.apple anchor of /etc/pf.conf and
+   enable pf by reference (-E hands out a token, -X gives it back). legacyray
+   does the same, so taking the tunnel down never disables pf under somebody
+   else, and the main ruleset is only ever the stock one */
+static int run_spawn_quiet(const char *bin, char *const argv[]);
+static char g_pf_token[32];
+/* net.inet.ip.forwarding as it was before the first tunnel, put back after */
+static char g_forwarding_prev[8];
 
 /* a line of text that starts with prefix */
 static int has_line(const char *text, const char *prefix) {
@@ -744,16 +744,47 @@ int routing_exec_egress_snapshot(char *name, size_t name_cap,
     return best ? 0 : -1;
 }
 
-static void clear_ipfw(void) {
+/* sweeping a range used to spawn ipfw once per rule number, over a hundred
+   times at every start even with none of ours left, so the rules are listed
+   once and only the numbers present are deleted */
+void routing_ipfw_delete_range(int lo, int hi) {
     const char *ipfw = routing_find_ipfw();
-    if (!ipfw) return;
+    if (!ipfw || lo > hi || hi - lo >= 256) return;
+    const size_t cap = 65536;
+    char *out = (char *)malloc(cap);
+    if (!out) return;
+    char *list[] = { (char *)ipfw, (char *)"list", NULL };
+    /* a list that fails (no root) means every delete would fail the same way */
+    if (capture_all(ipfw, list, out, cap) != 0) {
+        free(out);
+        return;
+    }
+    /* a listing cut off by the buffer may hide some of ours, so fall back to
+       deleting every number */
+    int truncated = strlen(out) + 1 >= cap;
+    unsigned char present[256];
+    memset(present, truncated ? 1 : 0, sizeof present);
+    for (const char *p = out; !truncated && p && *p; ) {
+        while (*p == ' ' || *p == '\t') ++p;
+        char *end = NULL;
+        long n = strtol(p, &end, 10);
+        if (end != p && n >= lo && n <= hi) present[n - lo] = 1;
+        p = strchr(p, '\n');
+        if (p) ++p;
+    }
+    free(out);
     char num[16];
     char del[] = "delete";
-    for (int n = 12030; n >= 12000; --n) {
+    for (int n = hi; n >= lo; --n) {
+        if (!present[n - lo]) continue;
         snprintf(num, sizeof num, "%d", n);
         char *argv[] = { (char *)ipfw, (char *)"-q", del, num, NULL };
         routing_spawn(ipfw, argv);
     }
+}
+
+static void clear_ipfw(void) {
+    routing_ipfw_delete_range(12000, 12030);
 }
 
 static int apply_ipfw(const char *ipfw, const char *server_ip,

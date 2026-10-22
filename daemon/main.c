@@ -346,9 +346,17 @@ static int run_managed(const char *ctl_path, const char *config_path,
 /* the settings were merged from this file and the command line before the
    listener was bound, and reading them again here would put the file back on
    top of the arguments */
-        if (storefile_load(&cs.engine.store, NULL, config_path) == STOREFILE_OK)
+        storefile_status_t lrc = storefile_load(&cs.engine.store, NULL, config_path);
+        if (lrc == STOREFILE_OK)
             fprintf(stderr, "legacyrayd: loaded %zu server(s) from %s\n",
                     cs.engine.store.n, config_path);
+        else if (lrc == STOREFILE_ERR_PATH)
+            fprintf(stderr, "legacyrayd: %s is outside the folders the daemon keeps "
+                    "its config in; nothing will be loaded from it or saved to it\n",
+                    config_path);
+        else
+            fprintf(stderr, "legacyrayd: cannot read %s (error %d)\n",
+                    config_path, (int)lrc);
     }
 
 /* the dns proxy consults geosite sets as soon as a tunnel is up, and the

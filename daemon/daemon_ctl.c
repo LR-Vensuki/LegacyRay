@@ -910,7 +910,10 @@ int daemon_ctl_flush(void *ctx, const char *what, char *reason, size_t reason_ca
 void daemon_ctl_persist(void *ctx, const store_t *store) {
     daemon_ctl_t *d = (daemon_ctl_t *)ctx;
     if (!d || !store || !d->config_path[0]) return;
-    storefile_save(store, &d->settings, d->config_path);
+    storefile_status_t rc = storefile_save(store, &d->settings, d->config_path);
+    if (rc != STOREFILE_OK)
+        fprintf(stderr, "legacyrayd: saving %s failed (error %d)\n",
+                d->config_path, (int)rc);
 }
 
 
