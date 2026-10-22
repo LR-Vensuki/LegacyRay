@@ -134,13 +134,26 @@ static void close_on_exec_all(void) {
     }
 }
 
+/* substrate reaches every process through DYLD_INSERT_LIBRARIES, and the
+   engine inherited it: tweaks loaded into it (Springtomize was seen there)
+   cost memory on a 512 MB phone and do nothing in a proxy */
+static char **engine_environ(void) {
+    static char *env[256];
+    static const char drop[] = "DYLD_INSERT_LIBRARIES=";
+    size_t n = 0;
+    for (char **p = environ; p && *p && n + 1 < sizeof env / sizeof env[0]; ++p)
+        if (strncmp(*p, drop, sizeof drop - 1) != 0) env[n++] = *p;
+    env[n] = NULL;
+    return env;
+}
+
 static int spawn_engine(engine_backend_t *e) {
     char threads[16];
     snprintf(threads, sizeof threads, "%d", e->threads > 0 ? e->threads : 1);
     char *argv[] = { (char *)bin_of(e), (char *)"--no-reload", (char *)"-t", threads,
                      (char *)config_of(e), NULL };
     close_on_exec_all();
-    if (posix_spawn(&e->child, bin_of(e), NULL, NULL, argv, environ) != 0) {
+    if (posix_spawn(&e->child, bin_of(e), NULL, NULL, argv, engine_environ()) != 0) {
         e->child = 0;
         return -1;
     }
