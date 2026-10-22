@@ -575,16 +575,82 @@ int routing_exec_egress_snapshot(char *name, size_t name_cap,
     return best ? 0 : -1;
 }
 
-static void clear_ipfw(void) {
+/* stdout and stderr of a tool into buf */
+static int capture_all(const char *bin, char *const argv[], char *buf, size_t cap) {
+    if (!buf || cap < 2) return -1;
+    buf[0] = '\0';
+    int fds[2];
+    if (pipe(fds) != 0) return -1;
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&fa, fds[1], STDERR_FILENO);
+    posix_spawn_file_actions_addclose(&fa, fds[0]);
+    posix_spawn_file_actions_addclose(&fa, fds[1]);
+    pid_t pid = 0;
+    int rc = posix_spawn(&pid, bin, &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(fds[1]);
+    if (rc != 0) {
+        close(fds[0]);
+        return -1;
+    }
+    size_t used = 0;
+    for (;;) {
+        ssize_t n = read(fds[0], buf + used, cap - 1 - used);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        used += (size_t)n;
+        if (used + 1 >= cap) break;
+    }
+    buf[used] = '\0';
+    close(fds[0]);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/* sweeping a range used to spawn ipfw once per rule number, over a hundred
+   times at every start even with none of ours left, so the rules are listed
+   once and only the numbers present are deleted */
+void routing_ipfw_delete_range(int lo, int hi) {
     const char *ipfw = routing_find_ipfw();
-    if (!ipfw) return;
+    if (!ipfw || lo > hi || hi - lo >= 256) return;
+    const size_t cap = 65536;
+    char *out = (char *)malloc(cap);
+    if (!out) return;
+    char *list[] = { (char *)ipfw, (char *)"list", NULL };
+    /* a list that fails (no root) means every delete would fail the same way */
+    if (capture_all(ipfw, list, out, cap) != 0) {
+        free(out);
+        return;
+    }
+    /* a listing cut off by the buffer may hide some of ours, so fall back to
+       deleting every number */
+    int truncated = strlen(out) + 1 >= cap;
+    unsigned char present[256];
+    memset(present, truncated ? 1 : 0, sizeof present);
+    for (const char *p = out; !truncated && p && *p; ) {
+        while (*p == ' ' || *p == '\t') ++p;
+        char *end = NULL;
+        long n = strtol(p, &end, 10);
+        if (end != p && n >= lo && n <= hi) present[n - lo] = 1;
+        p = strchr(p, '\n');
+        if (p) ++p;
+    }
+    free(out);
     char num[16];
     char del[] = "delete";
-    for (int n = 12030; n >= 12000; --n) {
+    for (int n = hi; n >= lo; --n) {
+        if (!present[n - lo]) continue;
         snprintf(num, sizeof num, "%d", n);
         char *argv[] = { (char *)ipfw, (char *)"-q", del, num, NULL };
         routing_spawn(ipfw, argv);
     }
+}
+
+static void clear_ipfw(void) {
+    routing_ipfw_delete_range(12000, 12030);
 }
 
 static int apply_ipfw(const char *ipfw, const char *server_ip,

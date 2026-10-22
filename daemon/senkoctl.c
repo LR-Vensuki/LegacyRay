@@ -32,12 +32,30 @@ static int reply_complete(const char *buf, size_t len) {
                 (llen >= 8 && memcmp(ln, "SUBMETA ", 8) == 0) ||
                 (llen >= 8 && memcmp(ln, "SUBINFO ", 8) == 0) ||
                 (llen >= 7 && memcmp(ln, "SUBHDR ", 7) == 0) ||
+                (llen >= 9 && memcmp(ln, "SUBEXTRA ", 9) == 0) ||
+                (llen >= 11 && memcmp(ln, "SUBROUTING ", 11) == 0) ||
                 (llen >= 8 && memcmp(ln, "SECTION ", 8) == 0) ||
                 (llen >= 6 && memcmp(ln, "FDATA ", 6) == 0) ||
                 (llen >= 7 && memcmp(ln, "FWLINE ", 7) == 0) ||
                 (llen >= 6 && memcmp(ln, "STAGE ", 6) == 0);
             if (!stream) return 1;
         }
+        start = i + 1;
+    }
+    return 0;
+}
+
+/* a list ends only at LISTEND: any subscription line the cli does not know
+   yet used to end the reply early and drop the servers after it */
+static int list_reply_complete(const char *buf, size_t len) {
+    size_t start = 0;
+    for (size_t i = 0; i < len; ++i) {
+        if (buf[i] != '\n') continue;
+        size_t llen = i - start;
+        const char *ln = buf + start;
+        if ((llen >= 8 && memcmp(ln, "LISTEND ", 8) == 0) ||
+            (llen >= 3 && memcmp(ln, "ERR", 3) == 0))
+            return 1;
         start = i + 1;
     }
     return 0;
@@ -426,7 +444,8 @@ int main(int argc, char **argv) {
     int timeout_sec = is_tunnel ? 60 : (is_ping ? 8 : (is_check ? 12 :
                       (is_refresh ? 20 : 5)));
     int (*done)(const char *, size_t) =
-        is_tunnel ? tunnel_reply_complete : reply_complete;
+        is_tunnel ? tunnel_reply_complete :
+        (strcmp(line, "LIST\n") == 0 ? list_reply_complete : reply_complete);
     int timed_out = 0;
     ssize_t n = talk_ex(sock, line, strlen(line), buf, sizeof buf,
                         timeout_sec, done, &timed_out);
