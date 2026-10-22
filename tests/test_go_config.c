@@ -108,6 +108,16 @@ int main(int argc, char **argv) {
     }
     cJSON_Delete(root);
 
+    root = render(
+        "vless://11111111-1111-4111-8111-111111111111@example.com:443"
+        "?type=xhttp&security=tls&sni=cdn.example.com&path=%2Fx"
+        "&extra=%7B%22xPaddingBytes%22%3A%2250-60%22%2C%22scMaxEachPostBytes%22"
+        "%3A4096%2C%22noGRPCHeader%22%3Atrue%7D", json, sizeof json);
+    assert(strstr(json, "\"xPaddingBytes\":\"50-60\"") != NULL);
+    assert(strstr(json, "\"scMaxEachPostBytes\":4096") != NULL);
+    assert(strstr(json, "\"noGRPCHeader\":true") != NULL);
+    cJSON_Delete(root);
+
     root = render("https://user:secret@example.com:8443#https-proxy", json, sizeof json);
     assert(strstr(json, "\"protocol\":\"http\"") != NULL);
     assert(strstr(json, "\"streamSettings\":{\"security\":\"tls\"") != NULL);

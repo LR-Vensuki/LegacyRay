@@ -18,6 +18,10 @@
    value and a jailbreak change does not hand the panel a new device */
 #define SENKO_HWID_PATH "/var/mobile/Library/Preferences/com.legacyray.hwid"
 
+/* held locked by the kick's supervisor, which keeps legacyrayd running when
+   launchd did not take its job */
+#define SENKO_SUPERVISE_PID "/var/run/legacyray-supervise.pid"
+
 /* launchd redirects both daemon streams here, and the ui reads the same file */
 #define SENKO_SYSTEM_LOG "/var/log/legacyray-system.log"
 

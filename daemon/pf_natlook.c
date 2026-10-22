@@ -85,14 +85,20 @@ void pf_natlook_close(void) {
     }
 }
 
-static void put_v4(struct pfioc_natlook_nl *nl, const struct in_addr *a,
-                   uint8_t *addr_slot, uint8_t *port_slot, uint16_t port) {
+/* pf keeps ports in network order, as sockaddr_in does, so the port is
+   copied as it is. converting it to host order first swapped its bytes on
+   arm, every lookup missed, and each connection waited on pfctl instead */
+static void put_v4(const struct sockaddr_in *sin, uint8_t *addr_slot,
+                   uint8_t *port_slot) {
     memset(addr_slot, 0, 16);
-    memcpy(addr_slot, a, sizeof *a);
+    memcpy(addr_slot, &sin->sin_addr, sizeof sin->sin_addr);
     memset(port_slot, 0, 4);
-    port_slot[0] = (uint8_t)(port >> 8);
-    port_slot[1] = (uint8_t)(port & 0xff);
-    (void)nl;
+    memcpy(port_slot, &sin->sin_port, sizeof sin->sin_port);
+}
+
+void pf_natlook_put_v4_for_test(const struct sockaddr_in *sin, uint8_t addr[16],
+                                uint8_t port[4]) {
+    put_v4(sin, addr, port);
 }
 
 static int natlook_try_one(int pffd, struct pfioc_natlook_nl *nl, int direction) {
@@ -210,6 +216,9 @@ static int pfctl_state_dest(uint16_t redir_port, uint16_t client_port,
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
+    /* pfctl without -q says "No ALTQ support in kernel" on every run, and this
+       runs for every redirected connection */
+    posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
     posix_spawn_file_actions_addclose(&fa, fds[0]);
     posix_spawn_file_actions_addclose(&fa, fds[1]);
 
@@ -260,8 +269,8 @@ int pf_natlook_dest(int accepted_fd, const struct sockaddr_in *clientaddr,
     if (pffd >= 0) {
         struct pfioc_natlook_nl nl;
         memset(&nl, 0, sizeof nl);
-        put_v4(&nl, &clientaddr->sin_addr, nl.saddr, nl.sxport, clientaddr->sin_port);
-        put_v4(&nl, &local.sin_addr, nl.daddr, nl.dxport, local.sin_port);
+        put_v4(clientaddr, nl.saddr, nl.sxport);
+        put_v4(&local, nl.daddr, nl.dxport);
 
         struct pfioc_natlook_nl res;
         memset(&res, 0, sizeof res);

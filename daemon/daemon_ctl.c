@@ -19,6 +19,7 @@
 #include "core/blake2b256.h"
 #include "legacy_ios.h"
 #include "go_config.h"
+#include "engine_config.h"
 #include "routing.h"
 #include "routing_exec.h"
 #include "core/reality_handshake.h"
@@ -107,11 +108,22 @@ void daemon_ctl_shutdown(daemon_ctl_t *d) {
         go_backend_stop(&d->go);
         c_backend_stop(&d->c_backend, d->loop);
     }
+    engine_backend_stop(&d->engine);
     pthread_mutex_destroy(&d->probe_route_lock);
 }
 
 int daemon_ctl_maintain(daemon_ctl_t *d) {
-    if (!d || !d->go.active) return 0;
+    if (!d) return 0;
+    if (d->engine.active && !engine_backend_keep_alive(&d->engine)) {
+/* the loop's upstream is gone; the redial builds everything again, and until
+   then nothing is redirected into a listener with nothing behind it */
+        loop_set_router(d->loop, NULL, NULL, NULL);
+        if (d->full_device) c_backend_stop(&d->c_backend, d->loop);
+        loop_stop(d->loop);
+        status_set(0);
+        return -1;
+    }
+    if (!d->go.active) return 0;
     if (go_backend_running(&d->go)) return 0;
     fprintf(stderr, "legacyrayd: go backend core exited unexpectedly\n");
     go_backend_stop(&d->go);
@@ -122,7 +134,7 @@ int daemon_ctl_maintain(daemon_ctl_t *d) {
 
 /* only an external core can die without the loop hearing about it */
 int daemon_ctl_timeout_ms(const daemon_ctl_t *d) {
-    return (d && d->go.active) ? 1000 : -1;
+    return (d && (d->go.active || d->engine.active)) ? 1000 : -1;
 }
 
 int daemon_ctl_stats(void *ctx, uint64_t *up, uint64_t *down) {
@@ -334,34 +346,49 @@ int daemon_ctl_apply(void *ctx, const ctl_action_t *action) {
     switch (action->kind) {
         case CTL_ACT_START: {
             const vl_server_t *s = &action->server;
-/* quic/udp only: no senko transport carries it, so there is nothing to hand
-   the local socks loop. the go core dials it directly with its own bundled
-   hysteria client, which means this profile needs the go backend and the
-   full-device tunnel that owns it */
-            int quic_only = (s->proto == VL_PROTO_HYSTERIA2);
+/* the rust engine takes every profile it can carry, when it is installed and
+   not switched off; the built-in core stays the fallback if it will not run */
+            int engine_can = d->settings.engine_core && engine_config_supports(s) &&
+                             engine_backend_available(&d->engine);
+            int go_wanted = d->full_device &&
+                (d->settings.force_backend == SENKO_BACKEND_GO ||
+                 (d->settings.force_backend == SENKO_BACKEND_AUTO &&
+                  go_backend_supported()));
+/* quic/udp only: no senko transport carries hysteria2. the engine has a
+   client for it behind the same loopback socks port as everything else; the
+   go core dials it with its own bundled client, which needs the go backend
+   and the full-device tunnel that owns it */
+            int quic_only = (s->proto == VL_PROTO_HYSTERIA2) && (go_wanted || !engine_can);
             if (quic_only) {
                 if (!d->full_device) {
-                    fprintf(stderr, "legacyrayd: hysteria2 requires full-device mode\n");
+                    fprintf(stderr, "legacyrayd: hysteria2 requires the engine "
+                                    "or full-device mode\n");
                     status_set(0);
                     return DCTL_ERR_TRANSPORT;
                 }
                 if (d->settings.force_backend == SENKO_BACKEND_C ||
                     d->settings.force_backend == SENKO_BACKEND_APP_PROXY) {
-                    fprintf(stderr, "legacyrayd: hysteria2 requires the go backend, "
-                                    "but the c backend is pinned in settings\n");
+                    fprintf(stderr, "legacyrayd: hysteria2 requires the engine or the go "
+                                    "backend, but the c backend is pinned in settings\n");
                     status_set(0);
                     return DCTL_ERR_TRANSPORT;
                 }
                 if (!go_backend_supported()) {
-                    fprintf(stderr, "legacyrayd: hysteria2 requires the go backend, "
-                                    "unsupported on this device\n");
+                    fprintf(stderr, "legacyrayd: hysteria2 requires the engine or the go "
+                                    "backend, unsupported on this device\n");
                     status_set(0);
                     return DCTL_ERR_TRANSPORT;
                 }
             }
 
+/* a pin is respected even when it cannot work: go_backend_start names the
+   reason it will not run on this device, which is the answer the tester came
+   for, and is more use than quietly taking the c core instead */
+            int go_attempted = d->full_device && (quic_only || go_wanted);
+/* the go backend has a core of its own and never uses the loop */
+            int use_engine = !quic_only && !go_attempted && engine_can;
             const transport_vt_t *vt = quic_only ? NULL : transport_for_server(s);
-            if (!vt && !quic_only) {
+            if (!vt && !quic_only && !use_engine) {
                 fprintf(stderr, "legacyrayd: unsupported transport/security for server\n");
                 status_set(0);
                 return DCTL_ERR_TRANSPORT;
@@ -382,10 +409,65 @@ int daemon_ctl_apply(void *ctx, const ctl_action_t *action) {
                 go_backend_stop(&d->go);
                 c_backend_stop(&d->c_backend, d->loop);
             }
+            engine_backend_stop(&d->engine);
+
+/* resolved once, before any rule goes up: the bypass is built from exactly
+   these addresses, the engine dials the first, and once the rules are up dns
+   goes through the tunnel itself */
+            char first_ip[64], ip_list[4096];
+            first_ip[0] = '\0';
+            ip_list[0] = '\0';
+            if ((d->full_device || use_engine) &&
+                resolve_ipv4_addresses(s->host, first_ip, sizeof first_ip,
+                                       ip_list, sizeof ip_list, 0) != 0) {
+                fprintf(stderr, "legacyrayd: dns resolution failed for %s\n", s->host);
+                loop_stop(d->loop);
+                status_set(0);
+                return DCTL_ERR_DNS;
+            }
+
+            if (use_engine) {
+                char engine_reason[160];
+                engine_reason[0] = '\0';
+                if (engine_backend_start(&d->engine, s, first_ip, engine_reason,
+                                         sizeof engine_reason) != 0) {
+                    fprintf(stderr, "legacyrayd: engine failed: %s\n", engine_reason);
+                    use_engine = 0;
+                    if (!vt) {
+                        snprintf(d->last_reason, sizeof d->last_reason, "%s",
+                                 engine_reason);
+                        loop_stop(d->loop);
+                        status_set(0);
+                        return DCTL_ERR_TRANSPORT;
+                    }
+                }
+            }
 
             if (quic_only) {
 /* nothing local backs this profile; drop any listener left from the last one */
                 loop_stop(d->loop);
+            } else if (use_engine) {
+/* the loop speaks plain socks5 to the engine on loopback; the server, its
+   protocol and its secrets are the engine's business */
+                vl_server_t local;
+                memset(&local, 0, sizeof local);
+                local.proto = VL_PROTO_SOCKS5;
+                local.security = VL_SEC_NONE;
+                local.net = VL_NET_TCP;
+                local.port = (uint16_t)d->engine.port;
+                snprintf(local.host, sizeof local.host, "127.0.0.1");
+                const transport_vt_t *local_vt = transport_for_server(&local);
+                dialer_set_target(&d->dialer, local.host, local.port);
+                dialer_pin_ipv4(&d->dialer, local.host);
+                if (!local_vt ||
+                    loop_set_server(d->loop, local_vt, dialer_connect, &d->dialer,
+                                    VL_PROTO_SOCKS5, uuid, "", "", "", "", "", "", "",
+                                    "", "", "", local.host, 0) != LOOP_OK) {
+                    fprintf(stderr, "legacyrayd: socks listener failed\n");
+                    engine_backend_stop(&d->engine);
+                    status_set(0);
+                    return DCTL_ERR_LOOP;
+                }
             } else {
                 dialer_set_target(&d->dialer, s->host, s->port);
 
@@ -397,23 +479,14 @@ int daemon_ctl_apply(void *ctx, const ctl_action_t *action) {
                     status_set(0);
                     return DCTL_ERR_LOOP;
                 }
+                {
+                    transport_xhttp_opts_t xh = transport_xhttp_opts(s);
+                    loop_set_xhttp(d->loop, &xh);
+                }
             }
 
             if (d->full_device) {
-                char first_ip[64], ip_list[4096];
-                first_ip[0] = '\0';
-                ip_list[0] = '\0';
-
-                if (resolve_ipv4_addresses(s->host, first_ip, sizeof first_ip,
-                                           ip_list, sizeof ip_list, 0) != 0) {
-                    fprintf(stderr, "legacyrayd: dns resolution failed for %s\n", s->host);
-                    loop_stop(d->loop);
-                    status_set(0);
-                    return DCTL_ERR_DNS;
-                }
-                /* the bypass is built from exactly these addresses, and once
-                   the rules are up dns goes through the tunnel itself */
-                if (!quic_only) dialer_pin_ipv4(&d->dialer, ip_list);
+                if (!quic_only && !use_engine) dialer_pin_ipv4(&d->dialer, ip_list);
 
                 /* the verification target only has to be a stable public
                    address, and resolving it again on every connect put a dns
@@ -428,11 +501,6 @@ int daemon_ctl_apply(void *ctx, const ctl_action_t *action) {
                 senko_force_t force;
                 force.backend = d->settings.force_backend;
                 force.pf_mode = d->settings.force_pf_mode;
-/* a pin is respected even when it cannot work: go_backend_start names the
-   reason it will not run on this device, which is the answer the tester came
-   for, and is more use than quietly taking the c core instead */
-                int go_attempted = quic_only || force.backend == SENKO_BACKEND_GO ||
-                    (force.backend == SENKO_BACKEND_AUTO && go_backend_supported());
                 int routing_ok;
                 if (go_attempted) {
                     routing_ok = go_backend_start(&d->go, s, first_ip, active_rules(d),
@@ -461,6 +529,7 @@ int daemon_ctl_apply(void *ctx, const ctl_action_t *action) {
                     snprintf(d->last_reason, sizeof d->last_reason, "%s",
                              backend_reason);
                     loop_stop(d->loop);
+                    engine_backend_stop(&d->engine);
                     status_set(0);
                     return go_attempted ? DCTL_ERR_GO : DCTL_ERR_ROUTING;
                 }
@@ -481,6 +550,7 @@ int daemon_ctl_apply(void *ctx, const ctl_action_t *action) {
                 c_backend_stop(&d->c_backend, d->loop);
             }
             loop_stop(d->loop);
+            engine_backend_stop(&d->engine);
             return 0;
 
         case CTL_ACT_PING:
@@ -540,6 +610,25 @@ static const char *proc_state(const char *pid_path, char *out, size_t cap) {
         return out;
     }
     snprintf(out, cap, "pid %ld", pid);
+    return out;
+}
+
+/* which of the two ways the daemon runs. the supervisor means launchd did not
+   take the job on this phone and the kick had to start the daemon itself */
+static const char *parent_state(char *out, size_t cap) {
+    long parent = (long)getppid();
+    FILE *f = fopen(SENKO_SUPERVISE_PID, "r");
+    long supervisor = 0;
+    if (f) {
+        if (fscanf(f, "%ld", &supervisor) != 1) supervisor = 0;
+        fclose(f);
+    }
+    if (supervisor > 1 && supervisor == parent)
+        snprintf(out, cap, "kick supervisor (pid %ld), launchd did not start it", parent);
+    else if (parent == 1)
+        snprintf(out, cap, "launchd");
+    else
+        snprintf(out, cap, "pid %ld", parent);
     return out;
 }
 
@@ -660,6 +749,16 @@ int daemon_ctl_diag(void *ctx, char *buf, size_t cap, size_t *len) {
         diag_add(buf, cap, &off, "backend", "c core, transparent listener");
     else
         diag_add(buf, cap, &off, "backend", "idle");
+/* which core speaks the protocols, under whichever backend routes */
+    if (d->engine.active)
+        diag_add(buf, cap, &off, "core", "engine on 127.0.0.1:%d", d->engine.port);
+    else if (d->go.active)
+        diag_add(buf, cap, &off, "core", "go");
+    else
+        diag_add(buf, cap, &off, "core", "built-in");
+    diag_add(buf, cap, &off, "core.engine", "%s",
+             !d->settings.engine_core ? "switched off" :
+             engine_backend_available(&d->engine) ? "installed" : "not installed");
     diag_add(buf, cap, &off, "backend.go_supported", "%s",
              go_backend_supported() ? "yes" : sizeof(void *) == 8
                  ? "no, ios below 12" : "no, 32 bit slice");
@@ -741,6 +840,8 @@ int daemon_ctl_diag(void *ctx, char *buf, size_t cap, size_t *len) {
              proc_state("/var/run/legacyrayawgd.pid", scratch, sizeof scratch));
     diag_add(buf, cap, &off, "proc.senko_kick", "%s",
              kick_state(scratch, sizeof scratch));
+    diag_add(buf, cap, &off, "proc.parent", "%s",
+             parent_state(scratch, sizeof scratch));
     diag_add(buf, cap, &off, "substrate.tlsfix", "%s",
              file_state(SENKO_SUBSTRATE_DIR "/legacyraytlsfix.dylib", scratch, sizeof scratch));
     diag_add(buf, cap, &off, "substrate.status", "%s",
@@ -794,7 +895,10 @@ int daemon_ctl_flush(void *ctx, const char *what, char *reason, size_t reason_ca
 void daemon_ctl_persist(void *ctx, const store_t *store) {
     daemon_ctl_t *d = (daemon_ctl_t *)ctx;
     if (!d || !store || !d->config_path[0]) return;
-    storefile_save(store, &d->settings, d->config_path);
+    storefile_status_t rc = storefile_save(store, &d->settings, d->config_path);
+    if (rc != STOREFILE_OK)
+        fprintf(stderr, "legacyrayd: saving %s failed (error %d)\n",
+                d->config_path, (int)rc);
 }
 
 #define SENKO_BACKUP_EXPORT "/var/mobile/Documents/legacyray-backup.lray"
@@ -1892,6 +1996,10 @@ static int prepare_server_probe(daemon_ctl_t *d, const vl_server_t *server,
         if (reason && reason_cap)
             snprintf(reason, reason_cap, "local test proxy could not be prepared");
         return -1;
+    }
+    {
+        transport_xhttp_opts_t xh = transport_xhttp_opts(server);
+        loop_set_xhttp(d->loop, &xh);
     }
     return 0;
 }

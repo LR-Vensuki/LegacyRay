@@ -44,5 +44,5 @@ static void tcp_close(void *h) {
 }
 
 const transport_vt_t transport_tcp = {
-    tcp_open, tcp_read, tcp_write, tcp_write, tcp_close, NULL, NULL
+    tcp_open, tcp_read, tcp_write, tcp_write, tcp_close, NULL, NULL, NULL
 };

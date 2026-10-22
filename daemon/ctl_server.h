@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/types.h>
 
 #include "ctl_engine.h"
 #include "settings.h"
@@ -120,6 +121,12 @@ typedef struct {
     char          sock_path[108]; /* unix socket path */
     char          token_path[108];
     char          token[40];
+/* the socket file this server bound, so it never removes a file another
+   daemon made, and puts its own back when something else removed it */
+    dev_t         sock_dev;
+    ino_t         sock_ino;
+    long          paths_checked_ms;
+    int           foreign_logged;
     ctl_engine_t  engine;
     ctl_apply_fn  apply;
     ctl_reason_fn reason;
@@ -243,6 +250,8 @@ void ctl_server_broadcast(ctl_server_t *s, const char *line, size_t len);
 
 size_t ctl_server_client_count(const ctl_server_t *s);
 
+/* bind the socket and write the token again if something removed them */
+void ctl_server_check_paths(ctl_server_t *s);
 void ctl_server_close(ctl_server_t *s);
 
 #ifdef __cplusplus

@@ -59,6 +59,15 @@ static long loop_now_ms(void) {
    away without a word, usually on the other side of a wifi/cellular move */
 #define LOOP_IDLE_MS (20L * 60L * 1000L)
 #define LOOP_DIRECT_CONNECT_MS 10000
+/* how long an opener waits on a transport's own handshake (tls and the
+   websocket upgrade) before it gives up on that connection and dials again */
+#define LOOP_OPEN_HANDSHAKE_MS 7000
+/* how many times a request the upstream proxy hung up on before answering
+   goes out again. the engine is such an upstream: when a cdn in front of the
+   server fails a websocket upgrade with 502 it closes the socks stream
+   without a reply, and a cdn does that to a share of upgrades */
+#define LOOP_REDIALS 3
+#define LOOP_REDIAL_WAIT_MS 150
 
 /* dead peers are found by the kernel instead of holding a slot forever */
 static void set_keepalive(int fd) {
@@ -154,6 +163,10 @@ static void *open_worker_main(void *arg) {
     loop_t *lp = c->owner;
     void *th = NULL;
 
+/* the upstream just refused this request: give it a moment */
+    if (c->redialing)
+        usleep((useconds_t)(LOOP_REDIAL_WAIT_MS * 1000 * c->redials));
+
 /* keep retries short */
     for (int attempt = 0; attempt < 3; ++attempt) {
         pthread_mutex_lock(&lp->open_lock);
@@ -172,12 +185,20 @@ static void *open_worker_main(void *arg) {
             if (rfd < 0) continue;
             set_nonblock(rfd);
             set_keepalive(rfd);
+/* publish the fd under the lock, so a cancel that came during the dial is
+   seen here and a later one can shut the fd down to end the handshake */
+            pthread_mutex_lock(&lp->open_lock);
             c->remote_fd = rfd;
+            cancelled = c->open_cancelled;
+            pthread_mutex_unlock(&lp->open_lock);
+            if (cancelled) break;
         }
         th = c->open_vt->open(c->remote_fd, &c->open_tls_cfg);
         if (th) break;
+        pthread_mutex_lock(&lp->open_lock);
         close(c->remote_fd);
         c->remote_fd = -1;
+        pthread_mutex_unlock(&lp->open_lock);
     }
 
     pthread_mutex_lock(&lp->open_lock);
@@ -344,6 +365,12 @@ void loop_set_tls(loop_t *lp, const char *sni, const char *fingerprint,
     lp->tls_cfg.insecure = lp->insecure;
 }
 
+void loop_set_xhttp(loop_t *lp, const transport_xhttp_opts_t *xh) {
+    if (!lp) return;
+    if (xh) lp->tls_cfg.xh = *xh;
+    else memset(&lp->tls_cfg.xh, 0, sizeof lp->tls_cfg.xh);
+}
+
 /* a connection's buffers run to a couple of hundred kilobytes, so a slot is
    only allocated while it is in use. a fixed array of them kept tens of
    megabytes resident in a daemon on a phone with 256 MB in all */
@@ -481,14 +508,14 @@ static void cancel_opening_conn(loop_t *lp, loop_conn_t *c) {
     if (!c->used || !c->opening) return;
     pthread_mutex_lock(&lp->open_lock);
     c->open_cancelled = 1;
+    /* wake the worker without reusing its remote fd */
+    if (c->remote_fd >= 0)
+        shutdown(c->remote_fd, SHUT_RDWR);
     pthread_mutex_unlock(&lp->open_lock);
     if (c->local_fd >= 0) {
         close(c->local_fd);
         c->local_fd = -1;
     }
-    /* wake the worker without reusing its remote fd */
-    if (c->remote_fd >= 0)
-        shutdown(c->remote_fd, SHUT_RDWR);
 }
 
 static void discard_conn(loop_conn_t *c);
@@ -584,7 +611,10 @@ static void reap_opening_conns(loop_t *lp) {
 
         c->th = th;
         sess_status_t ir;
-        if (c->transparent) {
+        if (c->redialing) {
+            c->redialing = 0;
+            ir = session_restart_upstream(&c->sess, th);
+        } else if (c->transparent) {
             ir = session_init(&c->sess, c->open_vt, th, c->open_proto,
                               c->open_proto == VL_PROTO_VLESS ? c->open_uuid : NULL,
                               c->open_flow[0] ? c->open_flow : NULL,
@@ -613,6 +643,8 @@ static void reap_opening_conns(loop_t *lp) {
                               c->open_pass[0] ? c->open_pass : NULL);
         }
         if (ir != SESS_OK) {
+            fprintf(stderr, "legacyrayd: session start failed (%s, proto %d)\n",
+                    c->transparent ? "redirected" : "socks", (int)c->open_proto);
             if (c->open_vt) c->open_vt->close(th);
             if (c->remote_fd >= 0) close(c->remote_fd);
             if (c->local_fd >= 0) close(c->local_fd);
@@ -675,6 +707,7 @@ loop_status_t loop_set_server(loop_t *lp, const transport_vt_t *vt,
 
     loop_set_tls(lp, sni, fingerprint, reality_pbk, reality_sid, path, ws_host,
                  xhttp_mode, peer_host, insecure);
+    loop_set_xhttp(lp, NULL); /* the caller sets the new server's, if any */
 
     lp->active = 1; /* accept clients again */
     return LOOP_OK;
@@ -760,6 +793,8 @@ static void fill_open_fields(loop_t *lp, loop_conn_t *c) {
     c->open_tls_cfg.xhttp_mode = c->open_xhttp_mode;
     c->open_tls_cfg.peer_host = c->open_peer_host;
     c->open_tls_cfg.insecure = c->open_insecure;
+    c->open_tls_cfg.xh = lp->tls_cfg.xh;
+    c->open_tls_cfg.handshake_ms = LOOP_OPEN_HANDSHAKE_MS;
 }
 
 /* hand a connection whose client socket is set to a worker that dials and
@@ -797,6 +832,33 @@ static void discard_conn(loop_conn_t *c) {
     if (c->local_fd >= 0) close(c->local_fd);
     if (c->remote_fd >= 0) close(c->remote_fd);
     clear_conn_slot(c);
+}
+
+/* the upstream proxy hung up before it answered, so nothing reached the
+   site yet: the session keeps the request and the client's bytes, and a
+   worker opens a new connection for them. -1 leaves the conn as it was */
+static int redial_conn(loop_t *lp, loop_conn_t *c) {
+    if (!session_upstream_refused(&c->sess) || c->redials >= LOOP_REDIALS)
+        return -1;
+    if (c->th && c->open_vt) c->open_vt->close(c->th);
+    c->th = NULL;
+    c->sess.th = NULL;
+    if (c->remote_fd >= 0) close(c->remote_fd);
+    c->remote_fd = -1;
+    c->redials++;
+    c->redialing = 1;
+/* the client's socks exchange is over whoever answered it; what it sends
+   while the worker opens is payload, not a request to parse */
+    c->socks_greet_done = 1;
+    c->socks_req_done = 1;
+    if (lp->nconns > 0) lp->nconns--;
+    fprintf(stderr, "legacyrayd: upstream closed before its reply, dialing again (%d)\n",
+            c->redials);
+    if (begin_open(lp, c) != 0) {
+        session_trace_close(&c->sess, "redial");
+        discard_conn(c);
+    }
+    return 0;
 }
 
 static void route_log(const loop_conn_t *c, const char *host, loop_route_t r) {
@@ -1093,6 +1155,27 @@ static void service_direct(loop_t *lp, loop_conn_t *c, short local_re, short rem
     }
 }
 
+/* client bytes the session refused wait in prebuf, ahead of any new read */
+static int feed_backlog(loop_conn_t *c) {
+    size_t off = 0;
+    while (off < c->prebuf_len) {
+        size_t consumed = 0;
+        sess_status_t fr = session_feed_client(&c->sess, c->prebuf + off,
+                                               c->prebuf_len - off, &consumed);
+        if (fr != SESS_OK) {
+            if (c->sess.state == SESS_ERROR) return -1;
+            break;
+        }
+        if (consumed == 0) break;
+        off += consumed;
+    }
+    if (off > 0) {
+        memmove(c->prebuf, c->prebuf + off, c->prebuf_len - off);
+        c->prebuf_len -= off;
+    }
+    return 0;
+}
+
 static void service_conn(loop_t *lp, loop_conn_t *c,
                          short local_re, short remote_re) {
     if (c->direct) {
@@ -1103,11 +1186,18 @@ static void service_conn(loop_t *lp, loop_conn_t *c,
 /* pump remote output when it is ready */
     if (remote_re & (POLLIN | POLLOUT | POLLHUP | POLLERR)) {
         session_pump_remote(&c->sess);
+        if (redial_conn(lp, c) == 0) return;
+    }
+    if (c->prebuf_len > 0 && feed_backlog(c) != 0) {
+        drop_conn(lp, c);
+        return;
     }
 
-    if (local_re & POLLIN) {
+/* read only what the session can take: a refused tail used to be lost */
+    size_t room = c->prebuf_len == 0 ? session_client_room(&c->sess) : 0;
+    if ((local_re & POLLIN) && room > 0) {
         uint8_t buf[8192];
-        ssize_t n = read(c->local_fd, buf, sizeof buf);
+        ssize_t n = read(c->local_fd, buf, room < sizeof buf ? room : sizeof buf);
         if (n > 0) {
             lp->bytes_up += (uint64_t)n;
             size_t off = 0;
@@ -1120,9 +1210,10 @@ static void service_conn(loop_t *lp, loop_conn_t *c,
                         drop_conn(lp, c);
                         return;
                     }
-                    break;
                 }
-                if (consumed == 0) { /* session backpressured */
+                if (fr != SESS_OK || consumed == 0) { /* session backpressured */
+                    memcpy(c->prebuf, buf + off, (size_t)n - off);
+                    c->prebuf_len = (size_t)n - off;
                     session_pump_remote(&c->sess);
                     break;
                 }
@@ -1136,12 +1227,24 @@ static void service_conn(loop_t *lp, loop_conn_t *c,
         }
     }
     /* flush before handling hangup */
+    int was_full = session_remote_room(&c->sess) == 0;
     if (flush_to_local(c) != 0) { drop_conn(lp, c); return; }
+    /* a pump that stopped on a full client queue can leave bytes inside the
+       transport (a websocket frame, a tls record) that no poll event will
+       announce: pump again while the flush keeps making room */
+    for (int i = 0; was_full && i < 8 && session_remote_room(&c->sess) > 0 &&
+                    c->sess.state != SESS_ERROR; ++i) {
+        size_t before = c->sess.to_client_len;
+        session_pump_remote(&c->sess);
+        if (c->sess.to_client_len == before) break;
+        if (flush_to_local(c) != 0) { drop_conn(lp, c); return; }
+    }
 
     if (local_re & (POLLHUP | POLLERR)) {
         drop_conn(lp, c);
         return;
     }
+    if (redial_conn(lp, c) == 0) return;
 
     /* close only after the session and pending output are done */
     if (session_is_done(&c->sess) && c->pend_off >= c->pend_len) {
@@ -1260,8 +1363,10 @@ size_t loop_prepare(loop_t *lp, struct pollfd *pfd, size_t cap) {
         if (c->sess.state == SESS_VISION_FIRST)
             session_pump_remote(&c->sess);
 
-/* poll the local socket and pending output */
-        short lev = POLLIN;
+/* poll the local socket and pending output; a session with no room for
+   another read, or a backlog of refused bytes, waits for its remote */
+        short lev = 0;
+        if (c->prebuf_len == 0 && session_client_room(&c->sess) > 0) lev |= POLLIN;
         if (c->pend_off < c->pend_len) lev |= POLLOUT;
         pfd[nf].fd = c->local_fd;
         pfd[nf].events = lev;
@@ -1269,9 +1374,11 @@ size_t loop_prepare(loop_t *lp, struct pollfd *pfd, size_t cap) {
         map[nf] = c; is_remote[nf] = 0;
         nf++;
 
-        /* poll remote writes only when needed */
-        short ev = POLLIN;
-        if (c->sess.to_remote_len > 0) ev |= POLLOUT;
+        /* poll remote writes only when needed, and reads only while the
+           client queue has room: a full one would spin the loop */
+        short ev = session_remote_room(&c->sess) > 0 ? POLLIN : 0;
+        if (session_remote_pending(&c->sess) > 0 && !session_remote_blocked(&c->sess))
+            ev |= POLLOUT;
         else if (c->sess.vt && c->sess.vt->want_write && c->sess.th &&
                  c->sess.vt->want_write(c->sess.th))
             ev |= POLLOUT;

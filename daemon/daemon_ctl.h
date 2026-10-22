@@ -7,6 +7,7 @@
 #include "loop.h"
 #include "c_backend.h"
 #include "go_backend.h"
+#include "engine_backend.h"
 #include "settings.h"
 
 #include <pthread.h>
@@ -39,6 +40,9 @@ typedef struct {
     char           probe_ip[16];
     c_backend_t    c_backend; /* in-process core, used wherever utun is not */
     go_backend_t   go; /* separate utun core, preferred where it runs */
+    /* the rust engine: carries the protocols of the profiles it supports and
+       hands them to the loop as a local socks upstream */
+    engine_backend_t engine;
     /* what the backend actually complained about. the control protocol only
        carries a layer name, and on ios 5 the missing piece is never obvious */
     char           last_reason[192];

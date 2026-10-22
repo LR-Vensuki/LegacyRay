@@ -5,6 +5,16 @@ PLIST=/Library/LaunchDaemons/com.legacyray.daemon.plist
 LAUNCHCTL=/bin/launchctl
 [ -x "$LAUNCHCTL" ] || LAUNCHCTL=/usr/bin/launchctl
 
+# launchd holds the job but launchctl cannot load it back. some ios 6
+# jailbreaks never create /var/tmp/launchd: there "unload" still reaches
+# launchd while "load" and "list <label>" do not, so unloading dropped the
+# job until the next reboot. a killed daemon comes back by KeepAlive instead,
+# from whatever binary is installed by then
+keep_job() {
+  "$LAUNCHCTL" list 2>/dev/null | grep -q -E '(^|[[:space:]])com\.legacyray\.daemon[[:space:]]*$' &&
+    ! "$LAUNCHCTL" list com.legacyray.daemon >/dev/null 2>&1
+}
+
 if [ "${SENKO_UPDATE:-0}" != "1" ]; then
   if [ -x /usr/bin/legacyray-kick ]; then
     status="$(/usr/bin/legacyray-kick --awg-status 2>/dev/null || true)"
@@ -19,10 +29,16 @@ if [ "${SENKO_UPDATE:-0}" != "1" ]; then
   if [ -S /var/tmp/legacyrayd.sock ] && [ -x /usr/bin/legacyrayctl ]; then
     /usr/bin/legacyrayctl DISCONNECT >/dev/null 2>&1 || true
   fi
-  "$LAUNCHCTL" unload "$PLIST" >/dev/null 2>&1 || true
+  # the supervisor of a daemon started without launchd restarts it otherwise
+  [ -x /usr/bin/legacyray-kick ] && /usr/bin/legacyray-kick --stop-supervisor >/dev/null 2>&1 || true
+  # an upgrade keeps such a job: the new postinst restarts the daemon into the
+  # new binary. a removal drops it, and there unload is what works
+  if [ "$1" != upgrade ] || ! keep_job; then
+    "$LAUNCHCTL" unload "$PLIST" >/dev/null 2>&1 || true
+  fi
   killall -TERM legacyrayd >/dev/null 2>&1 || true
   sleep 1
-  killall -9 legacyrayd legacyrayawgd >/dev/null 2>&1 || true
+  killall -9 legacyrayd legacyrayawgd legacyray-engine >/dev/null 2>&1 || true
   if [ -f /var/run/legacyray-pf.conf ]; then
     for pfctl in /sbin/pfctl /usr/sbin/pfctl; do
       [ -x "$pfctl" ] && { "$pfctl" -q -F all >/dev/null 2>&1 || true; break; }

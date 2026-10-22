@@ -1,8 +1,12 @@
 #include "transport.h"
+#include "ws_path.h"
+#include <errno.h>
+#include <poll.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <sys/time.h>
 
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -134,6 +138,62 @@ static int ws_accept_ok(ws_handle_t *h, const char *start, const char *end) {
     return strcmp(got, h->accept) == 0;
 }
 
+static int ws_handshake_step(ws_handle_t *h);
+
+/* the status line of a refused upgrade, so the log says what the server or
+   the cdn in front of it answered. the text comes from the network, so only
+   printable ascii of the first line goes through */
+static void ws_log_refusal(const ws_handle_t *h) {
+    char line[96];
+    size_t n = 0;
+    for (const uint8_t *p = h->hs_buf; *p && *p != '\r' && *p != '\n' &&
+                                       n < sizeof line - 1; ++p)
+        line[n++] = (*p >= 0x20 && *p < 0x7f) ? (char)*p : '?';
+    line[n] = '\0';
+    fprintf(stderr, "legacyrayd: websocket upgrade refused: %s\n", line);
+}
+
+static long ws_now_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long)tv.tv_sec * 1000L + (long)(tv.tv_usec / 1000);
+}
+
+static int ws_wait(int fd, short events, long deadline) {
+    struct pollfd p;
+    int r;
+    long left = deadline - ws_now_ms();
+    if (left <= 0) return -1;
+    p.fd = fd;
+    p.events = events;
+    p.revents = 0;
+    do {
+        r = poll(&p, 1, (int)left);
+    } while (r < 0 && errno == EINTR);
+    /* a hangup or error shows up as the next step's failure */
+    return r > 0 ? 0 : -1;
+}
+
+/* cdn fronts refuse a share of upgrades with a 5xx (about one in four on
+   some providers). done here, on the opener's thread, a refusal fails the
+   open while the client's bytes are still unsent, and the opener dials a
+   fresh connection instead of the session dying with nothing received */
+static int ws_finish_handshake(ws_handle_t *h, int fd, int budget_ms) {
+    long deadline = ws_now_ms() + budget_ms;
+    while (h->state != WS_STATE_ESTABLISHED) {
+        int r = ws_handshake_step(h);
+        if (h->state == WS_STATE_ESTABLISHED) break;
+        if (r == TRANSPORT_WANT_READ) {
+            if (ws_wait(fd, POLLIN, deadline) != 0) return -1;
+        } else if (r == TRANSPORT_WANT_WRITE || r == 0) {
+            if (ws_wait(fd, POLLOUT, deadline) != 0) return -1;
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static void *ws_open_common(int fd, const transport_tls_cfg_t *cfg, const transport_vt_t *sub_vt) {
     ws_handle_t *h = (ws_handle_t *)calloc(1, sizeof *h);
     if (!h) return NULL;
@@ -150,7 +210,7 @@ static void *ws_open_common(int fd, const transport_tls_cfg_t *cfg, const transp
     snprintf(h->host, sizeof h->host, "%s",
              (cfg && cfg->ws_host && cfg->ws_host[0]) ? cfg->ws_host :
              ((cfg && cfg->sni && cfg->sni[0]) ? cfg->sni : "localhost"));
-    snprintf(h->path, sizeof h->path, "%s", (cfg && cfg->path && cfg->path[0]) ? cfg->path : "/");
+    ws_path_without_early_data(cfg ? cfg->path : NULL, h->path, sizeof h->path);
     if (!ws_token_ok(h->host) || !ws_token_ok(h->path)) {
         h->sub_vt->close(h->sub_h);
         free(h);
@@ -186,6 +246,12 @@ static void *ws_open_common(int fd, const transport_tls_cfg_t *cfg, const transp
     h->hs_len = (size_t)l;
     h->hs_off = 0;
 
+    if (cfg && cfg->handshake_ms > 0 &&
+        ws_finish_handshake(h, fd, cfg->handshake_ms) != 0) {
+        h->sub_vt->close(h->sub_h);
+        free(h);
+        return NULL;
+    }
     return h;
 }
 
@@ -310,6 +376,7 @@ static int ws_handshake_step(ws_handle_t *h) {
                     }
                     return 0;
                 }
+                ws_log_refusal(h);
                 return TRANSPORT_ERR;
             }
             if (h->hs_len >= sizeof(h->hs_buf) - 1) {
@@ -337,6 +404,11 @@ static int ws_write(void *handle, const uint8_t *buf, size_t len) {
     if (pr < 0) return pr;
 
     if (len == 0) return 0;
+/* one frame per write, as big as the frame buffer and a 16-bit length hold;
+   the caller sends the rest with the next write. a whole 64 kb queue used
+   to fail the write */
+    if (len > sizeof(h->tx_buf) - 8) len = sizeof(h->tx_buf) - 8;
+    if (len > 0xffff) len = 0xffff;
 
     size_t header_size = 0;
     h->tx_buf[0] = 0x82;
@@ -364,33 +436,20 @@ static int ws_write(void *handle, const uint8_t *buf, size_t len) {
         h->tx_buf[header_size + i] = buf[i] ^ mask[i % 4];
     }
 
+/* once the frame is built every byte of it is taken: what the socket did
+   not accept waits in tx_pending and goes out before the next frame. saying
+   fewer were taken made the caller send them again in a new frame, so the
+   peer got them twice and the stream broke */
     int w = h->sub_vt->write(h->sub_h, h->tx_buf, header_size + len);
-    if (w < 0) {
-        if (w == TRANSPORT_WANT_WRITE) {
-            memcpy(h->tx_pending, h->tx_buf, header_size + len);
-            h->tx_pending_len = header_size + len;
-            h->tx_pending_off = 0;
-            return TRANSPORT_WANT_WRITE;
-        }
-        return w;
-    }
-
-    if ((size_t)w >= header_size) {
-        size_t consumed = (size_t)w - header_size;
-        if (consumed < len) {
-            size_t rem = (header_size + len) - (size_t)w;
-            memcpy(h->tx_pending, h->tx_buf + w, rem);
-            h->tx_pending_len = rem;
-            h->tx_pending_off = 0;
-        }
-        return (int)consumed;
-    } else {
+    if (w < 0 && w != TRANSPORT_WANT_WRITE) return w;
+    if (w < 0) w = 0;
+    if ((size_t)w < header_size + len) {
         size_t rem = (header_size + len) - (size_t)w;
         memcpy(h->tx_pending, h->tx_buf + w, rem);
         h->tx_pending_len = rem;
         h->tx_pending_off = 0;
-        return TRANSPORT_WANT_WRITE;
     }
+    return (int)len;
 }
 
 static int ws_read(void *handle, uint8_t *buf, size_t len) {
@@ -533,6 +592,7 @@ const transport_vt_t transport_ws_tcp = {
     NULL,
     ws_close,
     ws_want_write,
+    NULL,
     NULL
 };
 
@@ -543,6 +603,7 @@ const transport_vt_t transport_ws_reality = {
     NULL,
     ws_close,
     ws_want_write,
+    NULL,
     NULL
 };
 
@@ -553,5 +614,6 @@ const transport_vt_t transport_ws_tls = {
     NULL,
     ws_close,
     ws_want_write,
+    NULL,
     NULL
 };

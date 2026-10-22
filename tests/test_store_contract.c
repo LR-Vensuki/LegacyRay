@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#define PBK "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
 static int g_fail = 0;
 static void ok(const char *what, int cond) {
     if (cond) return;
@@ -187,6 +189,67 @@ int main(void) {
         memset(&reparsed, 0, sizeof reparsed);
         ok("rebuilt vless link reparses", cfg_parse_link(relink, &reparsed) == CFG_OK);
         ok("vless allowInsecure survives the round trip", reparsed.insecure == 1);
+
+/* a link's extra holds the xhttp knobs the server enforces; losing them on
+   restart puts the client back on xray's defaults, which that server refuses */
+        size_t xidx = 0;
+        ok("xhttp link with extra accepted",
+           store_add_manual(&rt,
+               "vless://11111111-1111-4111-8111-111111111111@xh.example:443"
+               "?security=reality&type=xhttp&sni=front.example&pbk=" PBK "&sid=ab&path=%2Fx"
+               "&mode=stream-one&extra=%7B%22xPaddingBytes%22%3A%7B%22from%22%3A50%2C"
+               "%22to%22%3A60%7D%2C%22scMaxEachPostBytes%22%3A4096%2C"
+               "%22noGRPCHeader%22%3Atrue%7D#XH",
+               &xidx) == STORE_OK);
+        ok("xhttp extra read from the link",
+           rt.servers[xidx].xh_pad_min == 50 && rt.servers[xidx].xh_pad_max == 60 &&
+           rt.servers[xidx].xh_post_max == 4096 && rt.servers[xidx].xh_no_grpc == 1);
+        ok("xhttp link rebuilds", store_link_at(&rt, xidx, relink, sizeof relink) == 0);
+        ok("rebuilt extra is fully escaped",
+           strstr(relink, "&extra=%7B%22xPaddingBytes%22%3A%2250-60%22") != NULL &&
+           strchr(relink, '{') == NULL && strchr(relink, '"') == NULL);
+        memset(&reparsed, 0, sizeof reparsed);
+        ok("rebuilt xhttp link reparses", cfg_parse_link(relink, &reparsed) == CFG_OK);
+        ok("xhttp extra survives the round trip",
+           reparsed.xh_pad_min == 50 && reparsed.xh_pad_max == 60 &&
+           reparsed.xh_post_max == 4096 && reparsed.xh_no_grpc == 1 &&
+           strcmp(reparsed.mode, "stream-one") == 0);
+        ok("xhttp link with request shaping accepted",
+           store_add_manual(&rt,
+               "vless://11111111-1111-4111-8111-111111111111@xh.example:443"
+               "?security=tls&type=xhttp&sni=front.example&path=%2Fx&mode=packet-up"
+               "&extra=%7B%22uplinkDataPlacement%22%3A%22cookie%22%2C%22uplinkHTTPMethod%22"
+               "%3A%22GET%22%2C%22sessionIDPlacement%22%3A%22header%22%2C%22seqKey%22%3A%22n%22"
+               "%2C%22seqPlacement%22%3A%22cookie%22%2C%22xPaddingObfsMode%22%3Atrue%2C"
+               "%22xPaddingPlacement%22%3A%22query%22%2C%22xPaddingKey%22%3A%22pad%22%2C"
+               "%22uplinkChunkSize%22%3A%22100-200%22%2C%22scMinPostsIntervalMs%22%3A20%7D#XS",
+               &xidx) == STORE_OK);
+        ok("xhttp shaping link rebuilds", store_link_at(&rt, xidx, relink, sizeof relink) == 0);
+        memset(&reparsed, 0, sizeof reparsed);
+        ok("rebuilt shaping link reparses", cfg_parse_link(relink, &reparsed) == CFG_OK);
+        ok("xhttp shaping survives the round trip",
+           cfg_xh_same(&reparsed, &rt.servers[xidx]) &&
+           strcmp(reparsed.xh_data_place, "cookie") == 0 &&
+           strcmp(reparsed.xh_method, "GET") == 0 &&
+           strcmp(reparsed.xh_sess_place, "header") == 0 &&
+           strcmp(reparsed.xh_seq_place, "cookie") == 0 &&
+           strcmp(reparsed.xh_seq_key, "n") == 0 && reparsed.xh_pad_obfs == 1 &&
+           strcmp(reparsed.xh_pad_place, "query") == 0 &&
+           strcmp(reparsed.xh_pad_key, "pad") == 0 &&
+           reparsed.xh_chunk_min == 100 && reparsed.xh_chunk_max == 200 &&
+           reparsed.xh_gap_min == 20 && reparsed.xh_gap_max == 20);
+        ok("the same node with its data in the body is a different server",
+           store_add_manual(&rt,
+               "vless://11111111-1111-4111-8111-111111111111@xh.example:443"
+               "?security=tls&type=xhttp&sni=front.example&path=%2Fx&mode=packet-up#XB",
+               &xidx) == STORE_OK && rt.servers[xidx].xh_data_place[0] == '\0');
+        ok("a different padding range is a different server",
+           store_add_manual(&rt,
+               "vless://11111111-1111-4111-8111-111111111111@xh.example:443"
+               "?security=reality&type=xhttp&sni=front.example&pbk=" PBK "&sid=ab&path=%2Fx"
+               "&mode=stream-one#XH2",
+               &xidx) == STORE_OK && rt.servers[xidx].xh_pad_max == 0);
+
     }
 
 /* the panel's suggested title must land as the subscription's name, but only

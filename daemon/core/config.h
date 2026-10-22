@@ -78,7 +78,37 @@ typedef struct {
    core dials one port from it at random and rotates through the rest
    (transport/internet/hysteria/udphop). empty when the link names one port */
     char     port_hop[128];
+/* xhttp knobs from the profile's "extra" (xray's xhttpSettings); zero keeps
+   xray's defaults. a server refuses x_padding outside its xPaddingBytes and a
+   post longer than its scMaxEachPostBytes, so these must match it */
+    uint32_t xh_pad_min, xh_pad_max;
+    uint32_t xh_post_max;
+    int      xh_no_grpc; /* noGRPCHeader: no grpc content type on streams */
+/* xray's newer xhttp request shaping, from the same places. fronts that
+   refuse request bodies get packet-up's data in numbered headers or cookies,
+   and a server may expect the session id, the sequence number and the
+   padding somewhere other than the path and the referer. a request shaped
+   any other way is refused (with 413 when a body is too big for the front).
+   empty or zero keeps xray's default */
+    char     xh_method[8];       /* uplinkHTTPMethod; POST */
+    char     xh_data_place[8];   /* uplinkDataPlacement: body, auto, header, cookie */
+    char     xh_data_key[32];    /* uplinkDataKey */
+    uint32_t xh_chunk_min, xh_chunk_max; /* uplinkChunkSize */
+    char     xh_sess_place[8];   /* sessionIDPlacement: path, query, header, cookie */
+    char     xh_sess_key[32];    /* sessionIDKey */
+    char     xh_seq_place[8];    /* seqPlacement, as above */
+    char     xh_seq_key[32];     /* seqKey */
+    int      xh_pad_obfs;        /* xPaddingObfsMode */
+    char     xh_pad_place[16];   /* xPaddingPlacement: queryInHeader, header, query, cookie */
+    char     xh_pad_key[32];     /* xPaddingKey */
+    char     xh_pad_header[32];  /* xPaddingHeader */
+    uint32_t xh_gap_min, xh_gap_max; /* scMinPostsIntervalMs */
 } vl_server_t;
+
+/* nonzero when two servers shape their xhttp requests the same way */
+int cfg_xh_same(const vl_server_t *a, const vl_server_t *b);
+/* nonzero when any xhttp knob differs from xray's default */
+int cfg_xh_custom(const vl_server_t *s);
 
 typedef enum {
     CFG_OK            =  0,

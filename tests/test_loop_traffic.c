@@ -36,8 +36,10 @@ int main(void) {
     assert(write(local[1], "upload", 6) == 6);
     service_conn(lp, c, POLLIN, 0);
     char data[8192];
-    assert(read(remote[1], data, sizeof data) == 6);
-    assert(memcmp(data, "upload", 6) == 0 && lp->bytes_up == 11);
+    /* bytes still in prebuf after the open go out first, in order */
+    assert(read(remote[1], data, sizeof data) == 11);
+    assert(memcmp(data, "earlyupload", 11) == 0 && lp->bytes_up == 11);
+    assert(c->prebuf_len == 0);
     assert(write(remote[1], "download", 8) == 8);
     service_conn(lp, c, 0, POLLIN);
     assert(read(local[1], data, sizeof data) == 8);

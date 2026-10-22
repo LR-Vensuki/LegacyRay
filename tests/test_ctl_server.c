@@ -332,6 +332,47 @@ int main(void) {
        stat(replace_path, &bst) == 0 && S_ISREG(bst.st_mode));
     unlink(replace_path);
 
+    /* two daemons on one path: the one that leaves must not take the socket
+       file and token of the one that stays */
+    const char *pair_path = "/tmp/senko_ctltest.pair.sock";
+    char pair_token[160];
+    token_path_from_sock(pair_path, pair_token, sizeof pair_token);
+    static ctl_server_t first, second; /* large: off the stack */
+    ok("first of a pair init", ctl_server_init(&first, pair_path, mock_apply, NULL) == CTLS_OK);
+    ok("second of a pair init", ctl_server_init(&second, pair_path, mock_apply, NULL) == CTLS_OK);
+    ctl_server_close(&first);
+    ok("leaving daemon keeps the other's socket", stat(pair_path, &bst) == 0 && S_ISSOCK(bst.st_mode));
+    ok("leaving daemon keeps the other's token", stat(pair_token, &bst) == 0);
+    {
+        int cli = connect_unix(pair_path);
+        ok("remaining daemon still reachable", cli >= 0);
+        if (cli >= 0) {
+            set_nonblock(cli);
+            ok("remaining daemon still authenticates", auth_client(&second, cli, pair_path));
+            close(cli);
+        }
+    }
+
+    /* something else removes both files: the daemon puts them back */
+    unlink(pair_path);
+    unlink(pair_token);
+    second.paths_checked_ms = 0;
+    ctl_server_check_paths(&second);
+    ok("removed socket bound again", stat(pair_path, &bst) == 0 && S_ISSOCK(bst.st_mode));
+    ok("removed token written again", stat(pair_token, &bst) == 0 && (bst.st_mode & 0007) == 0);
+    {
+        int cli = connect_unix(pair_path);
+        ok("restored socket reachable", cli >= 0);
+        if (cli >= 0) {
+            set_nonblock(cli);
+            ok("restored token authenticates", auth_client(&second, cli, pair_path));
+            close(cli);
+        }
+    }
+    ctl_server_close(&second);
+    ok("own socket removed on close", stat(pair_path, &bst) != 0);
+    ok("own token removed on close", stat(pair_token, &bst) != 0);
+
     apply_rec_t rec;
     memset(&rec, 0, sizeof rec);
 
@@ -816,6 +857,16 @@ int main(void) {
     exchange(&s, cli, buf, sizeof buf);
     ok("out of range setting reported", strcmp(buf, "ERR value out of range\n") == 0);
     ok("out of range setting changed nothing", live.sub_refresh_hours == 0);
+
+    write(cli, "SET sub_refresh_hours -1\n", 25);
+    exchange(&s, cli, buf, sizeof buf);
+    ok("subscription timer can be turned off", live.sub_refresh_hours == -1);
+    write(cli, "SET sub_refresh_hours -2\n", 25);
+    exchange(&s, cli, buf, sizeof buf);
+    ok("only -1 below zero", strcmp(buf, "ERR value out of range\n") == 0 &&
+       live.sub_refresh_hours == -1);
+    write(cli, "SET sub_refresh_hours 0\n", 24);
+    exchange(&s, cli, buf, sizeof buf);
 
     write(cli, "SETTINGS\n", 9);
     exchange(&s, cli, buf, sizeof buf);

@@ -117,7 +117,26 @@ static const char k_array_cfg[] =
     "        \"xhttpSettings\": {"
     "          \"path\": \"/api/\","
     "          \"mode\": \"packet-up\","
-    "          \"host\": \"host.example\""
+    "          \"host\": \"host.example\","
+    "          \"extra\": {"
+    "            \"xPaddingBytes\": \"200-300\","
+    "            \"scMaxEachPostBytes\": \"8000-9000\","
+    "            \"noGRPCHeader\": true,"
+    "            \"uplinkHTTPMethod\": \"get\","
+    "            \"uplinkDataPlacement\": \"header\","
+    "            \"uplinkDataKey\": \"X-Up\","
+    "            \"uplinkChunkSize\": \"1000-2000\","
+    "            \"sessionIDPlacement\": \"header\","
+    "            \"sessionIDKey\": \"bad key\","
+    "            \"seqPlacement\": \"query\","
+    "            \"seqKey\": \"n\","
+    "            \"xPaddingObfsMode\": true,"
+    "            \"xPaddingPlacement\": \"queryInHeader\","
+    "            \"xPaddingHeader\": \"X-Ref\","
+    "            \"xPaddingMethod\": \"tokenish\","
+    "            \"scMinPostsIntervalMs\": \"10-50\","
+    "            \"xmux\": { \"maxConcurrency\": \"16-32\" }"
+    "          }"
     "        }"
     "      }"
     "    }]"
@@ -337,6 +356,22 @@ int main(void) {
        strcmp(srv[3].ws_host, "host.example") == 0 &&
        strcmp(srv[3].sni, "sni.example") == 0 &&
        strcmp(srv[3].remark, "XHTTP node") == 0);
+    ok("xhttp extra: the server's padding, post size and grpc header",
+       n >= 4 && srv[3].xh_pad_min == 200 && srv[3].xh_pad_max == 300 &&
+       srv[3].xh_post_max == 8000 && srv[3].xh_no_grpc == 1);
+    ok("xhttp extra: where requests carry the data, the ids and the padding",
+       n >= 4 && strcmp(srv[3].xh_method, "GET") == 0 &&
+       strcmp(srv[3].xh_data_place, "header") == 0 &&
+       strcmp(srv[3].xh_data_key, "X-Up") == 0 &&
+       srv[3].xh_chunk_min == 1000 && srv[3].xh_chunk_max == 2000 &&
+       strcmp(srv[3].xh_sess_place, "header") == 0 &&
+       srv[3].xh_sess_key[0] == '\0' && /* not a token: xray's default stays */
+       strcmp(srv[3].xh_seq_place, "query") == 0 && strcmp(srv[3].xh_seq_key, "n") == 0 &&
+       srv[3].xh_pad_obfs == 1 && strcmp(srv[3].xh_pad_place, "queryInHeader") == 0 &&
+       strcmp(srv[3].xh_pad_header, "X-Ref") == 0 && srv[3].xh_pad_key[0] == '\0' &&
+       srv[3].xh_gap_min == 10 && srv[3].xh_gap_max == 50);
+    ok("ws nodes carry no xhttp knobs",
+       n >= 5 && srv[4].xh_pad_max == 0 && srv[4].xh_post_max == 0 && !cfg_xh_custom(&srv[4]));
 
     ok("xray trojan over ws",
        n >= 5 && srv[4].proto == VL_PROTO_TROJAN &&

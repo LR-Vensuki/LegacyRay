@@ -31,7 +31,13 @@ static int same_server(const vl_server_t *a, const vl_server_t *b) {
         && strcmp(a->path, b->path) == 0
         && strcmp(a->ws_host, b->ws_host) == 0
         && strcmp(a->mode, b->mode) == 0
-        && strcmp(a->encryption, b->encryption) == 0;
+        && strcmp(a->encryption, b->encryption) == 0
+        && cfg_xh_same(a, b)
+        && a->insecure == b->insecure
+        && strcmp(a->pin_sha256, b->pin_sha256) == 0
+        && strcmp(a->obfs, b->obfs) == 0
+        && strcmp(a->obfs_password, b->obfs_password) == 0
+        && strcmp(a->port_hop, b->port_hop) == 0;
 }
 
 static int section_seen(const int *order, size_t n, int id) {
@@ -603,6 +609,75 @@ static int pct_encode(const char *src, char *dst, size_t cap) {
     return (int)o;
 }
 
+/* "&extra=" with the xhttp knobs as xray's json, every byte outside the
+   unreserved set escaped so other clients read the link back the same.
+   nothing is added while every knob is at xray's default */
+static int append_xh_extra(const vl_server_t *s, char *buf, size_t cap, size_t *off) {
+    static const char hex[] = "0123456789ABCDEF";
+    char json[768];
+    size_t j = 0, o = *off;
+
+    if (s->net != VL_NET_XHTTP || !cfg_xh_custom(s)) return 0;
+#define XH_PUT(...) do { \
+        int put_n = snprintf(json + j, sizeof json - j, __VA_ARGS__); \
+        if (put_n < 0 || (size_t)put_n >= sizeof json - j) return -1; \
+        j += (size_t)put_n; \
+    } while (0)
+#define XH_SEP (j > 1 ? "," : "")
+    XH_PUT("{");
+    if (s->xh_pad_max)
+        XH_PUT("%s\"xPaddingBytes\":\"%lu-%lu\"", XH_SEP,
+               (unsigned long)s->xh_pad_min, (unsigned long)s->xh_pad_max);
+    if (s->xh_post_max)
+        XH_PUT("%s\"scMaxEachPostBytes\":%lu", XH_SEP, (unsigned long)s->xh_post_max);
+    if (s->xh_no_grpc) XH_PUT("%s\"noGRPCHeader\":true", XH_SEP);
+    /* the strings were held to token characters when they were read */
+    if (s->xh_method[0]) XH_PUT("%s\"uplinkHTTPMethod\":\"%s\"", XH_SEP, s->xh_method);
+    if (s->xh_data_place[0])
+        XH_PUT("%s\"uplinkDataPlacement\":\"%s\"", XH_SEP, s->xh_data_place);
+    if (s->xh_data_key[0]) XH_PUT("%s\"uplinkDataKey\":\"%s\"", XH_SEP, s->xh_data_key);
+    if (s->xh_chunk_max)
+        XH_PUT("%s\"uplinkChunkSize\":\"%lu-%lu\"", XH_SEP,
+               (unsigned long)s->xh_chunk_min, (unsigned long)s->xh_chunk_max);
+    if (s->xh_sess_place[0])
+        XH_PUT("%s\"sessionIDPlacement\":\"%s\"", XH_SEP, s->xh_sess_place);
+    if (s->xh_sess_key[0]) XH_PUT("%s\"sessionIDKey\":\"%s\"", XH_SEP, s->xh_sess_key);
+    if (s->xh_seq_place[0]) XH_PUT("%s\"seqPlacement\":\"%s\"", XH_SEP, s->xh_seq_place);
+    if (s->xh_seq_key[0]) XH_PUT("%s\"seqKey\":\"%s\"", XH_SEP, s->xh_seq_key);
+    if (s->xh_pad_obfs) XH_PUT("%s\"xPaddingObfsMode\":true", XH_SEP);
+    if (s->xh_pad_place[0])
+        XH_PUT("%s\"xPaddingPlacement\":\"%s\"", XH_SEP, s->xh_pad_place);
+    if (s->xh_pad_key[0]) XH_PUT("%s\"xPaddingKey\":\"%s\"", XH_SEP, s->xh_pad_key);
+    if (s->xh_pad_header[0])
+        XH_PUT("%s\"xPaddingHeader\":\"%s\"", XH_SEP, s->xh_pad_header);
+    if (s->xh_gap_max)
+        XH_PUT("%s\"scMinPostsIntervalMs\":\"%lu-%lu\"", XH_SEP,
+               (unsigned long)s->xh_gap_min, (unsigned long)s->xh_gap_max);
+    XH_PUT("}");
+#undef XH_SEP
+#undef XH_PUT
+
+    if (o + 7 >= cap) return -1;
+    memcpy(buf + o, "&extra=", 7);
+    o += 7;
+    for (size_t i = 0; i < j; ++i) {
+        unsigned char c = (unsigned char)json[i];
+        int plain = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                    (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~';
+        if (o + (plain ? 1 : 3) >= cap) return -1;
+        if (plain) {
+            buf[o++] = (char)c;
+        } else {
+            buf[o++] = '%';
+            buf[o++] = hex[c >> 4];
+            buf[o++] = hex[c & 0xf];
+        }
+    }
+    buf[o] = '\0';
+    *off = o;
+    return 0;
+}
+
 static int build_link(const vl_server_t *s, char *buf, size_t cap) {
     if (s->proto == VL_PROTO_SOCKS5 || s->proto == VL_PROTO_HTTP || s->proto == VL_PROTO_HTTPS) {
         const char *scheme = (s->proto == VL_PROTO_SOCKS5) ? "socks5" :
@@ -759,6 +834,7 @@ static int build_link(const vl_server_t *s, char *buf, size_t cap) {
         if (m < 0 || (size_t)m >= cap - off) return -1;
         off += (size_t)m;
     }
+    if (append_xh_extra(s, buf, cap, &off) != 0) return -1;
     if (s->insecure) {
         int m = snprintf(buf + off, cap - off, "&allowInsecure=1");
         if (m < 0 || (size_t)m >= cap - off) return -1;

@@ -1,0 +1,168 @@
+From 9491586737f2a0bca557f2dd4c9ed29ddfaa977a Mon Sep 17 00:00:00 2001
+From: LR-Vensuki <260785366+LR-Vensuki@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 21:02:18 +0000
+Subject: [PATCH] xhttp client: send the browser headers xray sends
+
+Xray puts a desktop Chrome fetch's headers on every XHTTP request whose
+profile names no user agent (User-Agent, Sec-CH-UA, Sec-Fetch-*,
+Accept, Accept-Language, Cache-Control, Pragma, Priority, DNT). The
+client sent none of them, not even a user agent, which is the request a
+CDN front ahead of an xray server sees from no other client. The Chrome
+version follows the date the way xray picks it.
+---
+ src/xhttp/wire.rs | 127 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 127 insertions(+)
+
+diff --git a/src/xhttp/wire.rs b/src/xhttp/wire.rs
+index 1620e1c..9e0aa81 100644
+--- a/src/xhttp/wire.rs
++++ b/src/xhttp/wire.rs
+@@ -99,6 +99,93 @@ pub fn sample(range: (u32, u32)) -> u32 {
+     rand::random_range(range.0..=range.1)
+ }
+ 
++/// Chrome's major version as xray picks it: 144 shipped on 2026-01-13, a new
++/// one comes every 35 days, and xray trails the newest by about two
++fn chrome_version(days_since_epoch: i64) -> i64 {
++    const CHROME_144_DAY: i64 = 20466;
++    (144 + (days_since_epoch - CHROME_144_DAY - 70).div_euclid(35)).max(144)
++}
++
++/// The Sec-CH-UA brand list chrome sends, greased and ordered by its version
++/// the way chromium (and xray) does it
++fn chrome_brands(version: i64) -> String {
++    const GREASE: [&str; 11] = [" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_"];
++    const GREASE_VERSION: [&str; 3] = ["8", "99", "24"];
++    const ORDER: [[usize; 3]; 6] = [
++        [0, 1, 2],
++        [0, 2, 1],
++        [1, 0, 2],
++        [1, 2, 0],
++        [2, 0, 1],
++        [2, 1, 0],
++    ];
++    let seed = version as usize;
++    let brands = [
++        format!(
++            "\"Not{}A{}Brand\";v=\"{}\"",
++            GREASE[seed % GREASE.len()],
++            GREASE[(seed + 1) % GREASE.len()],
++            GREASE_VERSION[seed % GREASE_VERSION.len()]
++        ),
++        format!("\"Chromium\";v=\"{version}\""),
++        format!("\"Google Chrome\";v=\"{version}\""),
++    ];
++    let mut ordered = [String::new(), String::new(), String::new()];
++    for (brand, slot) in brands.into_iter().zip(ORDER[seed % ORDER.len()]) {
++        ordered[slot] = brand;
++    }
++    ordered.join(", ")
++}
++
++/// What xray puts on every xhttp request whose profile names no user agent
++/// (or names "chrome"): desktop chrome making a fetch. fronts ahead of xray
++/// servers see that from every other client, and a bare request without even
++/// a user agent is what stands out
++fn masquerade(headers: &mut HeaderMap) {
++    use http::header::{HeaderName, HeaderValue};
++    let agent = headers
++        .get(http::header::USER_AGENT)
++        .map(|value| value.to_str().unwrap_or("?"));
++    if !matches!(agent, None | Some("chrome")) {
++        return;
++    }
++    static CHROME: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
++    let (agent, brands) = CHROME.get_or_init(|| {
++        let days = std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .map_or(0, |since| since.as_secs() / 86400) as i64;
++        let version = chrome_version(days);
++        (
++            format!(
++                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
++                 (KHTML, like Gecko) Chrome/{version}.0.0.0 Safari/537.36"
++            ),
++            chrome_brands(version),
++        )
++    });
++    let mut put = |name: &'static str, value: &str, replace: bool| {
++        let name = HeaderName::from_static(name);
++        if replace || !headers.contains_key(&name) {
++            if let Ok(value) = HeaderValue::from_str(value) {
++                headers.insert(name, value);
++            }
++        }
++    };
++    put("sec-ch-ua", brands, true);
++    put("sec-ch-ua-mobile", "?0", true);
++    put("sec-ch-ua-platform", "\"Windows\"", true);
++    put("dnt", "1", true);
++    put("user-agent", agent, true);
++    put("accept-language", "en-US,en;q=0.9", true);
++    put("sec-fetch-mode", "cors", true);
++    put("sec-fetch-dest", "empty", true);
++    put("sec-fetch-site", "same-origin", true);
++    put("priority", "u=1, i", false);
++    put("cache-control", "no-cache", false);
++    put("pragma", "no-cache", false);
++    put("accept", "*/*", false);
++}
++
+ pub fn request(
+     config: &XhttpClientConfig,
+     path: &Path,
+@@ -204,6 +291,7 @@ pub fn request(
+         request = request.header(http::header::COOKIE, cookies.join("; "));
+     }
+     let mut request = request.body(()).map_err(io::Error::other)?;
++    masquerade(request.headers_mut());
+     if upload && sequence.is_none() && !config.no_grpc_header {
+         request.headers_mut().insert(
+             http::header::CONTENT_TYPE,
+@@ -793,4 +881,43 @@ mod tests {
+         headers.insert("x-data-0", "**".parse().unwrap());
+         assert!(header_payload(&headers).is_err());
+     }
++
++    #[test]
++    fn chrome_identity_matches_what_xray_sends() {
++        // 2026-10-20, the day xray 26.10.17 sent Chrome 151 with this list
++        assert_eq!(chrome_version(20746), 150);
++        assert_eq!(chrome_version(0), 144);
++        assert_eq!(
++            chrome_brands(151),
++            "\"Not=A?Brand\";v=\"99\", \"Google Chrome\";v=\"151\", \"Chromium\";v=\"151\""
++        );
++    }
++
++    #[test]
++    fn requests_look_like_a_chrome_fetch_unless_the_profile_names_an_agent() {
++        let path = Path::new("/xh").unwrap();
++        let mut config: XhttpClientConfig = serde_json::from_value(serde_json::json!({
++            "headers": {"Pragma": "custom"}, "protocol": {"type": "socks"}
++        }))
++        .unwrap();
++        let req = request(&config, &path, "edge.test", true, "s", None, false).unwrap();
++        let headers = req.headers();
++        assert!(headers["user-agent"].to_str().unwrap().contains("Chrome/"));
++        assert_eq!(headers["sec-fetch-mode"], "cors");
++        assert_eq!(headers["accept"], "*/*");
++        assert_eq!(headers["pragma"], "custom");
++        assert!(
++            headers["sec-ch-ua"]
++                .to_str()
++                .unwrap()
++                .contains("Google Chrome")
++        );
++
++        config
++            .headers
++            .insert("User-Agent".into(), "MyAgent/1".into());
++        let req = request(&config, &path, "edge.test", true, "s", Some(0), true).unwrap();
++        assert_eq!(req.headers()["user-agent"], "MyAgent/1");
++        assert!(!req.headers().contains_key("sec-fetch-mode"));
++    }
+ }
+-- 
+2.43.0
+

@@ -20,15 +20,6 @@
 #define FWD_RULE_MAX 12098
 #define C_PROXY_STATE "/var/run/legacyray-c-proxy"
 
-static int ipfw_del(int number) {
-    const char *ipfw = routing_find_ipfw();
-    if (!ipfw) return -1;
-    char num[16];
-    snprintf(num, sizeof num, "%d", number);
-    char *argv[] = { (char *)ipfw, (char *)"-q", (char *)"delete", num, NULL };
-    return routing_spawn(ipfw, argv);
-}
-
 static int ipfw_add(const char *body) {
     const char *ipfw = routing_find_ipfw();
     if (!ipfw) return -1;
@@ -54,8 +45,7 @@ static int ipfw_add(const char *body) {
 
 void routing_fwd_clear_rules(void) {
     (void)unlink(C_PROXY_STATE);
-    for (int n = FWD_RULE_MAX; n >= FWD_RULE_MIN; --n)
-        (void)ipfw_del(n);
+    routing_ipfw_delete_range(FWD_RULE_MIN, FWD_RULE_MAX);
 }
 
 static int application_proxy_available(void) {

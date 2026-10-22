@@ -31,6 +31,7 @@ void daemon_settings_defaults(daemon_settings_t *s) {
     s->bypass_lan = 1;
     s->sub_panel_title = 0;
     s->prefer_chacha = 1;
+    s->engine_core = 1;
     snprintf(s->xray_version, sizeof s->xray_version, "26.7.28");
     snprintf(s->sub_user_agent, sizeof s->sub_user_agent, "Happ/3.26.1");
     s->kill_switch = 0;
@@ -203,8 +204,10 @@ settings_status_t daemon_settings_set(daemon_settings_t *s,
     }
     if (key_is(key, key_len, "sub_refresh_hours")) {
         int v;
-        /* a week is the longest schedule a panel expiry makes any sense at */
-        if (parse_bounded_int(val, ve, 0, 168, &v) != 0) return SETTINGS_ERR_VALUE;
+        /* -1 is off; 0 follows the provider's own interval. a week is the
+           longest schedule a panel expiry makes any sense at */
+        if (ve - val == 2 && val[0] == '-' && val[1] == '1') v = -1;
+        else if (parse_bounded_int(val, ve, 0, 168, &v) != 0) return SETTINGS_ERR_VALUE;
         s->sub_refresh_hours = v;
         return SETTINGS_OK;
     }
@@ -272,6 +275,12 @@ settings_status_t daemon_settings_set(daemon_settings_t *s,
         int b;
         if (parse_bool01(val, ve, &b) != 0) return SETTINGS_ERR_VALUE;
         s->prefer_chacha = b;
+        return SETTINGS_OK;
+    }
+    if (key_is(key, key_len, "engine_core")) {
+        int b;
+        if (parse_bool01(val, ve, &b) != 0) return SETTINGS_ERR_VALUE;
+        s->engine_core = b;
         return SETTINGS_OK;
     }
     if (key_is(key, key_len, "sub_panel_title")) {
@@ -416,6 +425,7 @@ int daemon_settings_serialize(const daemon_settings_t *s, char *buf, size_t cap,
     SETTINGS_EMIT("SET bypass_lan %d\n", s->bypass_lan ? 1 : 0);
     SETTINGS_EMIT("SET sub_panel_title %d\n", s->sub_panel_title ? 1 : 0);
     SETTINGS_EMIT("SET prefer_chacha %d\n", s->prefer_chacha ? 1 : 0);
+    SETTINGS_EMIT("SET engine_core %d\n", s->engine_core ? 1 : 0);
     SETTINGS_EMIT("SET xray_version %s\n", s->xray_version);
     SETTINGS_EMIT("SET sub_user_agent %s\n", s->sub_user_agent);
     SETTINGS_EMIT("SET kill_switch %d\n", s->kill_switch ? 1 : 0);

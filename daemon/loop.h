@@ -101,6 +101,11 @@ typedef struct {
 /* the relay ended without error, so a transport may half close politely */
     int        relay_clean;
 
+/* times the upstream hung up before it answered and the request went out
+   again; redialing is set while a worker opens the new connection */
+    int        redials;
+    int        redialing;
+
 /* retain local output so large package transfers survive backpressure */
     uint8_t    pend[64 * 1024];
     size_t     pend_len;
@@ -184,6 +189,10 @@ void loop_set_tls(loop_t *lp, const char *sni, const char *fingerprint,
                   const char *reality_pbk, const char *reality_sid,
                   const char *path, const char *ws_host,
                   const char *xhttp_mode, const char *peer_host, int insecure);
+
+/* the server's xhttp knobs; NULL restores xray's defaults. loop_set_server
+   clears them, so set them after it */
+void loop_set_xhttp(loop_t *lp, const transport_xhttp_opts_t *xh);
 
 /* replace the active path and drop connections tied to the old server */
 loop_status_t loop_set_server(loop_t *lp, const transport_vt_t *vt,

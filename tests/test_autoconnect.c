@@ -283,12 +283,32 @@ int main(void) {
     ctl_server_tick(&s);
     ok("the backoff holds the next attempt", g_fetch.calls == 2);
 
-    set.sub_refresh_hours = 0;
+    set.sub_refresh_hours = -1;
     s.sub_check_ms = 0;
     s.sub_retry_at_ms[0] = 0;
     s.engine.store.subs[0].last_refresh = 0;
     ctl_server_tick(&s);
     ok("the timer off means no refresh", g_fetch.calls == 2);
+
+    /* automatic: the provider's interval, twelve hours without one */
+    set.sub_refresh_hours = 0;
+    s.sub_check_ms = 0;
+    ctl_server_tick(&s);
+    ok("automatic pulls a list that was never pulled", g_fetch.calls == 3);
+    s.engine.store.subs[0].update_interval_h = 0;
+    s.engine.store.subs[0].last_refresh = (uint64_t)time(NULL) - 11 * 3600;
+    s.sub_check_ms = 0;
+    ctl_server_tick(&s);
+    ok("automatic leaves an 11 hour old list alone", g_fetch.calls == 3);
+    s.engine.store.subs[0].last_refresh = (uint64_t)time(NULL) - 13 * 3600;
+    s.sub_check_ms = 0;
+    ctl_server_tick(&s);
+    ok("automatic pulls a 13 hour old list", g_fetch.calls == 4);
+    s.engine.store.subs[0].update_interval_h = 2;
+    s.engine.store.subs[0].last_refresh = (uint64_t)time(NULL) - 3 * 3600;
+    s.sub_check_ms = 0;
+    ctl_server_tick(&s);
+    ok("automatic follows the provider's interval", g_fetch.calls == 5);
 
     ctl_server_close(&s);
     unlink(path);
