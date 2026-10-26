@@ -533,7 +533,10 @@ static void drop_conn(loop_t *lp, loop_conn_t *c) {
     if (!c->direct) {
         if (c->relay_clean && c->th && c->open_vt && c->open_vt->shutdown)
             c->open_vt->shutdown(c->th);
-        session_trace_close(&c->sess, "drop");
+        /* client bytes the session never took say where a stall sat */
+        char why[48];
+        snprintf(why, sizeof why, "drop held=%zu", c->prebuf_len);
+        session_trace_close(&c->sess, why);
         if (c->sess.state == SESS_ERROR)
             fprintf(stderr, "legacyrayd: dropping errored session\n");
         if (c->th && c->open_vt) c->open_vt->close(c->th);

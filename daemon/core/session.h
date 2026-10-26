@@ -90,19 +90,19 @@ typedef struct {
 /* the socks5 or http upstream hung up before it answered */
     int            upstream_refused;
 
-/* the destination label and the close latch exist in every build: an event line
-   with no destination in it names nothing, and 280 bytes a session is a cost
-   the trace is worth. everything below is what a release build cuts, because
-   the replay and upload buffers are 64 kb each */
+/* the destination label, the close latch and the byte counts exist in every
+   build: an event line with no destination in it names nothing, and a close
+   that does not say whether the request ever left or an answer ever came back
+   cannot tell a dead server from a stuck session. everything below is what a
+   release build cuts, because the replay and upload buffers are 64 kb each */
     char     trace_host[280];
     int      trace_closed;
-
-#ifndef SENKO_RELEASE
     uint64_t trace_app_tx;
     uint64_t trace_app_rx;
     uint64_t trace_wire_tx;
     uint64_t trace_wire_rx;
 
+#ifndef SENKO_RELEASE
     uint8_t  replay_buf[64 * 1024];
     size_t   replay_len;
     uint16_t replay_chunks;

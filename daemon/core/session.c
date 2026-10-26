@@ -114,9 +114,7 @@ static size_t push_remote_mode(session_t *s, const uint8_t *buf, size_t len, int
         s->state = SESS_ERROR;
         break;
     }
-#ifndef SENKO_RELEASE
     s->trace_wire_tx += (uint64_t)off;
-#endif
     return off;
 }
 
@@ -203,6 +201,7 @@ static sess_status_t send_vision_first(session_t *s,
     memcpy(first + reqlen, blk, blk_len);
     push_remote(s, first, reqlen + blk_len);
     if (s->state == SESS_ERROR) return SESS_ERR;
+    s->trace_app_tx += (uint64_t)content;
 
     s->state = SESS_VLESS_RESP;
 /* only DIRECT (inner tls 1.3) leaves the outer tls. END (tls 1.2, plain
@@ -237,17 +236,13 @@ static size_t push_app(session_t *s, const uint8_t *buf, size_t len) {
             return 0;
         size_t p = push_remote(s, enc, enc_len);
         if (p == 0) return 0;
-#ifndef SENKO_RELEASE
         s->trace_app_tx += (uint64_t)content;
-#endif
         return content;
     }
 
     if (!s->vision_on) {
         size_t n = push_remote(s, buf, len);
-#ifndef SENKO_RELEASE
         s->trace_app_tx += (uint64_t)n;
-#endif
         return n;
     }
     if (len == 0) return 0;
@@ -276,9 +271,7 @@ static size_t push_app(session_t *s, const uint8_t *buf, size_t len) {
     if (s->state == SESS_ERROR) return 0;
     if (sent_direct)
         request_upstream_direct(s, "local DIRECT", 1);
-#ifndef SENKO_RELEASE
     s->trace_app_tx += (uint64_t)content;
-#endif
     return content;
 }
 
@@ -295,9 +288,7 @@ static void deliver_client(session_t *s, const uint8_t *buf, size_t len) {
             s->state = SESS_ERROR;
             return;
         }
-#ifndef SENKO_RELEASE
         s->trace_app_rx += (uint64_t)len;
-#endif
         return;
     }
     senko_replay_feed(s, buf, len);
@@ -330,9 +321,7 @@ static void deliver_client(session_t *s, const uint8_t *buf, size_t len) {
         s->state = SESS_ERROR;
         return;
     }
-#ifndef SENKO_RELEASE
     s->trace_app_rx += (uint64_t)an;
-#endif
 }
 
 static void push_staged_client(session_t *s) {
@@ -459,6 +448,7 @@ static sess_status_t begin_vless_dest(session_t *s, const vless_dest_t *dest,
         push_remote(s, req, reqlen);
         if (s->state == SESS_ERROR) return SESS_ERR;
         payload_used = first;
+        s->trace_app_tx += (uint64_t)first;
     }
 
     if (payload_used_out) *payload_used_out = payload_used;
@@ -535,6 +525,7 @@ static sess_status_t begin_upstream_dest(session_t *s, const vless_dest_t *dest,
         s->state = SESS_ERROR;
         return SESS_ERR;
     }
+    s->trace_app_tx += (uint64_t)payload_used;
     if (payload_used_out) *payload_used_out = payload_used;
     return SESS_OK;
 }
@@ -702,9 +693,7 @@ sess_status_t session_pump_remote(session_t *s) {
         }
         if (n == 0) return SESS_OK;
 
-#ifndef SENKO_RELEASE
         s->trace_wire_rx += (uint64_t)n;
-#endif
 
         if (s->state == SESS_VLESS_RESP) {
             if (s->proto == VL_PROTO_VLESS) {
