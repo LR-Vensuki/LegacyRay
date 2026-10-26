@@ -70,7 +70,7 @@ unpack "${SSH2_TGZ}" "${SSH2_SRC}"
 
 build_openssl_armv7() {
   local prefix="${DEPS}/openssl-armv7"
-  local marker="${prefix}/.built-${OPENSSL_VERSION}-ios${MIN}-neon"
+  local marker="${prefix}/.built-${OPENSSL_VERSION}-ios${MIN}-neon-dirs"
   if [[ -f "${marker}" ]]; then echo "openssl armv7 up to date"; return; fi
   local bld="${DEPS}/build/openssl-armv7"
   rm -rf "${bld}" "${prefix}"
@@ -86,12 +86,18 @@ build_openssl_armv7() {
     # the neon assembly (chacha20, poly1305, bit-sliced aes, ghash, sha,
     # montgomery) needs several times fewer cycles per byte than the portable
     # c, and on a phone every cycle spent on crypto is battery.
-    # no-async: ucontext is missing from the ios sdk
+    # no-async: ucontext is missing from the ios sdk.
+    # --prefix and --openssldir only name paths compiled into the library (the
+    # files are copied out below, nothing is installed): the default, this
+    # cache, put the builder's home into every binary, and openssl looked
+    # there for roots on every handshake. no-filenames keeps the source paths
+    # of its error records out as well
     "${OSSL_SRC}/Configure" ios-cross \
       "CC=${bld}/cc" "AR=${TC}/llvm-ar" "RANLIB=${TC}/ranlib" \
       no-async no-shared no-dso no-tests no-engine no-ui-console \
-      no-docs no-apps no-quic no-comp -DBROKEN_CLANG_ATOMICS \
-      -O2 -fno-strict-aliasing --prefix="${prefix}" >/dev/null
+      no-docs no-apps no-quic no-comp no-filenames -DBROKEN_CLANG_ATOMICS \
+      -O2 -fno-strict-aliasing \
+      --prefix=/usr/local/legacyray --openssldir=/usr/local/legacyray/ssl >/dev/null
     # openssl 3 lost the ios32 flavour of the armcap reference: the armv4
     # modules write ".word OPENSSL_armcap_P-.Lfunc", which a mach-o assembler
     # cannot encode for an undefined symbol. their __APPLE__ code already

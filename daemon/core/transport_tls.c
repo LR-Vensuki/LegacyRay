@@ -1,6 +1,7 @@
 #include "transport.h"
 
 #include <pthread.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -11,6 +12,33 @@
 #include "../../common/senko_paths.h"
 
 #define SENKO_CA_BUNDLE SENKO_USR_LIB "/legacyraytlsfix/cacert.pem"
+
+static int ca_bundle_path(char *out, size_t cap) {
+    if (access(SENKO_CA_BUNDLE, R_OK) != 0) return 0;
+    return snprintf(out, cap, "%s", SENKO_CA_BUNDLE) < (int)cap;
+}
+
+/* the roots are parsed once and every connection's context shares them. each
+   handshake used to read and parse the whole bundle again, and
+   set_default_verify_paths sent openssl looking under the openssldir baked in
+   at build time, a folder in the builder's home that no phone has, a dozen
+   lookups per handshake. a bundle that is not there yet is looked for again
+   on the next connection */
+static pthread_mutex_t g_roots_lock = PTHREAD_MUTEX_INITIALIZER;
+static X509_STORE *g_roots;
+
+static X509_STORE *shared_roots(void) {
+    pthread_mutex_lock(&g_roots_lock);
+    if (!g_roots) {
+        char path[1024];
+        X509_STORE *st = ca_bundle_path(path, sizeof path) ? X509_STORE_new() : NULL;
+        if (st && X509_STORE_load_file(st, path) == 1) g_roots = st;
+        else X509_STORE_free(st);
+    }
+    X509_STORE *roots = g_roots;
+    pthread_mutex_unlock(&g_roots_lock);
+    return roots;
+}
 
 typedef struct {
     SSL_CTX *ctx;
@@ -118,9 +146,11 @@ static void *tls_open(int fd, const transport_tls_cfg_t *cfg) {
         SSL_CTX_set_verify(h->ctx, SSL_VERIFY_NONE, NULL);
     } else {
         SSL_CTX_set_verify(h->ctx, SSL_VERIFY_PEER, NULL);
-        SSL_CTX_set_default_verify_paths(h->ctx);
-        if (access(SENKO_CA_BUNDLE, R_OK) == 0)
-            SSL_CTX_load_verify_locations(h->ctx, SENKO_CA_BUNDLE, NULL);
+        X509_STORE *roots = shared_roots();
+        if (roots) SSL_CTX_set1_cert_store(h->ctx, roots);
+#if !defined(__APPLE__)
+        else SSL_CTX_set_default_verify_paths(h->ctx); /* host builds: the system's roots */
+#endif
     }
 
     h->ssl = SSL_new(h->ctx);
