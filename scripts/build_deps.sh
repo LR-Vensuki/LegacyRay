@@ -53,6 +53,21 @@ W
   chmod +x "${out}"
 }
 
+# asserts and debug lines name their source file, and __FILE__ is the path the
+# compiler was given: inside this cache, so under the builder's home. these
+# flags write the path's last part instead; a compiler without them builds
+# the same library, with the paths left in
+file_prefix_maps() {
+  local cc="$1" flags="" dir
+  shift
+  for dir in "$@"; do flags+=" -fmacro-prefix-map=${dir}=$(basename "${dir}")"; done
+  if "${cc}" ${flags} -E -x c /dev/null -o /dev/null 2>/dev/null; then
+    echo "${flags}"
+  else
+    echo "warning: ${cc} has no -fmacro-prefix-map; source paths stay in" >&2
+  fi
+}
+
 OSSL_TGZ="${DEPS}/src/openssl-${OPENSSL_VERSION}.tar.gz"
 OSSL_SRC="${DEPS}/src/openssl-${OPENSSL_VERSION}"
 fetch "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" "${OSSL_TGZ}"
@@ -164,18 +179,20 @@ build_mbedtls_armv7() {
 # way the amnezia client does; it rides on the openssl built above
 build_libssh2_armv7() {
   local prefix="${DEPS}/libssh2-armv7"
-  local marker="${prefix}/.built-${LIBSSH2_VERSION}-ios${MIN}"
+  local marker="${prefix}/.built-${LIBSSH2_VERSION}-ios${MIN}-dirs"
   if [[ -f "${marker}" ]]; then echo "libssh2 armv7 up to date"; return; fi
   local bld="${DEPS}/build/libssh2-armv7"
   rm -rf "${bld}" "${prefix}"
   mkdir -p "${bld}" "${prefix}"
   wrap_cc "${bld}/cc"
+  local maps
+  maps="$(file_prefix_maps "${bld}/cc" "${SSH2_SRC}" "${bld}")"
   echo "==> libssh2 ${LIBSSH2_VERSION} armv7 (iOS ${MIN}+)"
   (
     cd "${bld}"
     "${SSH2_SRC}/configure" --host=arm-apple-darwin11 --prefix="${prefix}" \
       CC="${bld}/cc" AR="${TC}/llvm-ar" RANLIB="${TC}/ranlib" \
-      CFLAGS="-O2" CPPFLAGS="-I${DEPS}/openssl-armv7/include" \
+      CFLAGS="-O2${maps}" CPPFLAGS="-I${DEPS}/openssl-armv7/include" \
       LDFLAGS="-L${DEPS}/openssl-armv7/lib" LIBS="-lcrypto" \
       --with-crypto=openssl --with-libssl-prefix="${DEPS}/openssl-armv7" \
       --disable-shared --enable-static --disable-examples-build \

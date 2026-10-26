@@ -34,6 +34,21 @@ W
   chmod +x "$1"
 }
 
+# asserts and debug lines name their source file, and __FILE__ is the path the
+# compiler was given: inside this cache, so under the builder's home. these
+# flags write the path's last part instead; a compiler without them builds
+# the same library, with the paths left in
+file_prefix_maps() {
+  local cc="$1" flags="" dir
+  shift
+  for dir in "$@"; do flags+=" -fmacro-prefix-map=${dir}=$(basename "${dir}")"; done
+  if "${cc}" ${flags} -E -x c /dev/null -o /dev/null 2>/dev/null; then
+    echo "${flags}"
+  else
+    echo "warning: ${cc} has no -fmacro-prefix-map; source paths stay in" >&2
+  fi
+}
+
 build_openssl_mac() {
   local prefix="${DEPS}/openssl-mac"
   local marker="${prefix}/.built-${OPENSSL_VERSION}-osx${MIN}-dirs"
@@ -70,18 +85,20 @@ build_openssl_mac() {
 
 build_libssh2_mac() {
   local prefix="${DEPS}/libssh2-mac"
-  local marker="${prefix}/.built-${LIBSSH2_VERSION}-osx${MIN}"
+  local marker="${prefix}/.built-${LIBSSH2_VERSION}-osx${MIN}-dirs"
   if [[ -f "${marker}" ]]; then echo "libssh2 mac up to date"; return; fi
   local bld="${DEPS}/build/libssh2-mac"
   rm -rf "${bld}" "${prefix}"
   mkdir -p "${bld}" "${prefix}"
   wrap_cc "${bld}/cc"
+  local maps
+  maps="$(file_prefix_maps "${bld}/cc" "${SSH2_SRC}" "${bld}")"
   echo "==> libssh2 ${LIBSSH2_VERSION} x86_64 (OS X ${MIN}+)"
   (
     cd "${bld}"
     "${SSH2_SRC}/configure" --host=x86_64-apple-darwin12 --prefix="${prefix}" \
       CC="${bld}/cc" AR="${TC}/llvm-ar" RANLIB="${TC}/ranlib" \
-      CFLAGS="-O2" CPPFLAGS="-I${DEPS}/openssl-mac/include" \
+      CFLAGS="-O2${maps}" CPPFLAGS="-I${DEPS}/openssl-mac/include" \
       LDFLAGS="-L${DEPS}/openssl-mac/lib" LIBS="-lcrypto" \
       --with-crypto=openssl --with-libssl-prefix="${DEPS}/openssl-mac" \
       --disable-shared --enable-static --disable-examples-build \
