@@ -43,6 +43,7 @@ extern NSString * const LRCatalogPingNotification;
     BOOL _loaded;
     BOOL _loading;
     int _selectedIndex;
+    BOOL _adoptDaemonSelection;
     NSUInteger _pingGeneration;
     NSMutableArray *_pingQueue;
     NSUInteger _pingInFlight;
@@ -69,6 +70,9 @@ extern NSString * const LRCatalogPingNotification;
 - (LRSubscription *)subscriptionWithIndex:(int)index;
 - (LRSection *)sectionForServer:(LRServer *)server;
 - (LRServer *)selectedServer;
+/* reload and take the daemon's selection: the tunnel came up on a server
+   chosen somewhere else (the terminal, another copy of the app) */
+- (void)adoptDaemonSelection;
 - (NSString *)displayNameForServer:(LRServer *)server;
 /* the next / previous server after the selected one, wrapping across sections */
 - (LRServer *)serverAfterSelected:(NSInteger)step;

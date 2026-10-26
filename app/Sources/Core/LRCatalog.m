@@ -243,6 +243,14 @@ static NSString *LRServerIdentity(LRServer *sv) {
         if (wanted && [LRServerIdentity(sv) isEqualToString:wanted]) _selectedIndex = sv.index;
     }
     if (_selectedIndex < 0) _selectedIndex = daemonSelected;
+    /* the server the tunnel is up on outranks a choice made here while idle */
+    if (_adoptDaemonSelection && daemonSelected >= 0) [self setSelectedIndex:daemonSelected];
+    _adoptDaemonSelection = NO;
+}
+
+- (void)adoptDaemonSelection {
+    _adoptDaemonSelection = YES;
+    [self reload];
 }
 
 - (void)setSelectedIndex:(int)index {
