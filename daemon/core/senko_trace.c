@@ -78,14 +78,11 @@ static const char *th_label(void *th) {
     return "-";
 }
 
-/* the byte counters only exist where they are compiled in, so a release build
-   prints the event and the vision framing state and stops there */
 static void trace_line(const char *host, const void *ctx, const session_t *s,
                        const char *event, const char *detail) {
     int ds = s ? s->vision_downstream_direct : 0;
     int us = s ? s->vision_upstream_direct : 0;
     int us_pend = s ? s->vision_upstream_direct_pending : 0;
-#ifndef SENKO_RELEASE
     if (s) {
         fprintf(stderr,
                 "legacyray-trace: t=%lu host=%s ctx=%p event=%s %s "
@@ -98,14 +95,12 @@ static void trace_line(const char *host, const void *ctx, const session_t *s,
                 (unsigned long long)s->trace_wire_tx,
                 (unsigned long long)s->trace_wire_rx,
                 ds, us, us_pend);
-        fflush(stderr);
-        return;
+    } else {
+        fprintf(stderr,
+                "legacyray-trace: t=%lu host=%s ctx=%p event=%s %s ds=%d us=%d us_pend=%d\n",
+                trace_ms(), host_or_dash(host), ctx,
+                event ? event : "?", detail ? detail : "", ds, us, us_pend);
     }
-#endif
-    fprintf(stderr,
-            "legacyray-trace: t=%lu host=%s ctx=%p event=%s %s ds=%d us=%d us_pend=%d\n",
-            trace_ms(), host_or_dash(host), ctx,
-            event ? event : "?", detail ? detail : "", ds, us, us_pend);
     fflush(stderr);
 }
 
@@ -154,9 +149,10 @@ void session_set_trace_host(session_t *s, const vless_dest_t *dest) {
 void session_trace_close(session_t *s, const char *reason) {
     if (!s || s->trace_closed) return;
     s->trace_closed = 1;
-    char detail[96];
-    snprintf(detail, sizeof detail, "state=%d %s",
-             (int)s->state, reason ? reason : "");
+    char detail[128];
+    snprintf(detail, sizeof detail, "state=%d %s up_queued=%zu up_staged=%zu",
+             (int)s->state, reason ? reason : "", s->to_remote_len,
+             s->client_stage_len);
     senko_trace_sess(s, "session_close", detail);
 #ifndef SENKO_RELEASE
     senko_replay_flush(s);

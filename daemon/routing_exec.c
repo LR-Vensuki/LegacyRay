@@ -144,6 +144,7 @@ static int fd_read_all(int fd, void *data, size_t len) {
     while (len > 0) {
         ssize_t n = read(fd, p, len);
         if (n < 0 && errno == EINTR) continue;
+        if (n == 0) errno = 0; /* the peer closed: tells it from a timeout */
         if (n <= 0) return -1;
         p += n;
         len -= (size_t)n;
@@ -871,7 +872,10 @@ static int apply_pf_mode(const char *pfctl, const char *server_ips,
 }
 
 
-static int socks5_connect_to_dns(int socks_port, const char *dns_upstream) {
+/* *step names what was under way when it failed, for the log */
+static int socks5_connect_to_dns(int socks_port, const char *dns_upstream,
+                                 const char **step) {
+    *step = "socket";
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
 /* the greeting is answered by the loop, which is busy while a connect is
@@ -889,17 +893,22 @@ static int socks5_connect_to_dns(int socks_port, const char *dns_upstream) {
     addr.sin_addr.s_addr = inet_addr("127.0.0.1");
     addr.sin_port = htons(socks_port);
 
+    *step = "connect to the socks port";
     if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
         close(fd);
         return -1;
     }
 
+    *step = "socks greeting";
     uint8_t greet[] = { 0x05, 0x01, 0x00 };
     if (fd_write_all(fd, greet, sizeof greet) != 0) { close(fd); return -1; }
 
+    *step = "socks greeting reply";
     uint8_t resp[10];
-    if (fd_read_all(fd, resp, 2) != 0 || resp[0] != 0x05 || resp[1] != 0x00) {
+    if (fd_read_all(fd, resp, 2) != 0) { close(fd); return -1; }
+    if (resp[0] != 0x05 || resp[1] != 0x00) {
         close(fd);
+        errno = EPROTO;
         return -1;
     }
 
@@ -915,10 +924,14 @@ static int socks5_connect_to_dns(int socks_port, const char *dns_upstream) {
         0x00, 0x35 /* port 53 */
     };
     memcpy(req + 4, &dns_addr.s_addr, 4);
+    *step = "socks request";
     if (fd_write_all(fd, req, sizeof req) != 0) { close(fd); return -1; }
 
-    if (fd_read_all(fd, resp, 10) != 0 || resp[0] != 0x05 || resp[1] != 0x00) {
+    *step = "socks request reply";
+    if (fd_read_all(fd, resp, 10) != 0) { close(fd); return -1; }
+    if (resp[0] != 0x05 || resp[1] != 0x00) {
         close(fd);
+        errno = EPROTO;
         return -1;
     }
 
@@ -936,27 +949,39 @@ static int dns_sendto(int fd, const uint8_t *data, size_t len,
 
 static int dns_exchange(routing_exec_t *st, int *tcp_fd,
                         const uint8_t *query, size_t query_len,
-                        uint8_t *response, size_t cap, size_t *response_len) {
+                        uint8_t *response, size_t cap, size_t *response_len,
+                        const char **step) {
     uint8_t length[2];
     if (*tcp_fd < 0) {
-        *tcp_fd = socks5_connect_to_dns(st->socks_port, st->dns_upstream);
+        *tcp_fd = socks5_connect_to_dns(st->socks_port, st->dns_upstream, step);
         if (*tcp_fd < 0) return -1;
     }
     length[0] = (uint8_t)(query_len >> 8);
     length[1] = (uint8_t)query_len;
+    *step = "query write";
     if (fd_write_all(*tcp_fd, length, sizeof length) != 0 ||
-        fd_write_all(*tcp_fd, query, query_len) != 0 ||
-        fd_read_all(*tcp_fd, length, sizeof length) != 0)
+        fd_write_all(*tcp_fd, query, query_len) != 0)
+        goto failed;
+    *step = "answer length";
+    if (fd_read_all(*tcp_fd, length, sizeof length) != 0)
         goto failed;
     size_t len = (size_t)(((uint16_t)length[0] << 8) | length[1]);
-    if (len == 0 || len > cap || fd_read_all(*tcp_fd, response, len) != 0)
+    *step = "answer";
+    if (len == 0 || len > cap) {
+        errno = EPROTO;
+        goto failed;
+    }
+    if (fd_read_all(*tcp_fd, response, len) != 0)
         goto failed;
     *response_len = len;
     return 0;
-failed:
-    close(*tcp_fd);
-    *tcp_fd = -1;
-    return -1;
+failed: {
+        int err = errno;
+        close(*tcp_fd);
+        *tcp_fd = -1;
+        errno = err;
+        return -1;
+    }
 }
 
 static void dns_log_rule(routing_exec_t *st, size_t index,
@@ -1057,6 +1082,9 @@ static void *dns_forwarder_thread(void *arg) {
 
     uint8_t query[DNS_CACHE_RESPONSE_MAX];
     uint8_t response[DNS_CACHE_RESPONSE_MAX];
+/* the same failure again and again is said once, until another one comes */
+    const char *said_step = NULL;
+    int said_err = -1;
     while (!st->dns_stop) {
         uint64_t now = monotonic_seconds();
         if (st->flush_dns_requested) {
@@ -1147,9 +1175,23 @@ static void *dns_forwarder_thread(void *arg) {
 
         int success = 0;
         for (int retries = 2; retries > 0 && !st->dns_stop; --retries) {
+            const char *step = "";
+            uint64_t began = monotonic_seconds();
             if (dns_exchange(st, &tcp_fd, query, (size_t)query_len,
-                             response, sizeof response, &response_len) != 0)
+                             response, sizeof response, &response_len, &step) != 0) {
+                int err = errno;
+                if (step != said_step || err != said_err) {
+                    fprintf(stderr, "legacyrayd: DNS proxy: %s via 127.0.0.1:%d failed "
+                            "after %llus (%s)\n", step, st->socks_port,
+                            (unsigned long long)(monotonic_seconds() - began),
+                            err ? strerror(err) : "closed");
+                    said_step = step;
+                    said_err = err;
+                }
                 continue;
+            }
+            said_step = NULL;
+            said_err = -1;
             dns_question_t response_question;
             dns_response_info_t info;
             if (response_len < 2 || response[0] != query[0] || response[1] != query[1] ||
