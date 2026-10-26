@@ -279,6 +279,11 @@ static BOOL LRInterfaceBytes(NSString *name, uint64_t *inBytes, uint64_t *outByt
         _uptime = uptime;
         _uptimeBase = [NSDate timeIntervalSinceReferenceDate] - uptime;
     }
+    /* a connect this app did not start (it is not busy) chose its server
+       elsewhere, and the card and the list should show that one. the daemon
+       stores its selection once the tunnel is up, not while connecting */
+    if (st == LRTunnelConnected && _state != LRTunnelConnected)
+        [[LRCatalog shared] adoptDaemonSelection];
     [self setState:st];
 }
 
