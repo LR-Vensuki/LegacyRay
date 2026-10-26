@@ -1,6 +1,7 @@
 #include "transport.h"
 
 #include <pthread.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -18,26 +19,46 @@
 #if defined(LR_MACOS)
 /* the installed roots, else the copy beside the running binary (the app's
    Helpers folder while the daemon runs from the bundle) */
-static void load_ca_bundle(SSL_CTX *ctx) {
-    if (access(SENKO_CA_BUNDLE, R_OK) == 0) {
-        SSL_CTX_load_verify_locations(ctx, SENKO_CA_BUNDLE, NULL);
-        return;
-    }
-    char self[PATH_MAX], real[PATH_MAX], path[PATH_MAX];
+static int ca_bundle_path(char *out, size_t cap) {
+    if (access(SENKO_CA_BUNDLE, R_OK) == 0)
+        return snprintf(out, cap, "%s", SENKO_CA_BUNDLE) < (int)cap;
+    char self[PATH_MAX], real[PATH_MAX];
     uint32_t n = sizeof self;
-    if (_NSGetExecutablePath(self, &n) != 0 || !realpath(self, real)) return;
+    if (_NSGetExecutablePath(self, &n) != 0 || !realpath(self, real)) return 0;
     char *slash = strrchr(real, '/');
-    if (!slash) return;
+    if (!slash) return 0;
     *slash = '\0';
-    if (snprintf(path, sizeof path, "%s/cacert.pem", real) >= (int)sizeof path) return;
-    if (access(path, R_OK) == 0) SSL_CTX_load_verify_locations(ctx, path, NULL);
+    if (snprintf(out, cap, "%s/cacert.pem", real) >= (int)cap) return 0;
+    return access(out, R_OK) == 0;
 }
 #else
-static void load_ca_bundle(SSL_CTX *ctx) {
-    if (access(SENKO_CA_BUNDLE, R_OK) == 0)
-        SSL_CTX_load_verify_locations(ctx, SENKO_CA_BUNDLE, NULL);
+static int ca_bundle_path(char *out, size_t cap) {
+    if (access(SENKO_CA_BUNDLE, R_OK) != 0) return 0;
+    return snprintf(out, cap, "%s", SENKO_CA_BUNDLE) < (int)cap;
 }
 #endif
+
+/* the roots are parsed once and every connection's context shares them. each
+   handshake used to read and parse the whole bundle again, and
+   set_default_verify_paths sent openssl looking under the openssldir baked in
+   at build time: a folder in the builder's home, which autofs on os x answers
+   in over half a second per lookup, a dozen lookups per handshake. a bundle
+   that is not there yet is looked for again on the next connection */
+static pthread_mutex_t g_roots_lock = PTHREAD_MUTEX_INITIALIZER;
+static X509_STORE *g_roots;
+
+static X509_STORE *shared_roots(void) {
+    pthread_mutex_lock(&g_roots_lock);
+    if (!g_roots) {
+        char path[1024];
+        X509_STORE *st = ca_bundle_path(path, sizeof path) ? X509_STORE_new() : NULL;
+        if (st && X509_STORE_load_file(st, path) == 1) g_roots = st;
+        else X509_STORE_free(st);
+    }
+    X509_STORE *roots = g_roots;
+    pthread_mutex_unlock(&g_roots_lock);
+    return roots;
+}
 
 typedef struct {
     SSL_CTX *ctx;
@@ -145,8 +166,11 @@ static void *tls_open(int fd, const transport_tls_cfg_t *cfg) {
         SSL_CTX_set_verify(h->ctx, SSL_VERIFY_NONE, NULL);
     } else {
         SSL_CTX_set_verify(h->ctx, SSL_VERIFY_PEER, NULL);
-        SSL_CTX_set_default_verify_paths(h->ctx);
-        load_ca_bundle(h->ctx);
+        X509_STORE *roots = shared_roots();
+        if (roots) SSL_CTX_set1_cert_store(h->ctx, roots);
+#if !defined(__APPLE__)
+        else SSL_CTX_set_default_verify_paths(h->ctx); /* host builds: the system's roots */
+#endif
     }
 
     h->ssl = SSL_new(h->ctx);

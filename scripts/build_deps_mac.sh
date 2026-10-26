@@ -36,7 +36,7 @@ W
 
 build_openssl_mac() {
   local prefix="${DEPS}/openssl-mac"
-  local marker="${prefix}/.built-${OPENSSL_VERSION}-osx${MIN}"
+  local marker="${prefix}/.built-${OPENSSL_VERSION}-osx${MIN}-dirs"
   if [[ -f "${marker}" ]]; then echo "openssl mac up to date"; return; fi
   local bld="${DEPS}/build/openssl-mac"
   rm -rf "${bld}" "${prefix}"
@@ -47,12 +47,18 @@ build_openssl_mac() {
     cd "${bld}"
     # the aes-ni, avx and sha extension paths are picked at run time, so the
     # same binary is fast on a 2008 core 2 and on a haswell.
-    # no-async: makecontext is deprecated on os x and buys nothing here
+    # no-async: makecontext is deprecated on os x and buys nothing here.
+    # --prefix and --openssldir only name paths compiled into the library (the
+    # files are copied out below, nothing is installed): the default, this
+    # cache, put the builder's home into every binary, and openssl looked
+    # there for roots on every handshake, which autofs answers slowly under
+    # /home on a mac. no-filenames keeps the source paths of its error
+    # records out as well
     "${OSSL_SRC}/Configure" darwin64-x86_64-cc \
       "CC=${bld}/cc" "AR=${TC}/llvm-ar" "RANLIB=${TC}/ranlib" \
       no-async no-shared no-dso no-tests no-engine no-ui-console \
-      no-docs no-apps no-quic no-comp \
-      -O2 --prefix="${prefix}" >/dev/null
+      no-docs no-apps no-quic no-comp no-filenames \
+      -O2 --prefix=/usr/local/legacyray --openssldir=/usr/local/legacyray/ssl >/dev/null
     make -j"${JOBS}" build_libs >/dev/null
     cp libssl.a libcrypto.a "${prefix}/lib/"
     mkdir -p "${prefix}/include"
