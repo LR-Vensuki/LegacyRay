@@ -72,6 +72,8 @@ HOST_TESTS += test_engine_config
 HOST_TESTS += test_session_upstream
 HOST_TESTS += test_vmess
 HOST_TESTS += test_subfetch_budget
+HOST_TESTS += test_net_diag
+HOST_TESTS += test_senko_clock
 
 all: test
 
@@ -79,6 +81,8 @@ test: $(HOST_TESTS)
 	./test_legacyray
 	./test_vmess
 	./test_subfetch_budget
+	./test_net_diag
+	./test_senko_clock
 	./test_trojan
 	./test_shadowsocks
 	./test_qr_zbar
@@ -205,6 +209,12 @@ test_subfetch_budget: test_subfetch_budget.c $(CORE)/subfetch.c $(CORE)/subfetch
 	$(CC) $(CFLAGS) $(TLS_CFLAGS) $(THREAD_CFLAGS) -I$(CORE) -I$(DAEMON) test_subfetch_budget.c \
 	      $(CORE)/subfetch.c $(CORE)/http.c $(CORE)/url.c $(CORE)/net_safe.c \
 	      $(CORE)/b64.c $(CORE)/transport_tcp.c -o $@ $(TLS_LDFLAGS) -lz $(THREAD_LDFLAGS)
+
+test_net_diag: test_net_diag.c $(CORE)/net_diag.c $(CORE)/net_diag.h $(CORE)/net_fail.h
+	$(CC) $(CFLAGS) $(TLS_CFLAGS) -I$(CORE) test_net_diag.c $(CORE)/net_diag.c -o $@
+
+test_senko_clock: test_senko_clock.c $(CORE)/senko_clock.c $(CORE)/senko_clock.h
+	$(CC) $(CFLAGS) -I$(CORE) test_senko_clock.c $(CORE)/senko_clock.c -o $@
 
 test_legacy_ios: test_legacy_ios.c $(DAEMON)/legacy_ios.c $(DAEMON)/legacy_ios.h
 	$(CC) $(CFLAGS) -I$(DAEMON) test_legacy_ios.c $(DAEMON)/legacy_ios.c -o $@

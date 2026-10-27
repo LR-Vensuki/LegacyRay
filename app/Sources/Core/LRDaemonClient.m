@@ -728,7 +728,7 @@ static BOOL LRCheckModeValid(NSString *mode) {
             }
         }
         if (ms < 0 && !error) error = reply ? @"no answer" : @"daemon offline";
-        if (callback) callback(ms, ms >= 0 ? nil : error);
+        if (callback) callback(ms, ms >= 0 ? nil : LRCheckReasonText(error));
     }];
 }
 
@@ -760,7 +760,7 @@ static BOOL LRCheckModeValid(NSString *mode) {
             }
         }
         if (ms < 0 && !error) error = reply ? @"no answer" : @"daemon offline";
-        if (callback) callback(stages, ms, ms >= 0 ? nil : error);
+        if (callback) callback(stages, ms, ms >= 0 ? nil : LRCheckReasonText(error));
     }];
 }
 

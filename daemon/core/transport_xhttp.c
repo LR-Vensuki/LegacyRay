@@ -79,6 +79,7 @@ typedef struct {
     size_t  app_len, app_off;
     uint8_t grpc_rx[XH_APP];
     size_t  grpc_rx_len;
+    net_fail_t *fail;
 } xh_t;
 
 static int h2_u24(const uint8_t *p) {
@@ -445,6 +446,7 @@ static int process_header_block(xh_t *h, uint8_t type, uint8_t flags,
     if (f.have_status) {
         if (f.status != 200) {
             char msg[96];
+            net_fail_note(h->fail, NET_FAIL_HTTP_STATUS, f.status);
             snprintf(msg, sizeof msg, "http status %d", f.status);
             return h2_fail(h, msg);
         }
@@ -457,6 +459,7 @@ static int process_header_block(xh_t *h, uint8_t type, uint8_t flags,
     if ((flags & H2_FLAG_END_STREAM) && h->grpc) {
         if (f.have_grpc_status && f.grpc_status != 0) {
             char msg[160];
+            net_fail_note(h->fail, NET_FAIL_GRPC_STATUS, f.grpc_status);
             snprintf(msg, sizeof msg, "grpc status %d: %s",
                      f.grpc_status, f.grpc_message);
             return h2_fail(h, msg);
@@ -801,6 +804,7 @@ static void *xh_open_common(int fd, const transport_tls_cfg_t *cfg,
     xh_t *h = (xh_t *)calloc(1, sizeof *h);
     if (!h) return NULL;
     h->sub_vt = sub;
+    h->fail = cfg ? cfg->fail : NULL;
     h->sub_h = sub->open(fd, cfg);
     if (!h->sub_h) { free(h); return NULL; }
     if (queue_boot(h, cfg, sec) != 0) {

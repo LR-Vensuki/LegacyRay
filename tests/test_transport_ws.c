@@ -244,9 +244,13 @@ static long ms_now(void) {
     return (long)tv.tv_sec * 1000L + (long)(tv.tv_usec / 1000);
 }
 
+static net_fail_t g_open_fail;
+
 static void *open_with_budget(int sv[2], int budget_ms) {
     transport_tls_cfg_t cfg;
     memset(&cfg, 0, sizeof cfg);
+    memset(&g_open_fail, 0, sizeof g_open_fail);
+    cfg.fail = &g_open_fail;
     cfg.ws_host = "cdn.example";
     cfg.path = "/ws?ed=2048";
     cfg.handshake_ms = budget_ms;
@@ -266,6 +270,8 @@ static void test_open_handshake(void) {
     ok("queue 502", write(sv[1], refused, sizeof refused - 1) == (ssize_t)(sizeof refused - 1));
     h = open_with_budget(sv, 2000);
     ok("502 fails the open", h == NULL);
+    ok("502 is kept for the check",
+       g_open_fail.kind == NET_FAIL_HTTP_STATUS && g_open_fail.value == 502);
     close_pair(sv, NULL);
 
     /* a silent server fails it once the budget runs out */
@@ -347,12 +353,39 @@ static void test_path_without_early_data(void) {
     ok("no path is the root", strcmp(out, "/") == 0);
 }
 
+/* a port that answers the client hello with plain http is not tls, and a
+   check says so instead of a bare handshake failure */
+static void test_tls_not_tls(void) {
+    int sv[2];
+    static const char text[] = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+    transport_tls_cfg_t cfg;
+    net_fail_t fail;
+    memset(&cfg, 0, sizeof cfg);
+    memset(&fail, 0, sizeof fail);
+    cfg.sni = "front.example";
+    cfg.fail = &fail;
+    ok("plain pair", socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    ok("queue text", write(sv[1], text, sizeof text - 1) == (ssize_t)(sizeof text - 1));
+    void *h = transport_tls.open(sv[0], &cfg);
+    ok("tls handle", h != NULL);
+    int r = TRANSPORT_WANT_READ;
+    uint8_t buf[64];
+    for (int i = 0; i < 50 && (r == TRANSPORT_WANT_READ || r == TRANSPORT_WANT_WRITE); ++i)
+        r = transport_tls.read(h, buf, sizeof buf);
+    ok("plain text fails the tls read", r < 0 && r != TRANSPORT_WANT_READ);
+    ok("plain text is named not tls", fail.kind == NET_FAIL_NOT_TLS);
+    if (h) transport_tls.close(h);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 int main(void) {
     int sv[2];
     void *h = NULL;
     char req[2048];
     test_path_without_early_data();
     test_open_handshake();
+    test_tls_not_tls();
     ok("start ws", start_ws(sv, &h, req, sizeof req) == 0);
     ok("path in request", strstr(req, "GET /ws HTTP/1.1\r\n") != NULL);
     ok("ws host header", strstr(req, "\r\nHost: cdn.example\r\n") != NULL);

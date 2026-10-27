@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "net_fail.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -42,6 +44,9 @@ typedef struct {
    as a broken request, and grpc servers refuse a handshake without h2 */
     int alpn_h2;
     transport_xhttp_opts_t xh;
+/* where the transport records why the server failed. caller owned and NULL
+   where nobody asks; handles keep the pointer, so it has to outlive them */
+    net_fail_t *fail;
 } transport_tls_cfg_t;
 
 typedef struct transport_vt {

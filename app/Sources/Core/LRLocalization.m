@@ -46,6 +46,32 @@ NSString *LRLocalized(NSString *english) {
     return hit ? hit : english;
 }
 
+NSString *LRCheckReasonText(NSString *english) {
+    if (![english length] || LRCurrentLanguage() == LRLanguageEnglish) return english;
+    NSString *hit = LRStringsLookup(english, LRCurrentLanguage());
+    if (hit) return hit;
+    NSUInteger n = [english length];
+    for (NSUInteger i = 0; i < n; ++i) {
+        unichar ch = [english characterAtIndex:i];
+        if (ch < '0' || ch > '9') continue;
+        if (i > 0) {
+            unichar prev = [english characterAtIndex:i - 1];
+            if ((prev >= '0' && prev <= '9') || (prev >= 'A' && prev <= 'Z') ||
+                (prev >= 'a' && prev <= 'z')) continue;
+        }
+        NSUInteger end = i;
+        while (end < n && [english characterAtIndex:end] >= '0' &&
+               [english characterAtIndex:end] <= '9') ++end;
+        NSString *number = [english substringWithRange:NSMakeRange(i, end - i)];
+        NSString *key = [NSString stringWithFormat:@"%@%%@%@",
+                         [english substringToIndex:i], [english substringFromIndex:end]];
+        hit = LRStringsLookup(key, LRCurrentLanguage());
+        return hit ? [hit stringByReplacingOccurrencesOfString:@"%@" withString:number]
+                   : english;
+    }
+    return english;
+}
+
 NSString *LRPlural(NSInteger n, NSString *one, NSString *few, NSString *many) {
     NSInteger a = n < 0 ? -n : n;
     if (LRCurrentLanguage() != LRLanguageRussian) return a == 1 ? one : many;

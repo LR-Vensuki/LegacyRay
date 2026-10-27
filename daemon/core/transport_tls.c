@@ -1,5 +1,6 @@
 #include "transport.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -50,6 +51,7 @@ typedef struct {
     int      fd;
     int      raw_rx;
     int      raw_tx;
+    net_fail_t *fail;
 } tls_handle_t;
 
 /* a filter in front of the socket bio that sends the first write, the
@@ -175,6 +177,7 @@ static void *tls_open(int fd, const transport_tls_cfg_t *cfg) {
         return NULL;
     }
     h->fd = fd;
+    h->fail = cfg ? cfg->fail : NULL;
 
 /* use the configured server name so cert checks and fronting stay aligned */
     if (cfg && cfg->sni && cfg->sni[0]) {
@@ -186,16 +189,70 @@ static void *tls_open(int fd, const transport_tls_cfg_t *cfg) {
     return h;
 }
 
-static int ssl_err_to_transport(SSL *ssl, int ret) {
-    int e = SSL_get_error(ssl, ret);
+/* what a failed handshake says about the server, for a check's diagnosis */
+static void note_tls_failure(const tls_handle_t *h, int ssl_error, int saved_errno) {
+    unsigned long code = ERR_peek_error();
+    int reason = code && ERR_GET_LIB(code) == ERR_LIB_SSL ? ERR_GET_REASON(code) : 0;
+    if (!h->fail || SSL_is_init_finished(h->ssl)) return;
+    if (reason == SSL_R_CERTIFICATE_VERIFY_FAILED) {
+        switch (SSL_get_verify_result(h->ssl)) {
+        case X509_V_ERR_CERT_NOT_YET_VALID:
+            net_fail_note(h->fail, NET_FAIL_CERT_NOT_YET_VALID, 0);
+            return;
+        case X509_V_ERR_CERT_HAS_EXPIRED:
+            net_fail_note(h->fail, NET_FAIL_CERT_EXPIRED, 0);
+            return;
+        case X509_V_ERR_HOSTNAME_MISMATCH:
+        case X509_V_ERR_IP_ADDRESS_MISMATCH:
+            net_fail_note(h->fail, NET_FAIL_CERT_NAME, 0);
+            return;
+        default:
+            net_fail_note(h->fail, NET_FAIL_CERT_UNTRUSTED, 0);
+            return;
+        }
+    }
+/* a plain http or proxy port answers the client hello with text */
+    if (reason == SSL_R_WRONG_VERSION_NUMBER || reason == SSL_R_PACKET_LENGTH_TOO_LONG) {
+        net_fail_note(h->fail, NET_FAIL_NOT_TLS, 0);
+        return;
+    }
+    if (saved_errno == ECONNRESET) {
+        net_fail_note(h->fail, NET_FAIL_RESET, 0);
+        return;
+    }
+    if (saved_errno == ETIMEDOUT) {
+        net_fail_note(h->fail, NET_FAIL_TIMEOUT, 0);
+        return;
+    }
+#ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
+    if (reason == SSL_R_UNEXPECTED_EOF_WHILE_READING) {
+        net_fail_note(h->fail, NET_FAIL_CLOSED, 0);
+        return;
+    }
+#endif
+    if (ssl_error == SSL_ERROR_ZERO_RETURN ||
+        (ssl_error == SSL_ERROR_SYSCALL && saved_errno == 0)) {
+        net_fail_note(h->fail, NET_FAIL_CLOSED, 0);
+        return;
+    }
+    net_fail_note(h->fail, NET_FAIL_TLS, reason);
+}
+
+static int ssl_err_to_transport(const tls_handle_t *h, int ret) {
+    int saved_errno = errno;
+    int e = SSL_get_error(h->ssl, ret);
     switch (e) {
         case SSL_ERROR_WANT_READ:  return TRANSPORT_WANT_READ;
         case SSL_ERROR_WANT_WRITE: return TRANSPORT_WANT_WRITE;
-        case SSL_ERROR_ZERO_RETURN: return TRANSPORT_EOF; /* peer closed cleanly */
+        case SSL_ERROR_ZERO_RETURN:
+            note_tls_failure(h, e, saved_errno);
+            return TRANSPORT_EOF; /* peer closed cleanly */
         case SSL_ERROR_SYSCALL:
 /* peer reset without close notify, treat it as eof and drain */
+            note_tls_failure(h, e, saved_errno);
             return TRANSPORT_EOF;
         default:
+            note_tls_failure(h, e, saved_errno);
             return TRANSPORT_ERR;
     }
 }
@@ -210,7 +267,7 @@ static int tls_read(void *handle, uint8_t *buf, size_t len) {
     }
     int n = SSL_read(h->ssl, buf, (int)len);
     if (n > 0) return n;
-    return ssl_err_to_transport(h->ssl, n);
+    return ssl_err_to_transport(h, n);
 }
 
 static int tls_write(void *handle, const uint8_t *buf, size_t len) {
@@ -223,7 +280,7 @@ static int tls_write(void *handle, const uint8_t *buf, size_t len) {
     }
     int n = SSL_write(h->ssl, buf, (int)len);
     if (n > 0) return n;
-    return ssl_err_to_transport(h->ssl, n);
+    return ssl_err_to_transport(h, n);
 }
 
 static int tls_raw_write(void *handle, const uint8_t *buf, size_t len) {

@@ -21,6 +21,11 @@ LRLanguage LRLanguageSetting(void);
 void LRSetLanguageSetting(LRLanguage language);
 NSString *LRLanguageName(LRLanguage language);
 
+/* a sentence the daemon wrote about a failed check, translated. its one
+   standalone number (a port, an http status, a clock difference) is %@ in the
+   table */
+NSString *LRCheckReasonText(NSString *english);
+
 /* russian needs three plural forms; english and chinese use the first two */
 NSString *LRPlural(NSInteger n, NSString *one, NSString *few, NSString *many);
 

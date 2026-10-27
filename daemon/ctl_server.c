@@ -1883,14 +1883,15 @@ static void dispatch_line(ctl_server_t *s, ctl_client_t *c,
     }
 
     if (cmd.kind == CTL_CMD_CHECK) {
-        char reply[160]; size_t rn = 0;
+        char reply[300]; size_t rn = 0;
         if (!s->check || cmd.server_index < 0 ||
             (size_t)cmd.server_index >= s->engine.store.n) {
             if (ctl_build_err("check unavailable", reply, sizeof reply, &rn) == CTL_OK)
                 client_write(c, reply, rn);
             return;
         }
-        char reason[96];
+/* the diagnosis is one sentence that says what to check */
+        char reason[256];
         reason[0] = '\0';
         ctl_check_trace_t trace;
         memset(&trace, 0, sizeof trace);

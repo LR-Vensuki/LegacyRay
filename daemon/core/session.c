@@ -744,6 +744,8 @@ sess_status_t session_pump_remote(session_t *s) {
                 vc_status_t vs = vless_conn_feed_response(&s->u.vc, tmp, (size_t)n, &app_off);
                 if (vs == VC_NEED_MORE) return SESS_OK; /* retain a partial header */
                 if (vs != VC_OK) {
+                    s->fail = n >= 5 && memcmp(tmp, "HTTP/", 5) == 0
+                        ? SESS_FAIL_WEBSITE : SESS_FAIL_PROTOCOL;
                     fprintf(stderr, "legacyrayd: vless response parse failed rc=%d bytes=%d\n",
                             (int)vs, n);
                     fail_pending_socks(s);
@@ -777,6 +779,7 @@ sess_status_t session_pump_remote(session_t *s) {
                         else break;
                     }
                     if (rs != S5C_OK) {
+                        if (rs == S5C_ERR_AUTH) s->fail = SESS_FAIL_LOGIN;
                         queue_socks_reply(s, SOCKS5_REP_GENERAL_FAIL);
                         s->state = SESS_ERROR;
                         return SESS_ERR;
@@ -806,6 +809,7 @@ sess_status_t session_pump_remote(session_t *s) {
                 int rs = hc_feed(&s->u.hc, tmp, (size_t)n, &consumed);
                 if (rs == HC_NEED_MORE) return SESS_OK;
                 if (rs != HC_OK) {
+                    if (rs == HC_ERR_AUTH) s->fail = SESS_FAIL_LOGIN;
                     queue_socks_reply(s, SOCKS5_REP_GENERAL_FAIL);
                     s->state = SESS_ERROR;
                     return SESS_ERR;
@@ -848,6 +852,7 @@ sess_status_t session_pump_remote(session_t *s) {
                 feed = NULL;
                 feed_len = 0;
                 if (fr == SS_ERR_BAD_TAG || fr == SS_ERR_CRYPTO) {
+                    s->fail = SESS_FAIL_DECRYPT;
                     fprintf(stderr, "legacyrayd: shadowsocks decrypt failed rc=%d\n", fr);
                     fail_pending_socks(s);
                     s->state = SESS_ERROR;
@@ -886,6 +891,7 @@ sess_status_t session_pump_remote(session_t *s) {
                     return SESS_OK;
                 }
                 if (fr != VMESS_OK && fr != VMESS_NEED_MORE) {
+                    s->fail = fr == VMESS_ERR_BAD_TAG ? SESS_FAIL_DECRYPT : SESS_FAIL_PROTOCOL;
                     fprintf(stderr, "legacyrayd: vmess response failed rc=%d\n", fr);
                     fail_pending_socks(s);
                     s->state = SESS_ERROR;

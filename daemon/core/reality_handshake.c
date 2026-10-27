@@ -192,6 +192,8 @@ static int wait_fd(int fd, short events, uint64_t deadline) {
     }
 }
 
+/* failures leave errno saying why: 0 for the server's close, ETIMEDOUT for a
+   stall, the socket's own error otherwise */
 static int read_full(int fd, uint8_t *buf, size_t n, uint64_t deadline) {
     size_t off = 0;
     while (off < n) {
@@ -199,9 +201,10 @@ static int read_full(int fd, uint8_t *buf, size_t n, uint64_t deadline) {
         if (r > 0) { off += (size_t)r; continue; }
         if (r == 0) { errno = 0; return -1; }
         if (errno == EINTR) continue;
-        if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
-            wait_fd(fd, POLLIN, deadline) == 0)
-            continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (wait_fd(fd, POLLIN, deadline) == 0) continue;
+            if (errno == EAGAIN) errno = ETIMEDOUT;
+        }
         return -1;
     }
     return 0;
@@ -226,7 +229,11 @@ static int read_record(int fd, uint8_t *type, uint8_t *body, size_t cap, size_t 
     uint8_t hdr[5];
     if (read_full(fd, hdr, 5, deadline) != 0) return -1;
     size_t len = ((size_t)hdr[3] << 8) | hdr[4];
-    if (len > cap) return -1;
+/* a length past any tls record is a port answering in plain text */
+    if (len > cap) {
+        errno = EPROTO;
+        return -1;
+    }
     if (read_full(fd, body, len, deadline) != 0) return -1;
     *type = hdr[0];
     *body_len = len;
@@ -357,6 +364,7 @@ static int cert_extract(const uint8_t *msg, size_t msg_len,
 void *reality_handshake_open(int fd, const rh_params_t *p, rh_status_t *err) {
     rh_status_t e = RH_ERR_PROTO;
     const char *stage = "arguments";
+    int io_errno = 0;
 #define FAIL(code) do { e = (code); goto fail; } while (0)
 
     rh_conn_t *c = NULL;
@@ -575,6 +583,7 @@ void *reality_handshake_open(int fd, const rh_params_t *p, rh_status_t *err) {
     return c;
 
 fail:
+    io_errno = errno;
     /* the sealed session id carries this device's clock, and a fronted
        server that finds it too far off its own quietly falls back to the
        camouflage site instead of ever presenting its real certificate;
@@ -593,6 +602,8 @@ fail:
     if (tr.ctx) tls13_transcript_free(&tr);
     if (c) free(c);
     if (err) *err = e;
+/* rh_open reads why the io failed after the calls above */
+    errno = io_errno;
     return NULL;
 #undef FAIL
 }
@@ -998,6 +1009,7 @@ static void *rh_open(int fd, const transport_tls_cfg_t *cfg) {
     errno = 0;
     int pr = poll(&pfd, 1, 4000);
     if (pr <= 0) {
+        net_fail_note(cfg ? cfg->fail : NULL, NET_FAIL_TIMEOUT, 0);
         if (pr == 0)
             fprintf(stderr, "legacyrayd: reality tcp connect timed out\n");
         else
@@ -1011,6 +1023,8 @@ static void *rh_open(int fd, const transport_tls_cfg_t *cfg) {
     socklen_t err_len = sizeof err_code;
     if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err_code, &err_len) < 0 || err_code != 0) {
         int saved_errno = errno;
+        net_fail_note(cfg ? cfg->fail : NULL,
+                      net_fail_from_errno(err_code ? err_code : saved_errno), 0);
         fprintf(stderr, "legacyrayd: reality tcp connect failed: so_error=%d errno=%d\n",
                 err_code, saved_errno);
         fcntl(fd, F_SETFL, flags);
@@ -1021,6 +1035,15 @@ static void *rh_open(int fd, const transport_tls_cfg_t *cfg) {
     void *h = reality_handshake_open(fd, &p, &err);
     if (!h) {
         int saved_errno = errno;
+        net_fail_t *fail = cfg ? cfg->fail : NULL;
+        if (err == RH_ERR_NOT_REALITY)
+            net_fail_note(fail, NET_FAIL_REALITY, 0);
+        else if (err == RH_ERR_IO)
+            net_fail_note(fail, saved_errno == 0 ? NET_FAIL_CLOSED
+                          : saved_errno == EPROTO ? NET_FAIL_NOT_TLS
+                          : net_fail_from_errno(saved_errno), 0);
+        else
+            net_fail_note(fail, NET_FAIL_TLS, 0);
         fprintf(stderr, "legacyrayd: reality handshake failed: %s (%d), errno=%d\n",
                 rh_status_name(err), (int)err, saved_errno);
     }

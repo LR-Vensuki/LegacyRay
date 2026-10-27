@@ -71,6 +71,7 @@ typedef struct {
     char       open_peer_host[256];
     int        open_insecure;
     transport_tls_cfg_t open_tls_cfg;
+    net_fail_t open_fail; /* what the transport saw of the server */
     void      *open_th;
 
 /* preserve the destination captured before the transparent handshake */
@@ -166,6 +167,11 @@ typedef struct loop {
     int          poll_tproxy_idx;
     size_t       poll_wake_idx;
     size_t       poll_conn_base;
+
+/* the first failure any connection saw since loop_failure_reset, for a check
+   to explain itself */
+    net_fail_t   last_fail;
+    sess_fail_t  last_answer;
 } loop_t;
 
 typedef enum {
@@ -193,6 +199,11 @@ void loop_set_tls(loop_t *lp, const char *sni, const char *fingerprint,
 /* the server's xhttp knobs; NULL restores xray's defaults. loop_set_server
    clears them, so set them after it */
 void loop_set_xhttp(loop_t *lp, const transport_xhttp_opts_t *xh);
+
+/* forget, and read back, why the connections since the reset failed: the
+   transport's view of the server and the session's view of its answer */
+void loop_failure_reset(loop_t *lp);
+void loop_failure_get(const loop_t *lp, net_fail_t *transport, sess_fail_t *answer);
 
 /* replace the active path and drop connections tied to the old server */
 loop_status_t loop_set_server(loop_t *lp, const transport_vt_t *vt,

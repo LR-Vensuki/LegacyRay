@@ -4,6 +4,8 @@
 #include "storefile.h"
 #include "status.h"
 
+#include "core/net_diag.h"
+#include "core/senko_clock.h"
 #include "core/transport.h"
 #include "core/transport_pick.h"
 #include "core/vless.h"
@@ -2028,6 +2030,77 @@ static int prepare_server_probe(daemon_ctl_t *d, const vl_server_t *server,
     return 0;
 }
 
+/* the device clock against a well known http answer, for a failed check that
+   a wrong clock would explain: vmess allows two minutes, and reality servers
+   and certificates check the time too. 0 when it was measured */
+static int measure_device_clock(daemon_ctl_t *d, int timeout_ms) {
+    static const char request[] =
+        "GET /generate_204 HTTP/1.1\r\n"
+        "Host: www.gstatic.com\r\n"
+        "User-Agent: LegacyRay\r\n"
+        "Connection: close\r\n\r\n";
+    char ip[INET6_ADDRSTRLEN];
+    if (!net_resolve_public("www.gstatic.com", 80, ip, sizeof ip)) return -1;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(80);
+    if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1) return -1;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    probe_bind_physical_interface(fd, d->full_device);
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    char head[1024];
+    size_t got = 0;
+    int rc = -1;
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0 &&
+        write(fd, request, sizeof request - 1) == (ssize_t)(sizeof request - 1)) {
+        while (got < sizeof head - 1) {
+            ssize_t r = read(fd, head + got, sizeof head - 1 - got);
+            if (r <= 0) break;
+            got += (size_t)r;
+            head[got] = '\0';
+            if (strstr(head, "\r\n\r\n")) break;
+        }
+        int64_t server_time = 0;
+/* a captive portal answers this host too, with its own clock or none */
+        if (got && net_fail_http_status(head, got) == 204 &&
+            senko_clock_from_http_head(head, got, &server_time) == 0) {
+            senko_clock_note(server_time);
+            rc = 0;
+        }
+    }
+    close(fd);
+    return rc;
+}
+
+/* one sentence on why the handshake check failed, from what the transport and
+   the session saw of the server and from the probe's last step */
+static void explain_handshake_failure(daemon_ctl_t *d, const vl_server_t *server,
+                                      const char *stage, char *out, size_t cap) {
+    net_diag_t diag;
+    memset(&diag, 0, sizeof diag);
+    diag.proto = server->proto;
+    diag.port = server->port;
+    loop_failure_get(d->loop, &diag.transport, &diag.answer);
+    if (diag.transport.kind != NET_FAIL_NONE)
+        diag.stage = NET_DIAG_TRANSPORT;
+    else if (diag.answer != SESS_FAIL_NONE || (stage && strncmp(stage, "bad ", 4) == 0))
+        diag.stage = NET_DIAG_ANSWER;
+    else if (stage && strncmp(stage, "no ", 3) == 0)
+        diag.stage = NET_DIAG_SILENT;
+    else
+        diag.stage = NET_DIAG_CLOSED;
+    diag.clock_known = senko_clock_offset(&diag.clock_offset_s);
+    if (net_diag_wants_clock(&diag) && measure_device_clock(d, 2000) == 0)
+        diag.clock_known = senko_clock_offset(&diag.clock_offset_s);
+    net_diag_text(&diag, out, cap);
+}
+
 static int check_run(daemon_ctl_t *d, const char *mode, const vl_server_t *server,
                      char *reason, size_t reason_cap) {
     if (strcmp(mode, "tcp") == 0) {
@@ -2079,12 +2152,17 @@ static int check_run(daemon_ctl_t *d, const char *mode, const vl_server_t *serve
         int ms = -1;
         char stage[120];
         stage[0] = '\0';
+        loop_failure_reset(d->loop);
         int result = tunnel_carry_probe(d, 7000, &ms, stage, sizeof stage);
         loop_stop(d->loop);
         if (result != 0) {
-            if (reason && reason_cap)
-                snprintf(reason, reason_cap, "profile handshake failed: %s",
-                         stage[0] ? stage : "no valid response");
+            if (reason && reason_cap) {
+                char why[256];
+                fprintf(stderr, "legacyrayd: profile handshake failed: %s\n",
+                        stage[0] ? stage : "no valid response");
+                explain_handshake_failure(d, server, stage, why, sizeof why);
+                snprintf(reason, reason_cap, "%s", why[0] ? why : "profile handshake failed");
+            }
             return -1;
         }
         return ms;

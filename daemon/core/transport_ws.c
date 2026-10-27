@@ -42,6 +42,7 @@ typedef struct {
     int                  rx_has_frame;
     int                  rx_opcode;
     size_t               rx_frame_left;
+    net_fail_t *fail;
 } ws_handle_t;
 
 static int ws_token_ok(const char *s) {
@@ -199,6 +200,7 @@ static void *ws_open_common(int fd, const transport_tls_cfg_t *cfg, const transp
     if (!h) return NULL;
 
     h->sub_vt = sub_vt;
+    h->fail = cfg ? cfg->fail : NULL;
     h->sub_h = sub_vt->open(fd, cfg);
     if (!h->sub_h) {
         free(h);
@@ -377,6 +379,11 @@ static int ws_handshake_step(ws_handle_t *h) {
                     return 0;
                 }
                 ws_log_refusal(h);
+                {
+                    int status = net_fail_http_status((const char *)h->hs_buf, h->hs_len);
+                    net_fail_note(h->fail, status > 0 ? NET_FAIL_HTTP_STATUS : NET_FAIL_TRANSPORT,
+                                  status > 0 ? status : 0);
+                }
                 return TRANSPORT_ERR;
             }
             if (h->hs_len >= sizeof(h->hs_buf) - 1) {

@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 T = [
 ("How do I import?", "Как импортировать?", "如何导入？"),
-("Press IMPORT (or + in the server list) and paste from the clipboard, scan a QR code, type or paste manually, add a subscription URL or pick a file. vless://, trojan://, ss://, socks5://, happ:// links, subscription URLs, base64 lists, Xray and sing-box JSON, Clash YAML, WireGuard / AmneziaWG profiles and Karing backups (zip or LAN send QR) all work.",
+("Press IMPORT (or + in the server list) and paste from the clipboard, scan a QR code, type or paste manually, add a subscription URL or pick a file. vless://, vmess://, trojan://, ss://, socks5://, happ:// links, subscription URLs, base64 lists, Xray and sing-box JSON, Clash YAML, WireGuard / AmneziaWG profiles and Karing backups (zip or LAN send QR) all work.",
  "Нажмите ИМПОРТ (или + в списке серверов) и вставьте из буфера, отсканируйте QR-код, введите вручную, добавьте ссылку на подписку или выберите файл. Поддерживаются ссылки vless://, trojan://, ss://, socks5://, happ://, ссылки на подписки, списки base64, JSON Xray и sing-box, YAML Clash, профили WireGuard / AmneziaWG и резервные копии Karing (zip или QR «Отправка по LAN»).",
- "按“导入”（或服务器列表中的 +），从剪贴板粘贴、扫描二维码、手动输入、添加订阅链接或选择文件。支持 vless://、trojan://、ss://、socks5://、happ:// 链接、订阅链接、base64 列表、Xray 与 sing-box JSON、Clash YAML、WireGuard / AmneziaWG 配置以及 Karing 备份（zip 或局域网发送二维码）。"),
+ "按“导入”（或服务器列表中的 +），从剪贴板粘贴、扫描二维码、手动输入、添加订阅链接或选择文件。支持 vless://、vmess://、trojan://、ss://、socks5://、happ:// 链接、订阅链接、base64 列表、Xray 与 sing-box JSON、Clash YAML、WireGuard / AmneziaWG 配置以及 Karing 备份（zip 或局域网发送二维码）。"),
 ("Which devices are supported?", "Какие устройства поддерживаются?", "支持哪些设备？"),
 ("Any jailbroken iPhone, iPod touch or iPad on iOS 4.0 to 7.x. iOS 5 and later redirect the whole device through the pf firewall; on iOS 4 there is no pf, so apps are redirected by the MobileSubstrate hook.",
  "Любые iPhone, iPod touch и iPad с джейлбрейком на iOS 4.0–7.x. На iOS 5 и новее весь трафик перенаправляется через файрвол pf; на iOS 4 pf нет, поэтому приложения перенаправляет хук MobileSubstrate.",

@@ -182,7 +182,10 @@ static void *open_worker_main(void *arg) {
         }
         if (c->remote_fd < 0) {
             int rfd = lp->dial(lp->dial_ctx);
-            if (rfd < 0) continue;
+            if (rfd < 0) {
+                net_fail_note(&c->open_fail, net_fail_from_errno(errno ? errno : ETIMEDOUT), 0);
+                continue;
+            }
             set_nonblock(rfd);
             set_keepalive(rfd);
 /* publish the fd under the lock, so a cancel that came during the dial is
@@ -409,6 +412,28 @@ static int flush_pend_local(loop_conn_t *c);
 static int flush_to_local(loop_conn_t *c);
 static void cancel_opening_conn(loop_t *lp, loop_conn_t *c);
 
+/* a connection's failure, kept for a check until the next reset */
+static void keep_conn_failure(loop_t *lp, const loop_conn_t *c) {
+    if (lp->last_fail.kind == NET_FAIL_NONE && c->open_fail.kind != NET_FAIL_NONE)
+        lp->last_fail = c->open_fail;
+    if (lp->last_answer == SESS_FAIL_NONE && !c->direct)
+        lp->last_answer = c->sess.fail;
+}
+
+void loop_failure_reset(loop_t *lp) {
+    if (!lp) return;
+    memset(&lp->last_fail, 0, sizeof lp->last_fail);
+    lp->last_answer = SESS_FAIL_NONE;
+}
+
+void loop_failure_get(const loop_t *lp, net_fail_t *transport, sess_fail_t *answer) {
+    if (transport) {
+        if (lp) *transport = lp->last_fail;
+        else memset(transport, 0, sizeof *transport);
+    }
+    if (answer) *answer = lp ? lp->last_answer : SESS_FAIL_NONE;
+}
+
 static void clear_conn_slot(loop_conn_t *c) {
     loop_t *owner = c->owner;
     memset(c, 0, sizeof *c);
@@ -540,6 +565,7 @@ static void drop_conn(loop_t *lp, loop_conn_t *c) {
         if (c->sess.state == SESS_ERROR)
             fprintf(stderr, "legacyrayd: dropping errored session\n");
         if (c->th && c->open_vt) c->open_vt->close(c->th);
+        keep_conn_failure(lp, c);
     }
     if (c->remote_fd >= 0) close(c->remote_fd);
     if (c->local_fd >= 0)  close(c->local_fd);
@@ -588,9 +614,12 @@ static void reap_opening_conns(loop_t *lp) {
         if (lp->nopening > 0) lp->nopening--;
 
         if (cancelled || !th) {
-            if (!cancelled && !th)
+            if (!cancelled && !th) {
                 fprintf(stderr, "legacyrayd: %s open failed (tproxy=%d)\n",
                         c->direct ? "direct" : "transport", c->transparent);
+                if (!c->direct && lp->last_fail.kind == NET_FAIL_NONE)
+                    lp->last_fail = c->open_fail;
+            }
             if (c->local_fd >= 0) close(c->local_fd);
             if (th && c->open_vt && !c->direct) c->open_vt->close(th);
             if (c->remote_fd >= 0) close(c->remote_fd);
@@ -798,6 +827,8 @@ static void fill_open_fields(loop_t *lp, loop_conn_t *c) {
     c->open_tls_cfg.insecure = c->open_insecure;
     c->open_tls_cfg.xh = lp->tls_cfg.xh;
     c->open_tls_cfg.handshake_ms = LOOP_OPEN_HANDSHAKE_MS;
+    memset(&c->open_fail, 0, sizeof c->open_fail);
+    c->open_tls_cfg.fail = &c->open_fail;
 }
 
 /* hand a connection whose client socket is set to a worker that dials and

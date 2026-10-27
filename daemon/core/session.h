@@ -29,6 +29,15 @@ typedef enum {
     SESS_ERROR /* close both sides after a protocol failure */
 } sess_state_t;
 
+/* what a failed session saw of the server's answer, for the check's diagnosis */
+typedef enum {
+    SESS_FAIL_NONE = 0,
+    SESS_FAIL_DECRYPT,  /* the answer does not decrypt: wrong key or not this protocol */
+    SESS_FAIL_PROTOCOL, /* the answer breaks the protocol */
+    SESS_FAIL_WEBSITE,  /* the answer is http, the way a fallback website answers */
+    SESS_FAIL_LOGIN     /* a socks or http proxy refused the user name or password */
+} sess_fail_t;
+
 typedef enum {
     SESS_OK      =  0,
     SESS_ERR_ARG = -1,
@@ -91,6 +100,7 @@ typedef struct {
     size_t         up_stage_len;
 /* the socks5 or http upstream hung up before it answered */
     int            upstream_refused;
+    sess_fail_t    fail;
 
 /* the destination label, the close latch and the byte counts exist in every
    build: an event line with no destination in it names nothing, and a close

@@ -18,7 +18,7 @@ CORE_SRC = core/vless.c core/b64.c core/config.c core/rules.c core/dns_msg.c cor
            core/tls13_kdf.c core/tls13_keysched.c core/tls13_record.c \
            core/tls13_transcript.c core/tls13_handshake.c core/reality_handshake.c \
            core/socks5_client.c core/http_client.c core/vision.c core/awg_config.c core/awg_handshake.c \
-           core/trojan_client.c core/shadowsocks_client.c core/vmess_client.c core/blake2b256.c
+           core/trojan_client.c core/shadowsocks_client.c core/vmess_client.c core/net_diag.c core/senko_clock.c core/senko_time.c core/blake2b256.c
 # vendored PQClean ml-kem-768 "clean" backend, plus its shared fips202.c and a
 # local randombytes.c shim over the core's openssl rng; see core/third_party/mlkem768/LICENSE
 MLKEM768_SRC = core/third_party/mlkem768/kem.c core/third_party/mlkem768/indcpa.c \
