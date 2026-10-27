@@ -48,6 +48,7 @@ HOST_TESTS = test_ctl_server test_autoconnect test_session_direct test_config_co
              test_b64 test_traffic test_loop_traffic test_rules
 HOST_TESTS += test_dns_msg
 HOST_TESTS += test_doh
+HOST_TESTS += test_dns_pool
 HOST_TESTS += test_dns_cache
 HOST_TESTS += test_pf_table
 HOST_TESTS += test_trojan
@@ -81,6 +82,7 @@ test: $(HOST_TESTS)
 	./test_rules
 	./test_dns_msg
 	./test_doh
+	./test_dns_pool
 	./test_dns_cache
 	./test_pf_table
 	./test_ctl_server
@@ -377,6 +379,14 @@ test_app_proxy: test_app_proxy.c ../tweaks/tlsfix/stl_proxy.c ../tweaks/tlsfix/s
 	      -DC_PROXY_STATE='"/tmp/legacyray-c-proxy-test"' \
 	      -I../tweaks/tlsfix test_app_proxy.c ../tweaks/tlsfix/stl_proxy.c \
 	      -o $@ $(THREAD_LDFLAGS)
+
+test_dns_pool: test_dns_pool.c $(DAEMON)/routing_exec.c $(CORE)/geo.c $(DAEMON)/routing.c \
+               $(DAEMON)/legacy_ios.c $(CORE)/rules.c $(CORE)/dns_msg.c \
+               $(CORE)/dns_cache.c $(DAEMON)/pf_table.c $(DNS_TLS)
+	$(CC) $(CFLAGS) $(TLS_CFLAGS) $(THREAD_CFLAGS) -I$(DAEMON) test_dns_pool.c $(CORE)/geo.c \
+	      $(DAEMON)/routing.c $(DAEMON)/legacy_ios.c $(NET_SAFE) $(CORE)/rules.c \
+	      $(CORE)/dns_msg.c $(CORE)/dns_cache.c $(DAEMON)/pf_table.c $(DNS_TLS) -o $@ \
+	      $(TLS_LDFLAGS) $(THREAD_LDFLAGS)
 
 test_ctl_server: test_ctl_server.c $(DAEMON)/ctl_server.c $(CORE)/ctl_engine.c \
                  $(CORE)/control.c $(CORE)/store.c $(CORE)/url.c $(NET_SAFE) \
