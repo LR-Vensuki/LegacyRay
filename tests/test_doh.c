@@ -54,6 +54,14 @@ int main(void) {
     ok("connection close",
        parse(closing, strlen(closing), &off, &body, &close_after, &status) == DOH_OK &&
        close_after && body == 1);
+    const char *listed = "HTTP/1.1 200 OK\r\nConnection: upgrade, close\r\nContent-Length: 1\r\n\r\nZ";
+    ok("close among other tokens",
+       parse(listed, strlen(listed), &off, &body, &close_after, &status) == DOH_OK &&
+       close_after);
+    const char *lookalike = "HTTP/1.1 200 OK\r\nConnection: enclosed\r\nContent-Length: 1\r\n\r\nZ";
+    ok("a token that only contains close",
+       parse(lookalike, strlen(lookalike), &off, &body, &close_after, &status) == DOH_OK &&
+       !close_after);
     const char *old = "HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n";
     ok("http/1.0 closes",
        parse(old, strlen(old), &off, &body, &close_after, &status) == DOH_OK && close_after);

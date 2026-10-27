@@ -23,6 +23,7 @@
 #include <arpa/inet.h>
 #include <sys/wait.h>
 #include <sys/time.h>
+#include <signal.h>
 #include <spawn.h>
 #include <time.h>
 #include <openssl/err.h>
@@ -1314,10 +1315,18 @@ typedef struct dns_pool {
     dns_worker_t workers[DNS_WORKERS];
 } dns_pool_t;
 
-/* what the forwarder did, for the diagnostics screen */
-static uint64_t g_dns_local_answers;
-static uint64_t g_dns_forwarded;
-static uint64_t g_dns_unanswered;
+/* what the forwarder did, for the diagnostics screen. 32 bits, so the
+   control thread reads them whole on armv7 */
+static uint32_t g_dns_local_answers;
+static uint32_t g_dns_forwarded;
+static uint32_t g_dns_unanswered;
+
+/* a socket the pfctl and sysctl children must not inherit */
+static int dns_socket(void) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd >= 0) (void)fcntl(fd, F_SETFD, FD_CLOEXEC);
+    return fd;
+}
 
 static void dns_worker_drop_stream(dns_worker_t *w) {
     pthread_mutex_lock(&w->pool->lock);
@@ -1330,7 +1339,7 @@ static void dns_worker_drop_stream(dns_worker_t *w) {
 static int dns_worker_open_stream(dns_worker_t *w, dns_job_t *job) {
     routing_exec_t *st = w->pool->st;
     job->step = "socket";
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = dns_socket();
     if (fd < 0) return -1;
     pthread_mutex_lock(&w->pool->lock);
     int stop = w->pool->stop;
@@ -1365,7 +1374,7 @@ static int dns_worker_open_https(dns_worker_t *w, dns_job_t *job) {
     dns_pool_t *pool = w->pool;
     routing_exec_t *st = pool->st;
     job->step = "socket";
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = dns_socket();
     if (fd < 0) return -1;
     pthread_mutex_lock(&pool->lock);
     int stop = pool->stop;
@@ -1392,11 +1401,12 @@ static int dns_worker_open_https(dns_worker_t *w, dns_job_t *job) {
         goto failed;
     }
     ERR_clear_error();
-    if (SSL_connect(ssl) != 1) {
-        int timed_out = errno == EAGAIN || errno == EWOULDBLOCK;
+    int rc = SSL_connect(ssl);
+    if (rc != 1) {
+        int e = SSL_get_error(ssl, rc);
         SSL_free(ssl);
         ERR_clear_error();
-        errno = timed_out ? EAGAIN : EPROTO;
+        errno = e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE ? EAGAIN : EPROTO;
         goto failed;
     }
     pthread_mutex_lock(&pool->lock);
@@ -1406,7 +1416,10 @@ static int dns_worker_open_https(dns_worker_t *w, dns_job_t *job) {
 failed: {
         int err = errno;
         dns_worker_drop_https(w);
-        errno = err;
+/* a stream that never came up says nothing about the question: a resolver
+   that does not answer on 443 at all is left for port 53, like one that
+   refuses */
+        errno = err == EAGAIN || err == EWOULDBLOCK ? ETIMEDOUT : err;
         return -1;
     }
 }
@@ -1486,13 +1499,16 @@ static int dns_https_exchange(dns_worker_t *w, dns_job_t *job) {
     }
 }
 
+/* A and AAAA, the questions every upstream answers on port 53 */
+static int dns_is_address_question(const dns_question_t *question) {
+    return question->class_code == 1 && (question->type == 1 || question->type == 28);
+}
+
 /* the question types the hijack on port 53 drops go over https while the
    resolver takes it there */
 static int dns_wants_https(dns_pool_t *pool, const dns_job_t *job) {
     if (!pool->https_ctx) return 0;
-    if (job->question.class_code == 1 &&
-        (job->question.type == 1 || job->question.type == 28))
-        return 0;
+    if (dns_is_address_question(&job->question)) return 0;
     pthread_mutex_lock(&pool->lock);
     int down = monotonic_seconds() < pool->https_down_until;
     pthread_mutex_unlock(&pool->lock);
@@ -1513,7 +1529,7 @@ static int dns_worker_try_https(dns_worker_t *w, dns_job_t *job) {
         job->err = errno;
         dns_worker_drop_https(w);
         if (job->err == EAGAIN || job->err == ECANCELED || job->err == EPROTO ||
-            job->err == EMSGSIZE)
+            job->err == EMSGSIZE || job->err == ETIMEDOUT)
             break;
     }
     return -1;
@@ -1576,16 +1592,37 @@ static void dns_worker_run(dns_worker_t *w, dns_job_t *job) {
     }
 }
 
+/* the next question to send, oldest first. the other types wait on an
+   upstream that may never answer them, so they get half the workers at most
+   and A and AAAA always find one free */
+static dns_job_t *dns_next_job(dns_pool_t *pool) {
+    size_t slow_running = 0;
+    for (size_t i = 0; i < DNS_JOBS; ++i)
+        if (pool->jobs[i].state == DNS_JOB_RUNNING &&
+            !dns_is_address_question(&pool->jobs[i].question))
+            slow_running++;
+    dns_job_t *job = NULL;
+    for (size_t i = 0; i < DNS_JOBS; ++i) {
+        dns_job_t *j = &pool->jobs[i];
+        if (j->state != DNS_JOB_QUEUED || (job && j->seq > job->seq)) continue;
+        if (!dns_is_address_question(&j->question) && slow_running >= DNS_WORKERS / 2)
+            continue;
+        job = j;
+    }
+    return job;
+}
+
 static void *dns_worker_thread(void *arg) {
     dns_worker_t *w = (dns_worker_t *)arg;
     dns_pool_t *pool = w->pool;
+/* signals belong to the main thread: one landing here turned a blocking read
+   into EINTR, which OpenSSL reports like the receive timeout */
+    sigset_t all;
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, NULL);
     pthread_mutex_lock(&pool->lock);
     while (!pool->stop) {
-        dns_job_t *job = NULL;
-        for (size_t i = 0; i < DNS_JOBS; ++i) {
-            dns_job_t *j = &pool->jobs[i];
-            if (j->state == DNS_JOB_QUEUED && (!job || j->seq < job->seq)) job = j;
-        }
+        dns_job_t *job = dns_next_job(pool);
         if (!job) {
             if (w->fd < 0 && w->https_fd < 0) {
                 pthread_cond_wait(&pool->work, &pool->lock);
@@ -1608,9 +1645,13 @@ static void *dns_worker_thread(void *arg) {
         }
         job->state = DNS_JOB_RUNNING;
         pthread_mutex_unlock(&pool->lock);
+        uint64_t began = monotonic_seconds();
         dns_worker_run(w, job);
+        job->seconds = monotonic_seconds() - began;
         pthread_mutex_lock(&pool->lock);
         job->state = DNS_JOB_DONE;
+/* a slow question left: one waiting for a free half may go now */
+        if (!dns_is_address_question(&job->question)) pthread_cond_broadcast(&pool->work);
         dns_wake(pool->st);
     }
     pthread_mutex_unlock(&pool->lock);
@@ -1709,7 +1750,8 @@ static int dns_add_waiter(dns_job_t *job, const struct sockaddr_in *address,
 }
 
 /* hand a question to the workers, or join the same one already under way.
-   -1 when every slot is taken */
+   -1 when every slot is taken, -2 when the same question has all the
+   waiters it can hold */
 static int dns_submit(dns_pool_t *pool, const dns_question_t *question,
                       rule_action_t action, const uint8_t *query, size_t query_len,
                       const struct sockaddr_in *address, socklen_t address_len) {
@@ -1721,11 +1763,14 @@ static int dns_submit(dns_pool_t *pool, const dns_question_t *question,
             if (!slot) slot = j;
             continue;
         }
+/* only a byte-for-byte copy past the id joins: flags, edns and the name's
+   case all shape the answer the client checks */
         if ((j->state == DNS_JOB_QUEUED || j->state == DNS_JOB_RUNNING) &&
-            j->action == action && dns_questions_match(&j->question, question)) {
+            j->action == action && j->query_len == query_len &&
+            memcmp(j->query + 2, query + 2, query_len - 2) == 0) {
             int rc = dns_add_waiter(j, address, address_len, query);
             pthread_mutex_unlock(&pool->lock);
-            return rc;
+            return rc == 0 ? 0 : -2;
         }
     }
     if (!slot) {
@@ -1961,12 +2006,16 @@ static void *dns_forwarder_thread(void *arg) {
             continue;
         }
 
-        if (pool && dns_submit(pool, &question, action, query, (size_t)query_len,
-                               &client_address, client_len) == 0) {
+        int submitted = pool ? dns_submit(pool, &question, action, query,
+                                          (size_t)query_len, &client_address,
+                                          client_len)
+                             : -1;
+        if (submitted == 0) {
             g_dns_forwarded++;
             said_full = 0;
             continue;
         }
+        if (submitted == -2) continue; /* asked often enough already; its answer is coming */
 /* every worker is busy and every slot taken: an old answer beats none, and
    the client asks again anyway */
         cached = dns_cache_get(&g_dns_cache, question.name, question.type,
@@ -2007,6 +2056,8 @@ static int start_dns_forwarder(routing_exec_t *st) {
         }
         st->dns_wake_ok = 1;
     }
+/* the pipe is how answers from the workers and a stop reach the forwarder */
+    if (!st->dns_wake_ok) return -1;
     if (pthread_create(&st->dns_thread, NULL, dns_forwarder_thread, st) != 0) {
         close_dns_wake(st);
         return -1;

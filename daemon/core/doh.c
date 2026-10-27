@@ -45,12 +45,21 @@ static const char *header_value(const char *line, size_t len, size_t name_len,
     return line + i;
 }
 
+/* token is one of the comma separated items of the value, case aside */
 static int has_token(const char *value, size_t len, const char *token) {
     size_t n = strlen(token);
-    for (size_t i = 0; i + n <= len; ++i) {
-        size_t j = 0;
-        while (j < n && tolower((unsigned char)value[i + j]) == token[j]) ++j;
-        if (j == n) return 1;
+    size_t i = 0;
+    while (i < len) {
+        while (i < len && (value[i] == ' ' || value[i] == '\t' || value[i] == ',')) ++i;
+        size_t start = i;
+        while (i < len && value[i] != ',') ++i;
+        size_t end = i;
+        while (end > start && (value[end - 1] == ' ' || value[end - 1] == '\t')) --end;
+        if (end - start == n) {
+            size_t j = 0;
+            while (j < n && tolower((unsigned char)value[start + j]) == token[j]) ++j;
+            if (j == n) return 1;
+        }
     }
     return 0;
 }
