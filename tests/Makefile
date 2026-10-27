@@ -74,6 +74,7 @@ HOST_TESTS += test_vmess
 HOST_TESTS += test_subfetch_budget
 HOST_TESTS += test_net_diag
 HOST_TESTS += test_senko_clock
+HOST_TESTS += test_amnezia_qr
 
 all: test
 
@@ -83,6 +84,7 @@ test: $(HOST_TESTS)
 	./test_subfetch_budget
 	./test_net_diag
 	./test_senko_clock
+	./test_amnezia_qr
 	./test_trojan
 	./test_shadowsocks
 	./test_qr_zbar
@@ -224,6 +226,11 @@ test_grpc_core: test_grpc_core.c $(CORE)/grpc_core.c $(CORE)/grpc_core.h
 
 test_awg_config: test_awg_config.c $(CORE)/awg_config.c $(CORE)/awg_config.h $(CORE)/b64.c $(CORE)/b64.h
 	$(CC) $(CFLAGS) test_awg_config.c $(CORE)/awg_config.c $(CORE)/b64.c -o $@ -lcrypto
+
+test_amnezia_qr: test_amnezia_qr.c amnezia_fixture.inc $(CORE)/amnezia_qr.c $(CORE)/amnezia_qr.h \
+                 $(CORE)/amnezia_bundle.c $(CORE)/awg_config.c $(CORE)/b64.c $(CJSON)
+	$(CC) $(CFLAGS) -I$(CORE) test_amnezia_qr.c $(CORE)/amnezia_qr.c $(CORE)/amnezia_bundle.c \
+	  $(CORE)/awg_config.c $(CORE)/b64.c $(CJSON) -o $@ -lz -lcrypto
 
 test_amnezia_bundle: test_amnezia_bundle.c amnezia_fixture.inc $(CORE)/amnezia_bundle.c \
                      $(CORE)/amnezia_bundle.h $(CORE)/awg_config.c $(CORE)/b64.c $(CJSON)

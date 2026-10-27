@@ -7,6 +7,7 @@
 #import <objc/message.h>
 #include <dlfcn.h>
 #include <zbar.h>
+#include "amnezia_qr.h"
 
 @interface LRQRScanScreen () <AVCaptureVideoDataOutputSampleBufferDelegate>
 - (void)captureOutput:(AVCaptureOutput *)out didOutputMetadataObjects:(NSArray *)objects
@@ -113,6 +114,8 @@ NSString *LRDecodeQRImage(UIImage *photo) {
     [self teardownCapture];
     if (_image) zbar_image_destroy(_image);
     if (_scanner) zbar_image_scanner_destroy(_scanner);
+    if (_frames) amz_qr_free((amz_qr_t *)_frames);
+    free(_frames);
     free(_pixels);
     [_session release];
     [_videoOutput release];
@@ -202,13 +205,48 @@ NSString *LRDecodeQRImage(UIImage *photo) {
     if (completion) completion(text);
 }
 
+/* the amnezia client shows a profile as a series of codes; each one is kept
+   until the series is whole, and the joined text goes on like any other */
+- (NSString *)joinAmneziaFrame:(NSString *)text {
+    if (!_frames) {
+        _frames = calloc(1, sizeof(amz_qr_t));
+        if (!_frames) return text;
+        amz_qr_init((amz_qr_t *)_frames);
+    }
+    amz_qr_t *q = (amz_qr_t *)_frames;
+    NSData *bytes = [text dataUsingEncoding:NSUTF8StringEncoding];
+    amz_qr_status_t st = amz_qr_add(q, (const char *)[bytes bytes], [bytes length]);
+    if (st == AMZ_QR_PART || st == AMZ_QR_REPEAT) {
+        _hint.text = [NSString stringWithFormat:L(@"Amnezia code %u of %u: keep the camera on the next code"),
+                      (unsigned)q->have, (unsigned)q->count];
+        return nil;
+    }
+    if (st == AMZ_QR_ERR_SPACE) {
+        amz_qr_free(q);
+        _hint.text = L(@"The Amnezia profile is too large");
+        return nil;
+    }
+    if (st != AMZ_QR_DONE) return text;
+    size_t cap = AMZ_QR_MAX_BYTES * 2, len = 0;
+    char *joined = malloc(cap);
+    NSString *whole = nil;
+    if (joined && amz_qr_result(q, joined, cap, &len) == 0)
+        whole = [[[NSString alloc] initWithBytes:joined length:len
+                                        encoding:NSUTF8StringEncoding] autorelease];
+    free(joined);
+    amz_qr_free(q);
+    if (!whole) _hint.text = L(@"The Amnezia codes could not be joined");
+    return whole;
+}
+
 - (void)hit:(NSString *)text {
     if (_done) return;
     _done = YES;
     NSString *copy = [text copy];
     dispatch_async(dispatch_get_main_queue(), ^{
         _done = NO;
-        [self finish:copy];
+        NSString *whole = [self joinAmneziaFrame:copy];
+        if (whole) [self finish:whole];
         [copy release];
     });
 }

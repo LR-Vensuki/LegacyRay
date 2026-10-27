@@ -60,3 +60,8 @@ T = [
 ("this device could not open the connection: restart LegacyRay and check the log in Diagnostics", "устройство не смогло открыть соединение: перезапустите LegacyRay и посмотрите журнал в «Диагностике»", "本设备无法建立连接：请重启 LegacyRay 并查看“诊断”中的日志"),
 ("this device has no network route to the server: check the internet connection", "у устройства нет сетевого пути к серверу: проверьте подключение к интернету", "本设备没有通往服务器的网络路径：请检查网络连接"),
 ]
+T += [
+("Amnezia code %u of %u: keep the camera on the next code", "Код Amnezia %u из %u: наведите камеру на следующий код", "Amnezia 二维码 %u / %u：请将相机对准下一个二维码"),
+("The Amnezia profile is too large", "Профиль Amnezia слишком большой", "Amnezia 配置太大"),
+("The Amnezia codes could not be joined", "Не удалось собрать коды Amnezia", "无法合并 Amnezia 二维码"),
+]

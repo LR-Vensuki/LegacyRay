@@ -26,6 +26,7 @@ typedef struct zbar_image_scanner_s zbar_image_scanner_t;
     LRButton *_torch;
     LRButton *_photos;
     id _popover;
+    void *_frames; /* amz_qr_t: the amnezia series collected so far */
     void (^_completion)(NSString *text);
 }
 /* called once with the decoded text, or nil when the user cancels */

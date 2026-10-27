@@ -14,7 +14,7 @@ SRC_DIRS := Sources Sources/Core Sources/Skin Sources/Controls Sources/Screens S
 OBJC_SRC := $(foreach d,$(SRC_DIRS),$(wildcard $(d)/*.m))
 C_SRC    := $(foreach d,$(SRC_DIRS),$(wildcard $(d)/*.c)) \
             ../daemon/core/b64.c ../daemon/core/control.c \
-            ../daemon/core/amnezia_bundle.c ../daemon/core/third_party/cJSON.c
+            ../daemon/core/amnezia_bundle.c ../daemon/core/amnezia_qr.c ../daemon/core/third_party/cJSON.c
 ZBAR_SRC := $(addprefix $(ZBAR)/zbar/,config.c error.c symbol.c image.c refcnt.c \
             img_scanner.c scanner.c decoder.c misc.c decoder/qr_finder.c \
             qrcode/qrdec.c qrcode/qrdectxt.c qrcode/rs.c qrcode/isaac.c \
