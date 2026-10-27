@@ -4,6 +4,8 @@
 #include "core/net_safe.h"
 #include "core/dns_cache.h"
 #include "core/dns_msg.h"
+#include "core/doh.h"
+#include "core/transport.h"
 #include "pf_table.h"
 #include "core/geo.h"
 
@@ -20,7 +22,12 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/wait.h>
+#include <sys/time.h>
 #include <spawn.h>
+#include <time.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <openssl/x509v3.h>
 #if defined(__APPLE__)
 #include <mach/mach_time.h>
 #else
@@ -1022,15 +1029,17 @@ static int apply_pf_mode(const char *pfctl, const char *server_ips,
 }
 
 
-/* *step names what was under way when it failed, for the log */
-static int socks5_connect_to_dns(int socks_port, const char *dns_upstream,
-                                 const char **step) {
-    *step = "socket";
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+/* the socks reply comes from the loop at once, before the tunnel is open, so
+   the wait for an answer also covers the transport's own tls and websocket
+   handshake, which the loop allows seven seconds */
+#define DNS_ANSWER_WAIT_SECONDS 8
+
+/* a socks stream to dns_upstream:port over fd, a fresh tcp socket. *step
+   names what was under way when it failed, for the log */
+static int socks5_dns_handshake(int fd, int socks_port, const char *dns_upstream,
+                                uint16_t port, const char **step) {
 /* the greeting is answered by the loop, which is busy while a connect is
-   being set up; without a bound this thread would stop answering dns for
-   the whole device until the loop came back */
+   being set up; without a bound a worker would wait on it for good */
     struct timeval timeout;
     timeout.tv_sec = 5;
     timeout.tv_usec = 0;
@@ -1044,48 +1053,46 @@ static int socks5_connect_to_dns(int socks_port, const char *dns_upstream,
     addr.sin_port = htons(socks_port);
 
     *step = "connect to the socks port";
-    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
-        close(fd);
-        return -1;
-    }
+    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) != 0) return -1;
 
     *step = "socks greeting";
     uint8_t greet[] = { 0x05, 0x01, 0x00 };
-    if (fd_write_all(fd, greet, sizeof greet) != 0) { close(fd); return -1; }
+    if (fd_write_all(fd, greet, sizeof greet) != 0) return -1;
 
     *step = "socks greeting reply";
     uint8_t resp[10];
-    if (fd_read_all(fd, resp, 2) != 0) { close(fd); return -1; }
+    if (fd_read_all(fd, resp, 2) != 0) return -1;
     if (resp[0] != 0x05 || resp[1] != 0x00) {
-        close(fd);
         errno = EPROTO;
         return -1;
     }
 
     struct in_addr dns_addr;
+    *step = "dns upstream address";
     if (!dns_upstream || inet_pton(AF_INET, dns_upstream, &dns_addr) != 1) {
-        close(fd);
+        errno = EINVAL;
         return -1;
     }
 
     uint8_t req[10] = {
         0x05, 0x01, 0x00, 0x01,
         0, 0, 0, 0,
-        0x00, 0x35 /* port 53 */
+        (uint8_t)(port >> 8), (uint8_t)port
     };
     memcpy(req + 4, &dns_addr.s_addr, 4);
     *step = "socks request";
-    if (fd_write_all(fd, req, sizeof req) != 0) { close(fd); return -1; }
+    if (fd_write_all(fd, req, sizeof req) != 0) return -1;
 
     *step = "socks request reply";
-    if (fd_read_all(fd, resp, 10) != 0) { close(fd); return -1; }
+    if (fd_read_all(fd, resp, 10) != 0) return -1;
     if (resp[0] != 0x05 || resp[1] != 0x00) {
-        close(fd);
         errno = EPROTO;
         return -1;
     }
 
-    return fd;
+    timeout.tv_sec = DNS_ANSWER_WAIT_SECONDS;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+    return 0;
 }
 
 static int dns_sendto(int fd, const uint8_t *data, size_t len,
@@ -1097,8 +1104,9 @@ static int dns_sendto(int fd, const uint8_t *data, size_t len,
     return n == (ssize_t)len ? 0 : -1;
 }
 
-static int dns_exchange(routing_exec_t *st, int *tcp_fd,
-                        const uint8_t *query, size_t query_len,
+/* one question and its answer over an open dns-over-tcp stream; on failure
+   the stream is spent and the caller closes it */
+static int dns_exchange(int tcp_fd, const uint8_t *query, size_t query_len,
                         uint8_t *response, size_t cap, size_t *response_len,
                         const char **step) {
     uint8_t length[2];
@@ -1107,40 +1115,36 @@ static int dns_exchange(routing_exec_t *st, int *tcp_fd,
         errno = EMSGSIZE;
         return -1;
     }
-    if (*tcp_fd < 0) {
-        *tcp_fd = socks5_connect_to_dns(st->socks_port, st->dns_upstream, step);
-        if (*tcp_fd < 0) return -1;
-    }
-/* the length and the query leave in one write. written apart, the query
-   waited for the ack of the two length bytes, and the tunnel could carry
-   the length alone ahead of it, which no other dns client does */
+/* the length and the query leave in one write, as every dns client sends them */
     uint8_t framed[2 + DNS_CACHE_RESPONSE_MAX];
     framed[0] = (uint8_t)(query_len >> 8);
     framed[1] = (uint8_t)query_len;
     memcpy(framed + 2, query, query_len);
     *step = "query write";
-    if (fd_write_all(*tcp_fd, framed, 2 + query_len) != 0)
-        goto failed;
+    if (fd_write_all(tcp_fd, framed, 2 + query_len) != 0) return -1;
     *step = "answer length";
-    if (fd_read_all(*tcp_fd, length, sizeof length) != 0)
-        goto failed;
+    if (fd_read_all(tcp_fd, length, sizeof length) != 0) return -1;
     size_t len = (size_t)(((uint16_t)length[0] << 8) | length[1]);
     *step = "answer";
-    if (len == 0 || len > cap) {
+    if (len == 0) {
         errno = EPROTO;
-        goto failed;
-    }
-    if (fd_read_all(*tcp_fd, response, len) != 0)
-        goto failed;
-    *response_len = len;
-    return 0;
-failed: {
-        int err = errno;
-        close(*tcp_fd);
-        *tcp_fd = -1;
-        errno = err;
         return -1;
     }
+    if (len > cap) {
+/* read past it, so the stream stays in step for the next question */
+        uint8_t skip[512];
+        while (len > 0) {
+            size_t part = len < sizeof skip ? len : sizeof skip;
+            if (fd_read_all(tcp_fd, skip, part) != 0) return -1;
+            len -= part;
+        }
+        *step = "answer size";
+        errno = EMSGSIZE;
+        return -1;
+    }
+    if (fd_read_all(tcp_fd, response, len) != 0) return -1;
+    *response_len = len;
+    return 0;
 }
 
 static void dns_log_rule(routing_exec_t *st, size_t index,
@@ -1226,12 +1230,627 @@ static int dns_sleep_ms(routing_exec_t *st, uint64_t now, uint64_t next_cleanup)
     return left > 3600 ? 3600 * 1000 : (int)(left * 1000);
 }
 
+/* a question waits on the tunnel in a worker, never in the forwarder. the dns
+   hijack of a typical xray server answers A and AAAA and drops every other
+   type without a word, and os x asks for the ptr records of its dns-sd browse
+   domains after each mDNSResponder HUP. one question at a time, each of those
+   held every name behind it for two five second waits, and the browser's
+   lookups ran out long before their turn came */
+#define DNS_WORKERS 8
+#define DNS_JOBS 48
+#define DNS_JOB_WAITERS 8
+/* the tunnel's idle timers (a cdn, xray's connIdle) end a quiet stream without
+   a word; one that sat this long is closed rather than trusted */
+#define DNS_STREAM_IDLE_SECONDS 30
+/* the other types go to the same resolver over https (rfc 8484), which the
+   hijack on port 53 never sees. an upstream that does not speak it is left
+   alone for this long */
+#define DNS_HTTPS_RETRY_SECONDS 300
+/* the biggest answer passed on whole; a bigger one (the TXT records of a
+   large domain) goes to the client truncated, to be asked again over tcp */
+#define DNS_ANSWER_MAX 4096
+
+typedef enum {
+    DNS_JOB_FREE = 0,
+    DNS_JOB_QUEUED,
+    DNS_JOB_RUNNING,
+    DNS_JOB_DONE,
+    DNS_JOB_FINISHING /* the forwarder is answering its clients */
+} dns_job_state_t;
+
+/* stub resolvers ask again long before the first try can be answered, so
+   every copy of a question rides on the one exchange already under way */
+typedef struct {
+    struct sockaddr_in address;
+    socklen_t address_len;
+    uint8_t id[2];
+} dns_waiter_t;
+
+typedef struct {
+    dns_job_state_t state;
+    uint64_t seq; /* first asked, first sent */
+    dns_question_t question;
+    rule_action_t action;
+    uint8_t query[DNS_CACHE_RESPONSE_MAX];
+    size_t query_len;
+    dns_waiter_t waiters[DNS_JOB_WAITERS];
+    size_t waiter_count;
+/* the worker's result */
+    uint8_t response[DNS_ANSWER_MAX];
+    size_t response_len;
+    int ok;
+    int too_big;
+    const char *step;
+    int err;
+    uint64_t seconds;
+} dns_job_t;
+
+struct dns_pool;
+
+typedef struct {
+    struct dns_pool *pool;
+    pthread_t thread;
+    int started;
+/* the worker's streams to the upstream, -1 without one: port 53, and port
+   443 with the tls over it. a descriptor changes hands under the pool lock,
+   so a stop can shut it down to end a wait and never touches a number the
+   worker has already closed */
+    int fd;
+    uint64_t last_used;
+    int https_fd;
+    SSL *https;
+    uint64_t https_last_used;
+} dns_worker_t;
+
+typedef struct dns_pool {
+    routing_exec_t *st;
+    pthread_mutex_t lock;
+    pthread_cond_t work;
+    int stop;
+    uint64_t next_seq;
+    SSL_CTX *https_ctx; /* NULL without roots to check the resolver against */
+    uint64_t https_down_until;
+    dns_job_t jobs[DNS_JOBS];
+    dns_worker_t workers[DNS_WORKERS];
+} dns_pool_t;
+
+/* what the forwarder did, for the diagnostics screen */
+static uint64_t g_dns_local_answers;
+static uint64_t g_dns_forwarded;
+static uint64_t g_dns_unanswered;
+
+static void dns_worker_drop_stream(dns_worker_t *w) {
+    pthread_mutex_lock(&w->pool->lock);
+    int fd = w->fd;
+    w->fd = -1;
+    pthread_mutex_unlock(&w->pool->lock);
+    if (fd >= 0) close(fd);
+}
+
+static int dns_worker_open_stream(dns_worker_t *w, dns_job_t *job) {
+    routing_exec_t *st = w->pool->st;
+    job->step = "socket";
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    pthread_mutex_lock(&w->pool->lock);
+    int stop = w->pool->stop;
+    if (!stop) w->fd = fd;
+    pthread_mutex_unlock(&w->pool->lock);
+    if (stop) {
+        close(fd);
+        errno = ECANCELED;
+        return -1;
+    }
+    if (socks5_dns_handshake(fd, st->socks_port, st->dns_upstream, 53, &job->step) != 0) {
+        int err = errno;
+        dns_worker_drop_stream(w);
+        errno = err;
+        return -1;
+    }
+    return 0;
+}
+
+static void dns_worker_drop_https(dns_worker_t *w) {
+    pthread_mutex_lock(&w->pool->lock);
+    int fd = w->https_fd;
+    SSL *ssl = w->https;
+    w->https_fd = -1;
+    w->https = NULL;
+    pthread_mutex_unlock(&w->pool->lock);
+    if (ssl) SSL_free(ssl);
+    if (fd >= 0) close(fd);
+}
+
+static int dns_worker_open_https(dns_worker_t *w, dns_job_t *job) {
+    dns_pool_t *pool = w->pool;
+    routing_exec_t *st = pool->st;
+    job->step = "socket";
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    pthread_mutex_lock(&pool->lock);
+    int stop = pool->stop;
+    if (!stop) w->https_fd = fd;
+    pthread_mutex_unlock(&pool->lock);
+    if (stop) {
+        close(fd);
+        errno = ECANCELED;
+        return -1;
+    }
+    if (socks5_dns_handshake(fd, st->socks_port, st->dns_upstream, 443, &job->step) != 0)
+        goto failed;
+    job->step = "https handshake";
+    SSL *ssl = SSL_new(pool->https_ctx);
+    if (!ssl) {
+        errno = ENOMEM;
+        goto failed;
+    }
+/* the resolver is named by its address, and its certificate carries it */
+    if (SSL_set_fd(ssl, fd) != 1 ||
+        X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), st->dns_upstream) != 1) {
+        SSL_free(ssl);
+        errno = EINVAL;
+        goto failed;
+    }
+    ERR_clear_error();
+    if (SSL_connect(ssl) != 1) {
+        int timed_out = errno == EAGAIN || errno == EWOULDBLOCK;
+        SSL_free(ssl);
+        ERR_clear_error();
+        errno = timed_out ? EAGAIN : EPROTO;
+        goto failed;
+    }
+    pthread_mutex_lock(&pool->lock);
+    w->https = ssl;
+    pthread_mutex_unlock(&pool->lock);
+    return 0;
+failed: {
+        int err = errno;
+        dns_worker_drop_https(w);
+        errno = err;
+        return -1;
+    }
+}
+
+/* one question over the worker's https stream; errno as dns_exchange leaves
+   it: EAGAIN for no answer in time, 0 for a stream the server closed */
+static int dns_https_exchange(dns_worker_t *w, dns_job_t *job) {
+    routing_exec_t *st = w->pool->st;
+    uint8_t request[512 + DNS_CACHE_RESPONSE_MAX];
+    uint8_t query[DNS_CACHE_RESPONSE_MAX];
+    size_t request_len = 0;
+/* rfc 8484 asks for id 0; the client's id goes back on the answer */
+    memcpy(query, job->query, job->query_len);
+    query[0] = query[1] = 0;
+    job->step = "https request";
+    if (doh_build_request(st->dns_upstream, query, job->query_len, request,
+                          sizeof request, &request_len) != DOH_OK) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+    size_t sent = 0;
+    while (sent < request_len) {
+        ERR_clear_error();
+        int n = SSL_write(w->https, request + sent, (int)(request_len - sent));
+        if (n <= 0) {
+            errno = SSL_get_error(w->https, n) == SSL_ERROR_ZERO_RETURN ? 0 : EPIPE;
+            return -1;
+        }
+        sent += (size_t)n;
+    }
+
+    job->step = "https answer";
+    uint8_t reply[DOH_HEADER_MAX + DNS_ANSWER_MAX];
+    size_t got = 0;
+    for (;;) {
+        size_t body_off = 0, body_len = 0;
+        int close_after = 0, status = 0;
+        doh_status_t ps = doh_parse_response(reply, got, &body_off, &body_len,
+                                             &close_after, &status);
+        if (ps == DOH_OK) {
+            if (body_len > sizeof job->response) {
+                job->step = "answer size";
+                errno = EMSGSIZE;
+                return -1;
+            }
+            if (body_len < 12) {
+                errno = EPROTO;
+                return -1;
+            }
+            memcpy(job->response, reply + body_off, body_len);
+            job->response[0] = job->query[0];
+            job->response[1] = job->query[1];
+            job->response_len = body_len;
+            if (close_after) dns_worker_drop_https(w);
+            return 0;
+        }
+        if (ps != DOH_NEED_MORE) {
+            job->step = ps == DOH_ERR_STATUS ? "https status" : "https reply";
+            errno = EPROTO;
+            return -1;
+        }
+        if (got == sizeof reply) {
+            job->step = "answer size";
+            errno = EMSGSIZE;
+            return -1;
+        }
+        ERR_clear_error();
+        int n = SSL_read(w->https, reply + got, (int)(sizeof reply - got));
+        if (n <= 0) {
+            int e = SSL_get_error(w->https, n);
+            int timed_out = e == SSL_ERROR_WANT_READ ||
+                            (e == SSL_ERROR_SYSCALL && (errno == EAGAIN || errno == EWOULDBLOCK));
+            errno = timed_out ? EAGAIN : 0;
+            return -1;
+        }
+        got += (size_t)n;
+    }
+}
+
+/* the question types the hijack on port 53 drops go over https while the
+   resolver takes it there */
+static int dns_wants_https(dns_pool_t *pool, const dns_job_t *job) {
+    if (!pool->https_ctx) return 0;
+    if (job->question.class_code == 1 &&
+        (job->question.type == 1 || job->question.type == 28))
+        return 0;
+    pthread_mutex_lock(&pool->lock);
+    int down = monotonic_seconds() < pool->https_down_until;
+    pthread_mutex_unlock(&pool->lock);
+    return !down;
+}
+
+/* 0 with the answer in job. on failure job->err says how it ended */
+static int dns_worker_try_https(dns_worker_t *w, dns_job_t *job) {
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        uint64_t began = monotonic_seconds();
+        int rc = w->https ? 0 : dns_worker_open_https(w, job);
+        if (rc == 0) rc = dns_https_exchange(w, job);
+        job->seconds = monotonic_seconds() - began;
+        if (rc == 0) {
+            w->https_last_used = monotonic_seconds();
+            return 0;
+        }
+        job->err = errno;
+        dns_worker_drop_https(w);
+        if (job->err == EAGAIN || job->err == ECANCELED || job->err == EPROTO ||
+            job->err == EMSGSIZE)
+            break;
+    }
+    return -1;
+}
+
+static void dns_worker_run(dns_worker_t *w, dns_job_t *job) {
+    job->ok = 0;
+    job->too_big = 0;
+    job->err = 0;
+    job->step = "";
+    uint64_t now = monotonic_seconds();
+    if (w->fd >= 0 && now - w->last_used > DNS_STREAM_IDLE_SECONDS)
+        dns_worker_drop_stream(w);
+    if (w->https && now - w->https_last_used > DNS_STREAM_IDLE_SECONDS)
+        dns_worker_drop_https(w);
+    if (dns_wants_https(w->pool, job)) {
+        if (dns_worker_try_https(w, job) == 0) {
+            job->ok = 1;
+            return;
+        }
+/* the question reached the resolver and went unanswered, which port 53
+   would not change; or the answer came and was too big to pass on whole */
+        if (job->err == EMSGSIZE) job->too_big = 1;
+        if (job->err == EAGAIN || job->err == ECANCELED || job->err == EMSGSIZE) return;
+        pthread_mutex_lock(&w->pool->lock);
+        int said = w->pool->https_down_until != 0;
+        w->pool->https_down_until = monotonic_seconds() + DNS_HTTPS_RETRY_SECONDS;
+        pthread_mutex_unlock(&w->pool->lock);
+        if (!said)
+            fprintf(stderr, "legacyrayd: DNS proxy: https to %s failed at %s (%s), "
+                    "port 53 for the next %d s\n", w->pool->st->dns_upstream, job->step,
+                    job->err ? strerror(job->err) : "closed", DNS_HTTPS_RETRY_SECONDS);
+    }
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        uint64_t began = monotonic_seconds();
+        int rc = w->fd >= 0 ? 0 : dns_worker_open_stream(w, job);
+        if (rc == 0)
+            rc = dns_exchange(w->fd, job->query, job->query_len, job->response,
+                              sizeof job->response, &job->response_len, &job->step);
+        job->seconds = monotonic_seconds() - began;
+        if (rc == 0 && job->response_len >= 2 && memcmp(job->response, job->query, 2) == 0) {
+            w->last_used = monotonic_seconds();
+            job->ok = 1;
+            return;
+        }
+        if (rc == 0) { /* the answer to another question: the stream is out of step */
+            job->step = "answer id";
+            errno = EPROTO;
+        }
+        job->err = errno;
+        dns_worker_drop_stream(w);
+        if (job->err == EMSGSIZE) {
+            job->too_big = 1;
+            break;
+        }
+/* a question that reached the upstream and heard nothing back was dropped
+   there on purpose, and asking again only holds this worker through another
+   wait. a stream that broke under it is worth one more */
+        if (job->err == EAGAIN || job->err == EWOULDBLOCK || job->err == ECANCELED) break;
+    }
+}
+
+static void *dns_worker_thread(void *arg) {
+    dns_worker_t *w = (dns_worker_t *)arg;
+    dns_pool_t *pool = w->pool;
+    pthread_mutex_lock(&pool->lock);
+    while (!pool->stop) {
+        dns_job_t *job = NULL;
+        for (size_t i = 0; i < DNS_JOBS; ++i) {
+            dns_job_t *j = &pool->jobs[i];
+            if (j->state == DNS_JOB_QUEUED && (!job || j->seq < job->seq)) job = j;
+        }
+        if (!job) {
+            if (w->fd < 0 && w->https_fd < 0) {
+                pthread_cond_wait(&pool->work, &pool->lock);
+                continue;
+            }
+/* an idle stream is let go while nothing asks, not kept open for the
+   server to time out */
+            struct timeval tv;
+            gettimeofday(&tv, NULL);
+            struct timespec until;
+            until.tv_sec = tv.tv_sec + DNS_STREAM_IDLE_SECONDS;
+            until.tv_nsec = (long)tv.tv_usec * 1000L;
+            if (pthread_cond_timedwait(&pool->work, &pool->lock, &until) == ETIMEDOUT) {
+                pthread_mutex_unlock(&pool->lock);
+                dns_worker_drop_stream(w);
+                dns_worker_drop_https(w);
+                pthread_mutex_lock(&pool->lock);
+            }
+            continue;
+        }
+        job->state = DNS_JOB_RUNNING;
+        pthread_mutex_unlock(&pool->lock);
+        dns_worker_run(w, job);
+        pthread_mutex_lock(&pool->lock);
+        job->state = DNS_JOB_DONE;
+        dns_wake(pool->st);
+    }
+    pthread_mutex_unlock(&pool->lock);
+    dns_worker_drop_stream(w);
+    dns_worker_drop_https(w);
+    return NULL;
+}
+
+static void dns_pool_free(dns_pool_t *pool) {
+    if (pool->https_ctx) SSL_CTX_free(pool->https_ctx);
+    pthread_cond_destroy(&pool->work);
+    pthread_mutex_destroy(&pool->lock);
+    free(pool);
+}
+
+/* a client for the resolver's https side, checked against the daemon's roots */
+static SSL_CTX *dns_https_ctx(void) {
+    X509_STORE *roots = transport_tls_roots();
+    if (!roots) return NULL;
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) return NULL;
+    static const unsigned char alpn[] = "\x08http/1.1";
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    SSL_CTX_set_alpn_protos(ctx, alpn, sizeof alpn - 1);
+    SSL_CTX_set1_cert_store(ctx, roots);
+    return ctx;
+}
+
+static dns_pool_t *dns_pool_start(routing_exec_t *st) {
+    dns_pool_t *pool = (dns_pool_t *)calloc(1, sizeof *pool);
+    if (!pool) return NULL;
+    pool->st = st;
+    if (pthread_mutex_init(&pool->lock, NULL) != 0) {
+        free(pool);
+        return NULL;
+    }
+    if (pthread_cond_init(&pool->work, NULL) != 0) {
+        pthread_mutex_destroy(&pool->lock);
+        free(pool);
+        return NULL;
+    }
+    pool->https_ctx = dns_https_ctx();
+    if (!pool->https_ctx)
+        fprintf(stderr, "legacyrayd: DNS proxy has no roots for https, port 53 only\n");
+    size_t started = 0;
+    for (size_t i = 0; i < DNS_WORKERS; ++i) {
+        dns_worker_t *w = &pool->workers[i];
+        w->pool = pool;
+        w->fd = -1;
+        w->https_fd = -1;
+        if (pthread_create(&w->thread, NULL, dns_worker_thread, w) == 0) {
+            w->started = 1;
+            started++;
+        }
+    }
+    if (started == 0) {
+        dns_pool_free(pool);
+        return NULL;
+    }
+    return pool;
+}
+
+static void dns_pool_stop(dns_pool_t *pool) {
+    if (!pool) return;
+    pthread_mutex_lock(&pool->lock);
+    pool->stop = 1;
+    for (size_t i = 0; i < DNS_WORKERS; ++i) {
+        if (pool->workers[i].fd >= 0) shutdown(pool->workers[i].fd, SHUT_RDWR);
+        if (pool->workers[i].https_fd >= 0) shutdown(pool->workers[i].https_fd, SHUT_RDWR);
+    }
+    pthread_cond_broadcast(&pool->work);
+    pthread_mutex_unlock(&pool->lock);
+    for (size_t i = 0; i < DNS_WORKERS; ++i)
+        if (pool->workers[i].started) pthread_join(pool->workers[i].thread, NULL);
+    dns_pool_free(pool);
+}
+
+/* 0 when the client will hear back: an answer is on its way or now owes it */
+static int dns_add_waiter(dns_job_t *job, const struct sockaddr_in *address,
+                          socklen_t address_len, const uint8_t *query) {
+    for (size_t i = 0; i < job->waiter_count; ++i) {
+        const dns_waiter_t *w = &job->waiters[i];
+        if (w->id[0] == query[0] && w->id[1] == query[1] &&
+            w->address.sin_port == address->sin_port &&
+            w->address.sin_addr.s_addr == address->sin_addr.s_addr)
+            return 0; /* a resend of a question that already waits */
+    }
+    if (job->waiter_count >= DNS_JOB_WAITERS) return -1;
+    dns_waiter_t *w = &job->waiters[job->waiter_count++];
+    memcpy(&w->address, address, sizeof w->address);
+    w->address_len = address_len;
+    w->id[0] = query[0];
+    w->id[1] = query[1];
+    return 0;
+}
+
+/* hand a question to the workers, or join the same one already under way.
+   -1 when every slot is taken */
+static int dns_submit(dns_pool_t *pool, const dns_question_t *question,
+                      rule_action_t action, const uint8_t *query, size_t query_len,
+                      const struct sockaddr_in *address, socklen_t address_len) {
+    pthread_mutex_lock(&pool->lock);
+    dns_job_t *slot = NULL;
+    for (size_t i = 0; i < DNS_JOBS; ++i) {
+        dns_job_t *j = &pool->jobs[i];
+        if (j->state == DNS_JOB_FREE) {
+            if (!slot) slot = j;
+            continue;
+        }
+        if ((j->state == DNS_JOB_QUEUED || j->state == DNS_JOB_RUNNING) &&
+            j->action == action && dns_questions_match(&j->question, question)) {
+            int rc = dns_add_waiter(j, address, address_len, query);
+            pthread_mutex_unlock(&pool->lock);
+            return rc;
+        }
+    }
+    if (!slot) {
+        pthread_mutex_unlock(&pool->lock);
+        return -1;
+    }
+    slot->question = *question;
+    slot->action = action;
+    memcpy(slot->query, query, query_len);
+    slot->query_len = query_len;
+    slot->waiter_count = 0;
+    (void)dns_add_waiter(slot, address, address_len, query);
+    slot->response_len = 0;
+    slot->ok = 0;
+    slot->step = "";
+    slot->err = 0;
+    slot->seconds = 0;
+    slot->seq = pool->next_seq++;
+    slot->state = DNS_JOB_QUEUED;
+    pthread_cond_signal(&pool->work);
+    pthread_mutex_unlock(&pool->lock);
+    return 0;
+}
+
+/* the same failure again and again is said once, until another one comes */
+typedef struct {
+    const char *step;
+    int err;
+} dns_said_t;
+
+static void dns_answer_waiters(int udp_fd, uint8_t *response, size_t response_len,
+                               const dns_job_t *job) {
+    for (size_t i = 0; i < job->waiter_count; ++i) {
+        const dns_waiter_t *w = &job->waiters[i];
+        response[0] = w->id[0];
+        response[1] = w->id[1];
+        (void)dns_sendto(udp_fd, response, response_len, &w->address, w->address_len);
+    }
+}
+
+static void dns_finish_job(routing_exec_t *st, int udp_fd, dns_job_t *job,
+                           dns_said_t *said) {
+    if (job->ok) {
+        dns_question_t response_question;
+        dns_response_info_t info;
+        if (dns_msg_parse_response_question(job->response, job->response_len,
+                                            &response_question) == DNS_MSG_OK &&
+            dns_questions_match(&job->question, &response_question) &&
+            dns_msg_response_info(job->response, job->response_len, &info) == DNS_MSG_OK &&
+            dns_msg_clamp_ttls(job->response, job->response_len,
+                               DNS_CACHE_TTL_MIN, DNS_CACHE_TTL_MAX) == DNS_MSG_OK &&
+            dns_msg_response_info(job->response, job->response_len, &info) == DNS_MSG_OK) {
+            said->step = NULL;
+            said->err = -1;
+            uint64_t now = monotonic_seconds();
+            dns_update_pf(st, &job->question, job->action, &info, now);
+            if (info.min_ttl > 0)
+                (void)dns_cache_put(&g_dns_cache, job->question.name, job->question.type,
+                                    job->response, job->response_len, now,
+                                    info.min_ttl, job->action);
+            dns_answer_waiters(udp_fd, job->response, job->response_len, job);
+            return;
+        }
+        fprintf(stderr, "legacyrayd: DNS proxy rejected malformed response\n");
+    } else if (job->too_big) {
+        uint8_t truncated[DNS_CACHE_RESPONSE_MAX];
+        size_t truncated_len = 0;
+        if (dns_msg_build_truncated(job->query, job->query_len, truncated,
+                                    sizeof truncated, &truncated_len) == DNS_MSG_OK) {
+            dns_answer_waiters(udp_fd, truncated, truncated_len, job);
+            return;
+        }
+    } else if (job->step != said->step || job->err != said->err) {
+        fprintf(stderr, "legacyrayd: DNS proxy: %s via 127.0.0.1:%d failed "
+                "after %llus (%s)\n", job->step, st->socks_port,
+                (unsigned long long)job->seconds,
+                job->err ? strerror(job->err) : "closed");
+        said->step = job->step;
+        said->err = job->err;
+    }
+
+    uint8_t response[DNS_CACHE_RESPONSE_MAX];
+    size_t response_len = 0;
+    rule_action_t cached_action;
+    int stale = 0;
+    if (dns_cache_get(&g_dns_cache, job->question.name, job->question.type,
+                      monotonic_seconds(), 1, response, sizeof response,
+                      &response_len, &cached_action, &stale) == DNS_CACHE_OK &&
+        cached_action == job->action) {
+        dns_answer_waiters(udp_fd, response, response_len, job);
+        return;
+    }
+    g_dns_unanswered++;
+    fprintf(stderr, "legacyrayd: DNS proxy got no answer for %s (type %u)\n",
+            job->question.name, (unsigned)job->question.type);
+}
+
+static void dns_finish_jobs(routing_exec_t *st, dns_pool_t *pool, int udp_fd,
+                            dns_said_t *said) {
+    dns_job_t *done[DNS_JOBS];
+    size_t count = 0;
+    pthread_mutex_lock(&pool->lock);
+    for (size_t i = 0; i < DNS_JOBS; ++i) {
+        if (pool->jobs[i].state != DNS_JOB_DONE) continue;
+        pool->jobs[i].state = DNS_JOB_FINISHING;
+        done[count++] = &pool->jobs[i];
+    }
+    pthread_mutex_unlock(&pool->lock);
+    for (size_t i = 0; i < count; ++i) dns_finish_job(st, udp_fd, done[i], said);
+    if (count == 0) return;
+    pthread_mutex_lock(&pool->lock);
+    for (size_t i = 0; i < count; ++i) done[i]->state = DNS_JOB_FREE;
+    pthread_mutex_unlock(&pool->lock);
+}
+
 static void *dns_forwarder_thread(void *arg) {
     routing_exec_t *st = (routing_exec_t *)arg;
     if (!st || !st->dns_bound) return NULL;
     int udp_fd = st->dns_fd;
-    int tcp_fd = -1;
     uint64_t next_cleanup = monotonic_seconds() + DNS_CLEANUP_SECONDS;
+    g_dns_local_answers = g_dns_forwarded = g_dns_unanswered = 0;
+    dns_pool_t *pool = dns_pool_start(st);
+    if (!pool)
+        fprintf(stderr, "legacyrayd: DNS proxy has no workers, it answers from the cache only\n");
+    int said_full = 0;
 /* poll says a datagram is waiting before recvfrom runs; the timeout only
    bounds a read that raced a reset */
     struct timeval timeout;
@@ -1241,10 +1860,9 @@ static void *dns_forwarder_thread(void *arg) {
 
     uint8_t query[DNS_CACHE_RESPONSE_MAX];
     uint8_t response[DNS_CACHE_RESPONSE_MAX];
-/* the same failure again and again is said once, until another one comes */
-    const char *said_step = NULL;
-    int said_err = -1;
+    dns_said_t said = { NULL, -1 };
     while (!st->dns_stop) {
+        if (pool) dns_finish_jobs(st, pool, udp_fd, &said);
         uint64_t now = monotonic_seconds();
         if (st->flush_dns_requested) {
             st->flush_dns_requested = 0;
@@ -1319,6 +1937,17 @@ static void *dns_forwarder_thread(void *arg) {
             continue;
         }
 
+/* the reverse trees of private addresses and the like are answered here:
+   the upstream says nxdomain for them too, when it says anything */
+        if (dns_msg_locally_served(question.name)) {
+            if (dns_msg_build_block(query, (size_t)query_len, DNS_BLOCK_NXDOMAIN,
+                                    response, sizeof response, &response_len) == DNS_MSG_OK)
+                (void)dns_sendto(udp_fd, response, response_len,
+                                 &client_address, client_len);
+            g_dns_local_answers++;
+            continue;
+        }
+
         rule_action_t cached_action;
         int stale = 0;
         dns_cache_status_t cached = dns_cache_get(
@@ -1332,68 +1961,29 @@ static void *dns_forwarder_thread(void *arg) {
             continue;
         }
 
-        int success = 0;
-        for (int retries = 2; retries > 0 && !st->dns_stop; --retries) {
-            const char *step = "";
-            uint64_t began = monotonic_seconds();
-            if (dns_exchange(st, &tcp_fd, query, (size_t)query_len,
-                             response, sizeof response, &response_len, &step) != 0) {
-                int err = errno;
-                if (step != said_step || err != said_err) {
-                    fprintf(stderr, "legacyrayd: DNS proxy: %s via 127.0.0.1:%d failed "
-                            "after %llus (%s)\n", step, st->socks_port,
-                            (unsigned long long)(monotonic_seconds() - began),
-                            err ? strerror(err) : "closed");
-                    said_step = step;
-                    said_err = err;
-                }
-                continue;
-            }
-            said_step = NULL;
-            said_err = -1;
-            dns_question_t response_question;
-            dns_response_info_t info;
-            if (response_len < 2 || response[0] != query[0] || response[1] != query[1] ||
-                dns_msg_parse_response_question(response, response_len,
-                                                &response_question) != DNS_MSG_OK ||
-                !dns_questions_match(&question, &response_question) ||
-                dns_msg_response_info(response, response_len, &info) != DNS_MSG_OK ||
-                dns_msg_clamp_ttls(response, response_len,
-                                   DNS_CACHE_TTL_MIN, DNS_CACHE_TTL_MAX) != DNS_MSG_OK ||
-                dns_msg_response_info(response, response_len, &info) != DNS_MSG_OK) {
-                fprintf(stderr, "legacyrayd: DNS proxy rejected malformed response\n");
-                close(tcp_fd);
-                tcp_fd = -1;
-                continue;
-            }
-            now = monotonic_seconds();
-            dns_update_pf(st, &question, action, &info, now);
-            if (info.min_ttl > 0)
-                (void)dns_cache_put(&g_dns_cache, question.name, question.type,
-                                    response, response_len, now, info.min_ttl, action);
+        if (pool && dns_submit(pool, &question, action, query, (size_t)query_len,
+                               &client_address, client_len) == 0) {
+            g_dns_forwarded++;
+            said_full = 0;
+            continue;
+        }
+/* every worker is busy and every slot taken: an old answer beats none, and
+   the client asks again anyway */
+        cached = dns_cache_get(&g_dns_cache, question.name, question.type,
+                               now, 1, response, sizeof response, &response_len,
+                               &cached_action, &stale);
+        if (cached == DNS_CACHE_OK && cached_action == action) {
+            response[0] = query[0];
+            response[1] = query[1];
             (void)dns_sendto(udp_fd, response, response_len,
                              &client_address, client_len);
-            success = 1;
-            break;
-        }
-
-        if (!success) {
-            cached = dns_cache_get(&g_dns_cache, question.name, question.type,
-                                   monotonic_seconds(), 1, response,
-                                   sizeof response, &response_len,
-                                   &cached_action, &stale);
-            if (cached == DNS_CACHE_OK && cached_action == action) {
-                response[0] = query[0];
-                response[1] = query[1];
-                (void)dns_sendto(udp_fd, response, response_len,
-                                 &client_address, client_len);
-            } else {
-                fprintf(stderr, "legacyrayd: DNS proxy failed to forward query\n");
-            }
+        } else if (pool && !said_full) {
+            fprintf(stderr, "legacyrayd: DNS proxy queue is full, dropping queries\n");
+            said_full = 1;
         }
     }
 
-    if (tcp_fd >= 0) close(tcp_fd);
+    dns_pool_stop(pool);
     return NULL;
 }
 
@@ -1664,6 +2254,13 @@ void routing_exec_dns_stats(uint64_t *hits, uint64_t *misses,
     if (misses) *misses = g_dns_cache.misses;
     if (stale_hits) *stale_hits = g_dns_cache.stale_hits;
     if (entries) *entries = dns_cache_entry_count(&g_dns_cache);
+}
+
+void routing_exec_dns_forwarder_stats(uint64_t *local, uint64_t *forwarded,
+                                      uint64_t *unanswered) {
+    if (local) *local = g_dns_local_answers;
+    if (forwarded) *forwarded = g_dns_forwarded;
+    if (unanswered) *unanswered = g_dns_unanswered;
 }
 
 void routing_exec_bypass_stats(pf_table_counts_t *counts,

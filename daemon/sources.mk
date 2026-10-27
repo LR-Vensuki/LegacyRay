@@ -1,6 +1,6 @@
 # the source lists of legacyrayd and the amneziawg helper, shared by the ios
 # (Makefile.ios) and os x (Makefile.mac) builds
-CORE_SRC = core/vless.c core/b64.c core/config.c core/rules.c core/dns_msg.c \
+CORE_SRC = core/vless.c core/b64.c core/config.c core/rules.c core/dns_msg.c core/doh.c \
            core/dns_cache.c core/profiles.c core/happ.c core/happ_crypt5.c \
            core/third_party/cJSON.c core/net_safe.c core/socks5.c core/senko_trace.c \
            core/senko_replay.c core/senko_upload.c core/vless_conn.c core/session.c \

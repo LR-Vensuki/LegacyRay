@@ -117,6 +117,11 @@ int routing_exec_render(const routing_exec_t *st, char *buf, size_t cap,
 void routing_exec_dns_stats(uint64_t *hits, uint64_t *misses,
                             uint64_t *stale_hits, size_t *entries);
 
+/* the forwarder since the tunnel came up: questions answered on the spot for
+   local zones, handed to the tunnel, and left with no answer at all */
+void routing_exec_dns_forwarder_stats(uint64_t *local, uint64_t *forwarded,
+                                      uint64_t *unanswered);
+
 /* the <legacyray_bypass> shadow: what it holds and what it has lost to its own
    capacity */
 void routing_exec_bypass_stats(pf_table_counts_t *counts,

@@ -60,6 +60,10 @@ static X509_STORE *shared_roots(void) {
     return roots;
 }
 
+X509_STORE *transport_tls_roots(void) {
+    return shared_roots();
+}
+
 typedef struct {
     SSL_CTX *ctx;
     SSL     *ssl;

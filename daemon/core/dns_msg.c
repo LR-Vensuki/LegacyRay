@@ -257,6 +257,71 @@ dns_msg_status_t dns_msg_build_block(const uint8_t *query, size_t query_len,
     return DNS_MSG_OK;
 }
 
+dns_msg_status_t dns_msg_build_truncated(const uint8_t *query, size_t query_len,
+                                         uint8_t *out, size_t cap, size_t *out_len) {
+    dns_question_t question;
+    if (out_len) *out_len = 0;
+    if (!query || !out || !out_len) return DNS_MSG_ERR_ARG;
+    if (dns_msg_parse_question(query, query_len, &question) != DNS_MSG_OK)
+        return DNS_MSG_ERR_FORMAT;
+    if (cap < question.question_end) return DNS_MSG_ERR_SPACE;
+    memset(out, 0, DNS_HEADER_LEN);
+    memcpy(out, query, 2);
+    write_u16(out + 2, (uint16_t)(0x8280u | (read_u16(query + 2) & 0x7900u)));
+    write_u16(out + 4, 1);
+    memcpy(out + DNS_HEADER_LEN, query + DNS_HEADER_LEN,
+           question.question_end - DNS_HEADER_LEN);
+    *out_len = question.question_end;
+    return DNS_MSG_OK;
+}
+
+/* name is zone itself or a name under it, on a label boundary */
+static int name_in_zone(const char *name, const char *zone) {
+    size_t n = strlen(name);
+    size_t z = strlen(zone);
+    if (n < z || strcmp(name + n - z, zone) != 0) return 0;
+    return n == z || name[n - z - 1] == '.';
+}
+
+/* name sits under <k>.zone for a decimal label k in lo..hi */
+static int name_in_zone_range(const char *name, const char *zone,
+                              unsigned lo, unsigned hi) {
+    size_t n = strlen(name);
+    size_t z = strlen(zone);
+    if (n < z + 2 || !name_in_zone(name, zone)) return 0;
+    size_t end = n - z - 1; /* the dot before zone */
+    size_t start = end;
+    while (start > 0 && name[start - 1] != '.') --start;
+    if (end - start == 0 || end - start > 3) return 0;
+    if (name[start] == '0' && end - start > 1) return 0;
+    unsigned value = 0;
+    for (size_t i = start; i < end; ++i) {
+        if (name[i] < '0' || name[i] > '9') return 0;
+        value = value * 10 + (unsigned)(name[i] - '0');
+    }
+    return value >= lo && value <= hi;
+}
+
+int dns_msg_locally_served(const char *name) {
+    static const char *const zones[] = {
+        "local", "home.arpa",
+        "0.in-addr.arpa", "10.in-addr.arpa", "127.in-addr.arpa",
+        "254.169.in-addr.arpa", "168.192.in-addr.arpa", "2.0.192.in-addr.arpa",
+        "100.51.198.in-addr.arpa", "113.0.203.in-addr.arpa",
+        "255.255.255.255.in-addr.arpa",
+        "0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa",
+        "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa",
+        "d.f.ip6.arpa", "8.e.f.ip6.arpa", "9.e.f.ip6.arpa", "a.e.f.ip6.arpa",
+        "b.e.f.ip6.arpa", "8.b.d.0.1.0.0.2.ip6.arpa"
+    };
+    if (!name || !name[0]) return 0;
+    for (size_t i = 0; i < sizeof zones / sizeof zones[0]; ++i)
+        if (name_in_zone(name, zones[i])) return 1;
+/* 172.16/12 and 100.64/10 do not end on an octet */
+    return name_in_zone_range(name, "172.in-addr.arpa", 16, 31) ||
+           name_in_zone_range(name, "100.in-addr.arpa", 64, 127);
+}
+
 static int skip_rdata_name(const uint8_t *msg, size_t len, size_t *pos,
                            size_t end) {
     size_t next = *pos;

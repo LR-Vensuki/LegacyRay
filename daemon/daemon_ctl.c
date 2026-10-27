@@ -838,6 +838,12 @@ int daemon_ctl_diag(void *ctx, char *buf, size_t cap, size_t *len) {
                  "%llu hit, %llu miss, %llu stale, %zu of %d entries",
                  (unsigned long long)hits, (unsigned long long)misses,
                  (unsigned long long)stale, entries, DNS_CACHE_CAP);
+        uint64_t local = 0, forwarded = 0, unanswered = 0;
+        routing_exec_dns_forwarder_stats(&local, &forwarded, &unanswered);
+        diag_add(buf, cap, &off, "dns.forwarder",
+                 "%llu local, %llu to the tunnel, %llu unanswered",
+                 (unsigned long long)local, (unsigned long long)forwarded,
+                 (unsigned long long)unanswered);
     }
     diag_top_rules(d->rules, buf, cap, &off);
 
