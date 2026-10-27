@@ -8,6 +8,21 @@
 #include <openssl/core_names.h>
 #include <openssl/params.h>
 
+#include "third_party/mlkem768/kem.h"
+
+rc_status_t rc_mlkem768_keygen(uint8_t pub[RC_MLKEM768_PUBLICKEYLEN],
+                               uint8_t priv[RC_MLKEM768_SECRETKEYLEN]) {
+    if (!pub || !priv) return RC_ERR_ARG;
+    return PQCLEAN_MLKEM768_CLEAN_crypto_kem_keypair(pub, priv) == 0 ? RC_OK : RC_ERR_CRYPTO;
+}
+
+rc_status_t rc_mlkem768_decap(const uint8_t ct[RC_MLKEM768_CIPHERTEXTLEN],
+                              const uint8_t priv[RC_MLKEM768_SECRETKEYLEN],
+                              uint8_t shared[RC_MLKEM768_SHAREDLEN]) {
+    if (!ct || !priv || !shared) return RC_ERR_ARG;
+    return PQCLEAN_MLKEM768_CLEAN_crypto_kem_dec(shared, ct, priv) == 0 ? RC_OK : RC_ERR_CRYPTO;
+}
+
 rc_status_t rc_x25519_keygen(uint8_t priv[RC_X25519_KEYLEN],
                              uint8_t pub[RC_X25519_KEYLEN]) {
     if (!priv || !pub) return RC_ERR_ARG;

@@ -109,7 +109,14 @@ tls13_sh_status_t tls13_parse_serverhello(const uint8_t *msg, size_t len,
             uint16_t klen  = rd_u16(&k);
             const uint8_t *key = rd_bytes(&k, klen);
             if (!k.err && group == 0x001d && klen == 32 && key) {
+                out->group = group;
                 memcpy(out->server_x25519, key, 32);
+                out->have_key_share = 1;
+            } else if (!k.err && group == 0x11ec && klen == 1120 && key) {
+                /* server share: ml-kem-768 ciphertext (1088) then x25519 point (32) */
+                out->group = group;
+                memcpy(out->server_mlkem768_ct, key, 1088);
+                memcpy(out->server_x25519, key + 1088, 32);
                 out->have_key_share = 1;
             }
         }

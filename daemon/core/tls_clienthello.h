@@ -11,6 +11,7 @@ extern "C" {
 #define TLS_CH_RANDOM_LEN     32
 #define TLS_CH_SESSIONID_LEN  32
 #define TLS_CH_X25519_PUB_LEN 32
+#define TLS_CH_MLKEM768_PUB_LEN 1184 /* draft-kwiatkowski-tls-ecdhe-mlkem-03 client share */
 #define TLS_CH_SESSIONID_OFF  39 /* keep reality aad offsets deterministic */
 
 typedef enum {
@@ -37,6 +38,10 @@ typedef struct {
     const char *sni; /* present the configured fronting name */
     tls_fp_t    fp; /* select the browser-shaped hello */
     const uint8_t *p256_pub; /* add the firefox decoy share when available */
+    /* real firefox offers this hybrid group first; a fingerprint missing it
+       reads as an outdated browser to any server that checks for it, which
+       reality servers use as anti-probing signal ahead of the token check */
+    const uint8_t *mlkem768_pub; /* TLS_CH_MLKEM768_PUB_LEN bytes, or NULL to omit */
 } tls_ch_params_t;
 
 /* legacyray: chrome and edge built on hardware without aes instructions list

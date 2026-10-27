@@ -63,6 +63,36 @@ int main(void) {
           versions[7] == 0x03 && versions[8] == 0x02 &&
           versions[9] == 0x03 && versions[10] == 0x01);
     check("edge omits chrome alps", !find_extension(hello, hello_len, 0x4469, NULL));
+    const uint8_t *shares = find_extension(hello, hello_len, 0x0033, &ext_len);
+    check("no hybrid share without an ml-kem key", shares && ext_len >= 2 + 4 + 32 &&
+          read_u16(shares + 2 + 4 + 1) != 0x11ec);
+
+/* the hybrid share comes first after grease and carries ml-kem key || x25519 */
+    static uint8_t mlkem[TLS_CH_MLKEM768_PUB_LEN];
+    static uint8_t big[4096];
+    static const tls_fp_t hybrid[] = {TLS_FP_CHROME, TLS_FP_EDGE, TLS_FP_FIREFOX};
+    memset(mlkem, 0x43, sizeof mlkem);
+    p.mlkem768_pub = mlkem;
+    for (size_t i = 0; i < sizeof hybrid / sizeof hybrid[0]; i++) {
+        p.fp = hybrid[i];
+        check("build with the hybrid share",
+              tls_build_clienthello(&p, big, sizeof big, &hello_len) == TLS_CH_OK);
+        shares = find_extension(big, hello_len, 0x0033, &ext_len);
+        size_t at = 2;
+        if (shares && p.fp != TLS_FP_FIREFOX) at += 4 + 1; /* grease share */
+        check("hybrid share is listed", shares && ext_len >= at + 4 + 1216 &&
+              read_u16(shares + at) == 0x11ec && read_u16(shares + at + 2) == 1216);
+        check("hybrid share is ml-kem key then x25519", shares && ext_len >= at + 4 + 1216 &&
+              memcmp(shares + at + 4, mlkem, sizeof mlkem) == 0 &&
+              memcmp(shares + at + 4 + sizeof mlkem, p.x25519_pub, 32) == 0);
+        const uint8_t *groups = find_extension(big, hello_len, 0x000a, &ext_len);
+        size_t g = (p.fp == TLS_FP_FIREFOX) ? 2 : 4;
+        check("hybrid group is offered first", groups && ext_len > g + 1 &&
+              read_u16(groups + g) == 0x11ec);
+    }
+    p.fp = TLS_FP_EDGE;
+    check("small buffer is refused, not overrun",
+          tls_build_clienthello(&p, hello, 1024, &hello_len) != TLS_CH_OK);
 
     if (failures) {
         printf("%d tls_clienthello checks failed\n", failures);

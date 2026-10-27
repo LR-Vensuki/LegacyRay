@@ -13,6 +13,12 @@ extern "C" {
 #define RC_GCM_TAGLEN     16
 #define RC_GCM_IVLEN      12
 
+/* draft-kwiatkowski-tls-ecdhe-mlkem-03 wire sizes for the X25519MLKEM768 group */
+#define RC_MLKEM768_PUBLICKEYLEN 1184
+#define RC_MLKEM768_SECRETKEYLEN 2400
+#define RC_MLKEM768_CIPHERTEXTLEN 1088
+#define RC_MLKEM768_SHAREDLEN     32
+
 typedef enum {
     RC_OK        =  0,
     RC_ERR_ARG   = -1,
@@ -21,6 +27,15 @@ typedef enum {
 
 rc_status_t rc_x25519_keygen(uint8_t priv[RC_X25519_KEYLEN],
                              uint8_t pub[RC_X25519_KEYLEN]);
+
+/* client side of the X25519MLKEM768 hybrid group: generate the encapsulation
+   keypair sent in the ClientHello key_share, then open the server's ciphertext */
+rc_status_t rc_mlkem768_keygen(uint8_t pub[RC_MLKEM768_PUBLICKEYLEN],
+                               uint8_t priv[RC_MLKEM768_SECRETKEYLEN]);
+
+rc_status_t rc_mlkem768_decap(const uint8_t ct[RC_MLKEM768_CIPHERTEXTLEN],
+                              const uint8_t priv[RC_MLKEM768_SECRETKEYLEN],
+                              uint8_t shared[RC_MLKEM768_SHAREDLEN]);
 
 rc_status_t rc_x25519_public(const uint8_t priv[RC_X25519_KEYLEN],
                              uint8_t pub[RC_X25519_KEYLEN]);

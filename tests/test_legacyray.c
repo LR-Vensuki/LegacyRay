@@ -237,6 +237,7 @@ static int hello_suites(tls_fp_t fp, uint16_t *first, uint16_t *second, int grea
     p.sni = "www.example.com";
     p.fp = fp;
     p.p256_pub = NULL;
+    p.mlkem768_pub = NULL;
     static uint8_t buf[2048];
     size_t len = 0;
     if (tls_build_clienthello(&p, buf, sizeof buf, &len) != TLS_CH_OK) return -1;

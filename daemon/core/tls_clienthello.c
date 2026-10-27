@@ -58,6 +58,13 @@ static uint16_t prng_grease(prng_t *p) {
     return v[prng_next(p) & 15];
 }
 
+/* the two grease extensions must differ: a hello with the same extension type
+   twice is malformed and a server ends the handshake on it */
+static uint16_t distinct_grease(prng_t *p, uint16_t other) {
+    uint16_t value = prng_grease(p);
+    return value == other ? (uint16_t)(value ^ 0x1010) : value;
+}
+
 static void ext_sni(w_t *w, const char *sni) {
     size_t sl = strlen(sni);
     w_u16(w, 0x0000);
@@ -92,41 +99,56 @@ static void ext_status_request(w_t *w) {
 static void ext_grease_empty(w_t *w, uint16_t val) { w_u16(w, val); w_u16(w, 0x0000); }
 static void ext_grease_1byte(w_t *w, uint16_t val) { w_u16(w, val); w_u16(w, 0x0001); w_u8(w, 0x00); }
 
-static void ext_key_share_x25519(w_t *w, const uint8_t pub[32], uint16_t grease) {
+static void ext_key_share_x25519(w_t *w, const uint8_t pub[32], uint16_t grease,
+                                 const uint8_t *mlkem768) {
     w_u16(w, 0x0033);
     size_t ext = w_mark_u16(w);
       size_t shares = w_mark_u16(w);
         if (grease) { w_u16(w, grease); w_u16(w, 0x0001); w_u8(w, 0x00); }
+        if (mlkem768) {
+            w_u16(w, 0x11ec); w_u16(w, 1216);
+            w_bytes(w, mlkem768, 1184); w_bytes(w, pub, 32);
+        }
         w_u16(w, 0x001d); w_u16(w, 32); w_bytes(w, pub, 32);
       w_patch_u16(w, shares);
     w_patch_u16(w, ext);
 }
-static void ext_key_share_firefox(w_t *w, const uint8_t x25519[32], const uint8_t *p256) {
+/* draft-kwiatkowski-tls-ecdhe-mlkem-03 3.1.1: the client's X25519MLKEM768
+   share is the ml-kem-768 encapsulation key followed by the x25519 point,
+   1184 + 32 = 1216 bytes, listed first to match real firefox's preference */
+static void ext_key_share_firefox(w_t *w, const uint8_t x25519[32], const uint8_t *p256,
+                                  const uint8_t *mlkem768) {
     w_u16(w, 0x0033);
     size_t ext = w_mark_u16(w);
       size_t shares = w_mark_u16(w);
+        if (mlkem768) {
+            w_u16(w, 0x11ec); w_u16(w, 1216);
+            w_bytes(w, mlkem768, 1184); w_bytes(w, x25519, 32);
+        }
         w_u16(w, 0x001d); w_u16(w, 32); w_bytes(w, x25519, 32);
         if (p256) { w_u16(w, 0x0017); w_u16(w, 65); w_bytes(w, p256, 65); }
       w_patch_u16(w, shares);
     w_patch_u16(w, ext);
 }
 
-static void ext_groups_chrome(w_t *w, uint16_t grease) {
+static void ext_groups_chrome(w_t *w, uint16_t grease, int mlkem768) {
     static const uint16_t g[] = {0x001d, 0x0017, 0x0018};
     w_u16(w, 0x000a);
     size_t ext = w_mark_u16(w);
       size_t list = w_mark_u16(w);
         if (grease) w_u16(w, grease);
+        if (mlkem768) w_u16(w, 0x11ec);
         for (size_t i = 0; i < 3; i++) w_u16(w, g[i]);
       w_patch_u16(w, list);
     w_patch_u16(w, ext);
 }
-static void ext_groups_firefox(w_t *w) {
-    static const uint16_t g[] = {0x001d, 0x0017, 0x0018, 0x0019, 0x0100, 0x0101};
+static void ext_groups_firefox(w_t *w, int mlkem768) {
+    static const uint16_t g[] = {0x11ec, 0x001d, 0x0017, 0x0018, 0x0019, 0x0100, 0x0101};
+    size_t start = mlkem768 ? 0 : 1; /* skip the hybrid group id when no key share follows */
     w_u16(w, 0x000a);
     size_t ext = w_mark_u16(w);
       size_t list = w_mark_u16(w);
-        for (size_t i = 0; i < 6; i++) w_u16(w, g[i]);
+        for (size_t i = start; i < sizeof g / sizeof g[0]; i++) w_u16(w, g[i]);
       w_patch_u16(w, list);
     w_patch_u16(w, ext);
 }
@@ -242,23 +264,23 @@ static void ciphers_min(w_t *w) { /* randomized: 1301 + 1303 (our two) */
 
 /* profiles keep the supported reality fingerprints explicit */
 
-static void exts_chrome(w_t *w, const tls_ch_params_t *p, prng_t *pr, int edge) {
-    (void)edge; /* edge == chrome here */
-    uint16_t g1 = prng_grease(pr), g2 = prng_grease(pr);
+static void exts_chrome(w_t *w, const tls_ch_params_t *p, prng_t *pr, int use_mlkem) {
+    const uint8_t *mlkem768 = use_mlkem ? p->mlkem768_pub : NULL;
+    uint16_t g1 = prng_grease(pr), g2 = distinct_grease(pr, g1);
     uint16_t gg = prng_grease(pr), gv = prng_grease(pr);
     size_t exts = w_mark_u16(w);
       ext_grease_empty(w, g1);
       if (p->sni && p->sni[0]) ext_sni(w, p->sni);
       ext_ems(w);
       ext_reneg(w);
-      ext_groups_chrome(w, gg);
+      ext_groups_chrome(w, gg, mlkem768 != NULL);
       ext_ec_points(w);
       ext_session_ticket(w);
       ext_alpn(w);
       ext_status_request(w);
       ext_sigalgs_default(w);
       ext_sct(w);
-      ext_key_share_x25519(w, p->x25519_pub, gg);
+      ext_key_share_x25519(w, p->x25519_pub, gg, mlkem768);
       ext_psk_modes(w);
       ext_versions_chrome(w, gv);
       ext_alps_h2(w); /* match chrome alps */
@@ -267,25 +289,27 @@ static void exts_chrome(w_t *w, const tls_ch_params_t *p, prng_t *pr, int edge) 
 }
 
 static void exts_qq(w_t *w, const tls_ch_params_t *p, prng_t *pr) {
-    exts_chrome(w, p, pr, 0);
+    exts_chrome(w, p, pr, 0); /* qq is not chromium-based; no pq key share to match */
 }
 
 static void exts_edge(w_t *w, const tls_ch_params_t *p, prng_t *pr) {
-    uint16_t g1 = prng_grease(pr), g2 = prng_grease(pr);
+    /* edge rides chromium's tls stack, so it gets the same hybrid share */
+    const uint8_t *mlkem768 = p->mlkem768_pub;
+    uint16_t g1 = prng_grease(pr), g2 = distinct_grease(pr, g1);
     uint16_t gg = prng_grease(pr), gv = prng_grease(pr);
     size_t exts = w_mark_u16(w);
       ext_grease_empty(w, g1);
       if (p->sni && p->sni[0]) ext_sni(w, p->sni);
       ext_ems(w);
       ext_reneg(w);
-      ext_groups_chrome(w, gg);
+      ext_groups_chrome(w, gg, mlkem768 != NULL);
       ext_ec_points(w);
       ext_session_ticket(w);
       ext_alpn(w);
       ext_status_request(w);
       ext_sigalgs_default(w);
       ext_sct(w);
-      ext_key_share_x25519(w, p->x25519_pub, gg);
+      ext_key_share_x25519(w, p->x25519_pub, gg, mlkem768);
       ext_psk_modes(w);
       ext_versions_edge(w, gv);
       ext_grease_1byte(w, g2);
@@ -297,13 +321,13 @@ static void exts_firefox(w_t *w, const tls_ch_params_t *p, prng_t *pr) {
       if (p->sni && p->sni[0]) ext_sni(w, p->sni);
       ext_ems(w);
       ext_reneg(w);
-      ext_groups_firefox(w);
+      ext_groups_firefox(w, p->mlkem768_pub != NULL);
       ext_ec_points(w);
       ext_session_ticket(w);
       ext_alpn(w);
       ext_status_request(w);
       ext_delegated_creds(w);
-      ext_key_share_firefox(w, p->x25519_pub, p->p256_pub);
+      ext_key_share_firefox(w, p->x25519_pub, p->p256_pub, p->mlkem768_pub);
       ext_versions_firefox(w);
       ext_sigalgs_firefox(w);
       ext_psk_modes(w);
@@ -321,7 +345,7 @@ static void exts_randomized(w_t *w, const tls_ch_params_t *p) {
       ext_alpn(w);
       ext_versions_tls13(w);
       ext_psk_modes(w);
-      ext_key_share_x25519(w, p->x25519_pub, 0);
+      ext_key_share_x25519(w, p->x25519_pub, 0, NULL);
       ext_ec_points(w);
     w_patch_u16(w, exts);
 }
@@ -359,7 +383,7 @@ tls_ch_status_t tls_build_clienthello(const tls_ch_params_t *p,
         case TLS_FP_QQ:         exts_qq(&w, p, &pr); break;
         case TLS_FP_RANDOMIZED: exts_randomized(&w, p); break;
         case TLS_FP_EDGE:       exts_edge(&w, p, &pr); break;
-        default:                exts_chrome(&w, p, &pr, 0); break;
+        default:                exts_chrome(&w, p, &pr, p->mlkem768_pub != NULL); break;
     }
 
     w_patch_u24(&w, hs_len);

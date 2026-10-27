@@ -1,5 +1,6 @@
 /* pin hkdf to rfc 5869 and keep aead and x25519 round trips self-consistent */
 #include "../daemon/core/reality_crypto.h"
+#include "../daemon/core/third_party/mlkem768/api.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -98,8 +99,24 @@ static void test_chacha_roundtrip(void) {
        hex_eq(out, pt, sizeof pt));
 }
 
+/* what a server encapsulates to our key, we must open to the same secret */
+static void test_mlkem768_roundtrip(void) {
+    static uint8_t pub[RC_MLKEM768_PUBLICKEYLEN], priv[RC_MLKEM768_SECRETKEYLEN];
+    static uint8_t ct[RC_MLKEM768_CIPHERTEXTLEN];
+    uint8_t server_ss[RC_MLKEM768_SHAREDLEN], client_ss[RC_MLKEM768_SHAREDLEN];
+    ok("mlkem768 keygen", rc_mlkem768_keygen(pub, priv) == RC_OK);
+    ok("mlkem768 encap", PQCLEAN_MLKEM768_CLEAN_crypto_kem_enc(ct, server_ss, pub) == 0);
+    ok("mlkem768 decap", rc_mlkem768_decap(ct, priv, client_ss) == RC_OK);
+    ok("mlkem768 shared secrets match", hex_eq(server_ss, client_ss, sizeof client_ss));
+    ct[0] ^= 1;
+    rc_mlkem768_decap(ct, priv, client_ss);
+    ok("mlkem768 tampered ciphertext gives another secret",
+       !hex_eq(server_ss, client_ss, sizeof client_ss));
+}
+
 int main(void) {
     fails = 0;
+    test_mlkem768_roundtrip();
     test_hkdf_rfc5869_a1();
     test_x25519_roundtrip();
     test_aes256gcm_roundtrip();

@@ -19,6 +19,15 @@ CORE_SRC = core/vless.c core/b64.c core/config.c core/rules.c core/dns_msg.c cor
            core/tls13_transcript.c core/tls13_handshake.c core/reality_handshake.c \
            core/socks5_client.c core/http_client.c core/vision.c core/awg_config.c core/awg_handshake.c \
            core/trojan_client.c core/shadowsocks_client.c core/blake2b256.c
+# vendored PQClean ml-kem-768 "clean" backend, plus its shared fips202.c and a
+# local randombytes.c shim over the core's openssl rng; see core/third_party/mlkem768/LICENSE
+MLKEM768_SRC = core/third_party/mlkem768/kem.c core/third_party/mlkem768/indcpa.c \
+               core/third_party/mlkem768/poly.c core/third_party/mlkem768/polyvec.c \
+               core/third_party/mlkem768/ntt.c core/third_party/mlkem768/cbd.c \
+               core/third_party/mlkem768/reduce.c core/third_party/mlkem768/verify.c \
+               core/third_party/mlkem768/symmetric-shake.c core/third_party/mlkem768/fips202.c \
+               core/third_party/mlkem768/randombytes.c
+CORE_SRC += $(MLKEM768_SRC)
 DAEMON_SRC = dialer.c loop.c core/sniff.c pf_natlook.c ctl_server.c daemon_ctl.c storefile.c netwatch.c geo_ctl.c settings.c status.c \
              routing.c routing_exec.c routing_fwd.c pf_table.c c_backend.c go_config.c go_backend.c \
              engine_config.c engine_backend.c \
@@ -35,9 +44,9 @@ legacyrayd: $(CORE_SRC) $(DAEMON_SRC)
 legacyrayctl: senkoctl.c core/b64.c
 	$(CC) $(CFLAGS) senkoctl.c core/b64.c -o $@ $(LDFLAGS)
 
-legacyrayawgd: senkoawgd.c awg_utun.c awg_route.c awg_pfroute.c core/awg_config.c core/awg_handshake.c core/awg_tunnel.c core/b64.c core/reality_crypto.c status.c legacy_ios.c proc_detach.c
+legacyrayawgd: senkoawgd.c awg_utun.c awg_route.c awg_pfroute.c core/awg_config.c core/awg_handshake.c core/awg_tunnel.c core/b64.c core/reality_crypto.c $(MLKEM768_SRC) status.c legacy_ios.c proc_detach.c
 	$(CC) $(CFLAGS) $(TLS_CFLAGS) senkoawgd.c awg_utun.c awg_route.c awg_pfroute.c core/awg_config.c core/awg_handshake.c \
-	      core/awg_tunnel.c core/b64.c core/reality_crypto.c status.c legacy_ios.c proc_detach.c -o $@ $(LDFLAGS) $(TLS_LDFLAGS)
+	      core/awg_tunnel.c core/b64.c core/reality_crypto.c $(MLKEM768_SRC) status.c legacy_ios.c proc_detach.c -o $@ $(LDFLAGS) $(TLS_LDFLAGS)
 
 clean:
 	rm -f legacyrayd legacyrayctl legacyrayawgd

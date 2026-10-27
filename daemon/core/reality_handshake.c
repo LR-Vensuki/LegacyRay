@@ -363,13 +363,21 @@ void *reality_handshake_open(int fd, const rh_params_t *p, rh_status_t *err) {
     tls13_transcript_t tr; tr.ctx = NULL;
     uint8_t eph_priv[32], eph_pub[32];
     uint8_t authkey[RA_AUTHKEY_LEN];
+    /* real firefox, chrome and edge all offer this hybrid group by default;
+       matching that key_share is what keeps a picky reality server from
+       routing an otherwise-valid token to the camouflage site as an
+       outdated client (qq and the randomized profile stay as they are) */
+    uint8_t mlkem_pub[RC_MLKEM768_PUBLICKEYLEN];
+    uint8_t mlkem_priv[RC_MLKEM768_SECRETKEYLEN];
+    int use_mlkem = p && (p->fp == TLS_FP_FIREFOX || p->fp == TLS_FP_CHROME || p->fp == TLS_FP_EDGE);
 
     if (fd < 0 || !p) { e = RH_ERR_ARG; goto fail; }
 
     stage = "ephemeral key generation";
     if (rc_x25519_keygen(eph_priv, eph_pub) != RC_OK) FAIL(RH_ERR_CRYPTO);
+    if (use_mlkem && rc_mlkem768_keygen(mlkem_pub, mlkem_priv) != RC_OK) FAIL(RH_ERR_CRYPTO);
 
-    uint8_t hello[2048]; size_t hello_len = 0;
+    uint8_t hello[4096]; size_t hello_len = 0;
     tls_ch_params_t chp;
     memset(&chp, 0, sizeof chp);
 /* random must be real entropy: reality reads random[:20] as the hkdf salt and random[20:32] as the seal nonce */
@@ -379,6 +387,7 @@ void *reality_handshake_open(int fd, const rh_params_t *p, rh_status_t *err) {
     chp.sni = p->sni;
     chp.fp = (tls_fp_t)p->fp;
     chp.p256_pub = p->has_p256 ? p->p256_pub : NULL;
+    chp.mlkem768_pub = use_mlkem ? mlkem_pub : NULL;
     stage = "ClientHello construction";
     if (tls_build_clienthello(&chp, hello, sizeof hello, &hello_len) != TLS_CH_OK)
         FAIL(RH_ERR_PROTO);
@@ -432,12 +441,28 @@ void *reality_handshake_open(int fd, const rh_params_t *p, rh_status_t *err) {
     tls13_transcript_update(&tr, shrec, shlen);
 
     stage = "TLS key schedule";
-    uint8_t ecdhe[RC_SHARED_LEN];
-    if (rc_x25519_shared(eph_priv, sh.server_x25519, ecdhe) != RC_OK) FAIL(RH_ERR_CRYPTO);
+    uint8_t x25519_ss[RC_SHARED_LEN];
+    if (rc_x25519_shared(eph_priv, sh.server_x25519, x25519_ss) != RC_OK) FAIL(RH_ERR_CRYPTO);
+
+    /* draft-kwiatkowski-tls-ecdhe-mlkem-03 3.1.3: the (ec)dhe input to the tls
+       1.3 key schedule is ml-kem shared secret || x25519 shared secret when
+       the hybrid group was negotiated, plain x25519 otherwise */
+    uint8_t ecdhe[RC_MLKEM768_SHAREDLEN + RC_SHARED_LEN];
+    size_t ecdhe_len;
+    if (sh.group == 0x11ec) {
+        if (!use_mlkem) FAIL(RH_ERR_PROTO); /* server picked a group we never offered */
+        if (rc_mlkem768_decap(sh.server_mlkem768_ct, mlkem_priv, ecdhe) != RC_OK)
+            FAIL(RH_ERR_CRYPTO);
+        memcpy(ecdhe + RC_MLKEM768_SHAREDLEN, x25519_ss, RC_SHARED_LEN);
+        ecdhe_len = RC_MLKEM768_SHAREDLEN + RC_SHARED_LEN;
+    } else {
+        memcpy(ecdhe, x25519_ss, RC_SHARED_LEN);
+        ecdhe_len = RC_SHARED_LEN;
+    }
 
     uint8_t early[TLS13_HASH_LEN], hs_secret[TLS13_HASH_LEN];
     if (tls13_early_secret(NULL, 0, early) != TLS13_OK) FAIL(RH_ERR_CRYPTO);
-    if (tls13_handshake_secret(early, ecdhe, sizeof ecdhe, hs_secret) != TLS13_OK)
+    if (tls13_handshake_secret(early, ecdhe, ecdhe_len, hs_secret) != TLS13_OK)
         FAIL(RH_ERR_CRYPTO);
 
     uint8_t th_chsh[TLS13_TRANSCRIPT_LEN]; /* hash(ch..sh) */

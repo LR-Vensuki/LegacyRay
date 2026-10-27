@@ -1,0 +1,12 @@
+ML-KEM-768 "clean" reference implementation, vendored from PQClean
+(https://github.com/PQClean/PQClean/tree/master/crypto_kem/ml-kem-768/clean)
+on 2026-09-30, plus the shared fips202.c/.h from PQClean/common.
+
+Public Domain (https://creativecommons.org/share-your-work/public-domain/cc0/)
+
+For Keccak, this is public-domain code from sources and by authors listed
+in comments on top of fips202.c.
+
+randombytes.h in this directory is not from PQClean: it is a local shim
+that calls senko's existing OpenSSL RNG (see reality_crypto.c) instead of
+PQClean's own OS-specific randombytes.c, so it carries no separate license.

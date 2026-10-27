@@ -28,7 +28,10 @@ typedef struct {
     uint16_t cipher_suite; /* retain the negotiated aead suite */
     uint16_t version; /* retain the negotiated tls version */
     int      have_key_share;
+    uint16_t group; /* 0x001d plain x25519, or 0x11ec the mlkem768 hybrid */
     uint8_t  server_x25519[32]; /* retain the server x25519 share */
+    /* draft-kwiatkowski-tls-ecdhe-mlkem-03 3.1.2: only set when group == 0x11ec */
+    uint8_t  server_mlkem768_ct[1088];
 } tls13_serverhello_t;
 
 typedef enum {
