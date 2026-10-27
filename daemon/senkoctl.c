@@ -147,7 +147,10 @@ static int ctl_auth(int fd, const char *sock) {
     int ln = snprintf(line, sizeof line, "AUTH %s\n", token);
     if (ln <= 0 || (size_t)ln >= sizeof line) return -1;
     if (write_all(fd, line, (size_t)ln) < 0) return -1;
-    struct timeval tv; tv.tv_sec = 2; tv.tv_usec = 0;
+/* the daemon answers from the same poll that carries a connect or a
+   disconnect, which runs pfctl and stops the dns forwarder: two seconds
+   failed the command right after one of those with "auth failed" */
+    struct timeval tv; tv.tv_sec = 10; tv.tv_usec = 0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     char buf[128];
     size_t tot = 0;
