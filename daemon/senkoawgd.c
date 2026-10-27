@@ -13,6 +13,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
 #include <signal.h>
@@ -100,6 +101,17 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  %s --route-plan-probe <amneziawg.conf> <endpoint-ipv4> <gateway-ipv4>\n", argv0);
 }
 
+/* the stock datagram buffers drop the tail of a burst from the server while
+   the loop is busy decrypting, and each lost datagram is a tcp retransmit */
+#define AWG_UDP_BUFFER (256 * 1024)
+
+static void size_udp_buffers(int fd) {
+    int size = AWG_UDP_BUFFER;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof size) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof size) != 0)
+        fprintf(stderr, "legacyrayawgd: keeping the stock udp buffers (errno %d)\n", errno);
+}
+
 static int open_endpoint(const awg_config_t *cfg, char *endpoint, size_t endpoint_cap) {
     char port[8];
     snprintf(port, sizeof port, "%u", cfg->endpoint_port);
@@ -113,6 +125,7 @@ static int open_endpoint(const awg_config_t *cfg, char *endpoint, size_t endpoin
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) continue;
+        size_udp_buffers(fd);
         if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
             struct sockaddr_in *peer = (struct sockaddr_in *)ai->ai_addr;
             if (inet_ntop(AF_INET, &peer->sin_addr, endpoint, endpoint_cap)) {
@@ -243,6 +256,15 @@ static int run_tunnel(const awg_config_t *cfg, int timeout_ms) {
     long last_rekey_attempt_ms = 0;
     long rekey_wanted_since = 0; /* 0 when no traffic is asking for a session */
     int keys_dead_logged = 0;
+/* a responder starts sending on new keys only once a packet sealed with them
+   arrives, so a tunnel with nothing to send yet would leave the server's
+   first packets waiting for a timer */
+    {
+        size_t wire_len = 0;
+        if (awg_tunnel_seal(&tunnel, NULL, 0, wire, sizeof wire, &wire_len) == AWG_TUN_OK &&
+            send(udp_fd, wire, wire_len, 0) != (ssize_t)wire_len)
+            fprintf(stderr, "legacyrayawgd: first keepalive not sent (errno %d)\n", errno);
+    }
     while (!g_stop) {
         now_ms = monotonic_millis();
         long key_age = now_ms - last_handshake_ms;
