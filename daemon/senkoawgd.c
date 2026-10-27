@@ -279,7 +279,7 @@ static int run_tunnel(const awg_config_t *cfg, int timeout_ms) {
                 tunnel.handshake = refreshed;
                 tunnel.send_counter = 0;
                 tunnel.recv_counter = 0;
-                tunnel.recv_window = 0;
+                memset(tunnel.recv_window, 0, sizeof tunnel.recv_window);
                 tunnel.have_recv_counter = 0;
                 now_ms = monotonic_millis();
                 last_handshake_ms = now_ms;
