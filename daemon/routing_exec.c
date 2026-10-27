@@ -952,15 +952,24 @@ static int dns_exchange(routing_exec_t *st, int *tcp_fd,
                         uint8_t *response, size_t cap, size_t *response_len,
                         const char **step) {
     uint8_t length[2];
+    if (query_len > DNS_CACHE_RESPONSE_MAX) {
+        *step = "query size";
+        errno = EMSGSIZE;
+        return -1;
+    }
     if (*tcp_fd < 0) {
         *tcp_fd = socks5_connect_to_dns(st->socks_port, st->dns_upstream, step);
         if (*tcp_fd < 0) return -1;
     }
-    length[0] = (uint8_t)(query_len >> 8);
-    length[1] = (uint8_t)query_len;
+/* the length and the query leave in one write. written apart, the query
+   waited for the ack of the two length bytes, and the tunnel could carry
+   the length alone ahead of it, which no other dns client does */
+    uint8_t framed[2 + DNS_CACHE_RESPONSE_MAX];
+    framed[0] = (uint8_t)(query_len >> 8);
+    framed[1] = (uint8_t)query_len;
+    memcpy(framed + 2, query, query_len);
     *step = "query write";
-    if (fd_write_all(*tcp_fd, length, sizeof length) != 0 ||
-        fd_write_all(*tcp_fd, query, query_len) != 0)
+    if (fd_write_all(*tcp_fd, framed, 2 + query_len) != 0)
         goto failed;
     *step = "answer length";
     if (fd_read_all(*tcp_fd, length, sizeof length) != 0)

@@ -854,7 +854,11 @@ static int rh_write(void *handle, const uint8_t *buf, size_t len) {
                                 CT_APPDATA, buf, len,
                                 c->wpend, sizeof c->wpend, &rlen) != TLS13_REC_OK)
         return TRANSPORT_ERR;
-    senko_trace_th(c, "tx_record", "reality app record");
+    if (senko_trace_enabled()) {
+        char detail[48];
+        snprintf(detail, sizeof detail, "reality app record len=%zu", len);
+        senko_trace_th(c, "tx_record", detail);
+    }
     c->c_app_seq++;
     c->c_app_bytes += (uint64_t)len;
     c->wpend_len = rlen;
