@@ -370,18 +370,25 @@ static routing_status_t routing_pf_conf_build(const char *server_ips,
             pf_port_filters(&w, rules, ifnames, if_count);
             pf_port_no_translation(&w, rules, ifnames, if_count);
             for (size_t i = 0; i < if_count; i++)
-                pf_ap(&w, "nat on %s inet proto tcp from any to ! <legacyray_bypass> -> 127.0.0.1\n",
-                      ifnames[i]);
+                pf_ap(&w, "nat on %s inet proto tcp from any to ! <legacyray_bypass> -> 127.0.0.1\n"
+                          "nat on %s inet proto udp from any to any port 53 -> 127.0.0.1\n",
+                      ifnames[i], ifnames[i]);
             pf_ap(&w, "rdr pass on lo0 inet proto tcp from any to ! <legacyray_bypass> -> 127.0.0.1 port %d\n",
                   redir_port);
+/* a query the device sends itself never comes in on en0, so the rdr on the
+   interface below would not see it and it went to the network's resolver,
+   around the tunnel: it is turned to lo0 the way tcp is */
+            pf_ap(&w, "rdr pass on lo0 inet proto udp from any to any port 53 -> 127.0.0.1 port %d\n",
+                  dns_local_port);
             for (size_t i = 0; i < if_count; i++)
                 pf_ap(&w, "rdr pass on %s proto udp from any to any port 53 -> 127.0.0.1 port %d\n",
                       ifnames[i], dns_local_port);
             for (size_t i = 0; i < if_count; i++) {
                 const char *ifn = ifnames[i];
                 pf_ap(&w, "pass out quick on %s inet proto tcp from any to <legacyray_bypass> flags S/SA keep state\n"
-                          "pass out quick on %s route-to lo0 inet proto tcp from any to ! <legacyray_bypass> flags S/SA keep state\n",
-                      ifn, ifn);
+                          "pass out quick on %s route-to lo0 inet proto tcp from any to ! <legacyray_bypass> flags S/SA keep state\n"
+                          "pass out quick on %s route-to lo0 inet proto udp from any to any port 53 keep state\n",
+                      ifn, ifn, ifn);
                 pf_block_triplet(&w, ifn);
             }
             pf_ap(&w, "pass in all keep state\n");

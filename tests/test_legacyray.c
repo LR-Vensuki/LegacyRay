@@ -96,6 +96,10 @@ static void test_firewall(void) {
                               strstr(pf, "100.64.0.0/10") != NULL);
     ok("port filters precede the redirect",
        strstr(pf, "port { 25 }") < strstr(pf, "route-to lo0"));
+    ok("the device's own dns turns to lo0",
+       strstr(pf, "pass out quick on en0 route-to lo0 inet proto udp from any to any port 53 keep state") != NULL &&
+       strstr(pf, "rdr pass on lo0 inet proto udp from any to any port 53 -> 127.0.0.1 port 15353") != NULL &&
+       strstr(pf, "nat on en0 inet proto udp from any to any port 53 -> 127.0.0.1") != NULL);
 
     routing_set_policy(0, NULL);
     ok("pf without lan builds",
