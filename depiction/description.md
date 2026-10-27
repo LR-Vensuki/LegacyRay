@@ -2,7 +2,7 @@ VPN-клиент для всего устройства на **iOS 4.0 – 7.x**
 
 LegacyRay — форк [senko](https://github.com/sqmrak/senko) от sqmrak (GPL-2.0): сетевое ядро и демон взяты из senko и доработаны, интерфейс написан заново.
 
-**Протоколы**: VLESS (TCP, TLS, Reality + xtls-rprx-vision, WebSocket, XHTTP, gRPC), Trojan, Shadowsocks, SOCKS5 и HTTP(S), AmneziaWG 1.0/1.5/2.0, WireGuard.
+**Протоколы**: VLESS (TCP, TLS, Reality + xtls-rprx-vision, WebSocket, XHTTP, gRPC), VMess, Trojan, Shadowsocks, SOCKS5 и HTTP(S), AmneziaWG 1.0/1.5/2.0, WireGuard.
 
 **Подписки**: URI-списки, base64, happ-ссылки (включая crypt5), Xray и sing-box JSON, Clash YAML, Shadowrocket и Surge INI. Трафик, срок и напоминания об окончании подписки.
 
