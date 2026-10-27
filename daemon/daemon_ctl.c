@@ -1459,8 +1459,10 @@ static void probe_bind_physical_interface(int fd, int full_device) {
 
 /* measure one direct ipv4 handshake from connect until the socket reports its
    final error state */
+/* why may be NULL; otherwise it says why the connect failed */
 static int probe_tcp_ipv4(const char *ip, uint16_t port, int timeout_ms,
-                          int full_device) {
+                          int full_device, net_fail_kind_t *why) {
+    if (why) *why = NET_FAIL_SYSTEM;
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
@@ -1479,6 +1481,7 @@ static int probe_tcp_ipv4(const char *ip, uint16_t port, int timeout_ms,
     long start = probe_now_ms();
     int rc = connect(fd, (struct sockaddr *)&addr, sizeof addr);
     if (rc != 0 && errno != EINPROGRESS) {
+        if (why) *why = net_fail_from_errno(errno);
         close(fd);
         return -1;
     }
@@ -1491,6 +1494,7 @@ static int probe_tcp_ipv4(const char *ip, uint16_t port, int timeout_ms,
     timeout.tv_usec = (timeout_ms % 1000) * 1000;
     rc = select(fd + 1, NULL, &writable, NULL, &timeout);
     if (rc <= 0 || !FD_ISSET(fd, &writable)) {
+        if (why && rc == 0) *why = NET_FAIL_TIMEOUT;
         close(fd);
         return -1;
     }
@@ -1498,6 +1502,7 @@ static int probe_tcp_ipv4(const char *ip, uint16_t port, int timeout_ms,
     int soerr = 0;
     socklen_t soerr_len = sizeof soerr;
     if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &soerr_len) != 0 || soerr != 0) {
+        if (why && soerr) *why = net_fail_from_errno(soerr);
         close(fd);
         return -1;
     }
@@ -1622,7 +1627,7 @@ int daemon_ctl_probe(void *ctx, const char *host, uint16_t port) {
         pthread_mutex_unlock(&d->probe_route_lock);
     }
 
-    int ms = probe_tcp_ipv4(ip, port, timeout_ms, d && d->full_device);
+    int ms = probe_tcp_ipv4(ip, port, timeout_ms, d && d->full_device, NULL);
     if (go_bypassed) {
         pthread_mutex_lock(&d->probe_route_lock);
         go_backend_bypass_remove_ipv4(&d->go, ip);
@@ -2095,6 +2100,19 @@ static void explain_handshake_failure(daemon_ctl_t *d, const vl_server_t *server
         diag.stage = NET_DIAG_SILENT;
     else
         diag.stage = NET_DIAG_CLOSED;
+/* the probe's own deadline can end before the tunnel's dial gives up, so a
+   server that never answered left no failure behind: ask it directly */
+    if (diag.stage == NET_DIAG_SILENT || diag.stage == NET_DIAG_CLOSED) {
+        char ip[INET6_ADDRSTRLEN];
+        net_fail_kind_t why = NET_FAIL_NONE;
+        if (!net_resolve_public(server->host, server->port, ip, sizeof ip)) {
+            diag.stage = NET_DIAG_DNS;
+        } else if (probe_tcp_ipv4(ip, server->port, 2500, d->full_device, &why) < 0 &&
+                   why != NET_FAIL_SYSTEM) {
+            diag.stage = NET_DIAG_TRANSPORT;
+            diag.transport.kind = why;
+        }
+    }
     diag.clock_known = senko_clock_offset(&diag.clock_offset_s);
     if (net_diag_wants_clock(&diag) && measure_device_clock(d, 2000) == 0)
         diag.clock_known = senko_clock_offset(&diag.clock_offset_s);
