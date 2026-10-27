@@ -1,6 +1,6 @@
 Package: com.legacyray.app
 Name: LegacyRay
-Version: 1.0.2
+Version: 1.0.3
 Architecture: iphoneos-arm
 Description: Full-device VLESS, Trojan, Shadowsocks, SOCKS and AmneziaWG client for iOS 4-7, drawn the way Apple drew iOS 6, with a native iOS 7 look on iOS 7. A fork of senko.
 Maintainer: LegacyReborn Project
