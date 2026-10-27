@@ -220,6 +220,9 @@ static int same_origin(const url_t *a, const url_t *b) {
            strcasecmp(a->host, b->host) == 0;
 }
 
+/* how long a body that keeps arriving may go quiet before the extension ends */
+#define SUBFETCH_IDLE_MS 3000
+
 /* fetch one url */
 static subfetch_status_t fetch_once(const subfetch_cfg_t *cfg, const url_t *u,
                                     uint8_t *body, size_t body_cap, size_t *body_len,
@@ -262,12 +265,22 @@ static subfetch_status_t fetch_once(const subfetch_cfg_t *cfg, const url_t *u,
         }
         if (!io_ok) { result = SUBFETCH_ERR_TRANSPORT; break; }
 
+        const long hard_deadline = deadline +
+            (cfg->progress_extend_ms > 0 ? cfg->progress_extend_ms : 0);
         http_parser_t hp;
         http_parser_init(&hp, body, body_cap);
         uint8_t rb[8192];
         for (;;) {
             int n = vt->read(th, rb, sizeof rb);
             if (n > 0) {
+/* a 1 MB feed over a slow link stalled at the fixed timeout with http 200
+   and half the body: data that is still flowing earns a few more seconds, up
+   to the hard cap */
+                if (hard_deadline > deadline) {
+                    long idle = now_ms() + SUBFETCH_IDLE_MS;
+                    if (idle > hard_deadline) idle = hard_deadline;
+                    if (idle > deadline) deadline = idle;
+                }
                 http_status_t hs = http_parser_feed(&hp, rb, (size_t)n);
                 if (hs == HTTP_DONE) {
                     if (hp.have_set_cookie && cookie_jar && cookie_cap)

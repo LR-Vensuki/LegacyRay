@@ -1240,18 +1240,24 @@ static int subfetch_dial(void *ctx, const char *host, uint16_t port) {
 static int daemon_ctl_fetch_timeout(void *ctx, const char *url,
                                     const char *request_header,
                                     unsigned char *buf, size_t cap, size_t *len,
-                                    ctl_fetch_meta_t *meta, int timeout_ms);
+                                    ctl_fetch_meta_t *meta, int timeout_ms,
+                                    int budget_ms);
+
+/* the app waits 25s for ADDSUB and 30s for REFRESH; both attempts, the one
+   through the tunnel and the direct retry, have to fit inside the shorter */
+#define SUBSCRIPTION_FETCH_BUDGET_MS 22000
 
 int daemon_ctl_fetch(void *ctx, const char *url,
                      const char *request_header,
                      unsigned char *buf, size_t cap, size_t *len,
                      ctl_fetch_meta_t *meta) {
-    return daemon_ctl_fetch_timeout(ctx, url, request_header, buf, cap, len, meta, 15000);
+    return daemon_ctl_fetch_timeout(ctx, url, request_header, buf, cap, len, meta, 15000,
+                                    SUBSCRIPTION_FETCH_BUDGET_MS);
 }
 
 static int geo_fetch(void *ctx, const char *url, unsigned char *buf, size_t cap,
                      size_t *len, int timeout_ms) {
-    return daemon_ctl_fetch_timeout(ctx, url, NULL, buf, cap, len, NULL, timeout_ms);
+    return daemon_ctl_fetch_timeout(ctx, url, NULL, buf, cap, len, NULL, timeout_ms, 0);
 }
 
 int daemon_ctl_geo(void *ctx, const char *what, char *out, size_t cap, size_t *len) {
@@ -1281,7 +1287,9 @@ int daemon_ctl_geo(void *ctx, const char *what, char *out, size_t cap, size_t *l
 static int daemon_ctl_fetch_timeout(void *ctx, const char *url,
                                     const char *request_header,
                                     unsigned char *buf, size_t cap, size_t *len,
-                                    ctl_fetch_meta_t *meta, int timeout_ms) {
+                                    ctl_fetch_meta_t *meta, int timeout_ms,
+                                    int budget_ms) {
+    long started_ms = probe_now_ms();
     fetch_dial_ctx_t dial_ctx = { ctx, 0 };
     subfetch_cfg_t cfg;
     memset(&cfg, 0, sizeof cfg);
@@ -1293,6 +1301,8 @@ static int daemon_ctl_fetch_timeout(void *ctx, const char *url,
     cfg.tls = &transport_tls; /* use tls for https */
     cfg.request_header = request_header;
     cfg.max_redirects = 5;
+/* a body that is still arriving may run on past the timeout, inside the budget */
+    if (budget_ms > timeout_ms) cfg.progress_extend_ms = budget_ms - timeout_ms;
 
     subfetch_info_t info;
     subfetch_status_t r = subfetch_get_info(&cfg, url, buf, cap, len, timeout_ms, &info);
@@ -1302,9 +1312,17 @@ static int daemon_ctl_fetch_timeout(void *ctx, const char *url,
    subscription refresh that could otherwise replace it */
     if ((r == SUBFETCH_ERR_DIAL || r == SUBFETCH_ERR_TRANSPORT) &&
         !dial_ctx.force_direct) {
-        dial_ctx.force_direct = 1;
-        fprintf(stderr, "legacyrayd: subfetch retrying direct, bypassing the tunnel\n");
-        r = subfetch_get_info(&cfg, url, buf, cap, len, timeout_ms, &info);
+        int retry_ms = timeout_ms;
+        if (budget_ms > 0) {
+            long left = budget_ms - (probe_now_ms() - started_ms);
+            if (left < retry_ms) retry_ms = (int)left;
+        }
+        cfg.progress_extend_ms = 0;
+        if (retry_ms >= 3000) {
+            dial_ctx.force_direct = 1;
+            fprintf(stderr, "legacyrayd: subfetch retrying direct, bypassing the tunnel\n");
+            r = subfetch_get_info(&cfg, url, buf, cap, len, retry_ms, &info);
+        }
     }
     if (r != SUBFETCH_OK) {
         const char *why = "unknown";

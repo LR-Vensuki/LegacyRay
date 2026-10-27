@@ -71,12 +71,14 @@ HOST_TESTS += test_loop_redial
 HOST_TESTS += test_engine_config
 HOST_TESTS += test_session_upstream
 HOST_TESTS += test_vmess
+HOST_TESTS += test_subfetch_budget
 
 all: test
 
 test: $(HOST_TESTS)
 	./test_legacyray
 	./test_vmess
+	./test_subfetch_budget
 	./test_trojan
 	./test_shadowsocks
 	./test_qr_zbar
@@ -198,6 +200,11 @@ test_subinfo: test_subinfo.c $(CORE)/subfetch.c $(CORE)/subfetch.h
 	$(CC) $(CFLAGS) $(TLS_CFLAGS) -DSENKO_HOST_TEST -I$(DAEMON) test_subinfo.c \
 	      $(CORE)/subfetch.c $(CORE)/http.c $(CORE)/url.c $(CORE)/net_safe.c \
 	      $(CORE)/b64.c -o $@ $(TLS_LDFLAGS) -lz
+
+test_subfetch_budget: test_subfetch_budget.c $(CORE)/subfetch.c $(CORE)/subfetch.h
+	$(CC) $(CFLAGS) $(TLS_CFLAGS) $(THREAD_CFLAGS) -I$(CORE) -I$(DAEMON) test_subfetch_budget.c \
+	      $(CORE)/subfetch.c $(CORE)/http.c $(CORE)/url.c $(CORE)/net_safe.c \
+	      $(CORE)/b64.c $(CORE)/transport_tcp.c -o $@ $(TLS_LDFLAGS) -lz $(THREAD_LDFLAGS)
 
 test_legacy_ios: test_legacy_ios.c $(DAEMON)/legacy_ios.c $(DAEMON)/legacy_ios.h
 	$(CC) $(CFLAGS) -I$(DAEMON) test_legacy_ios.c $(DAEMON)/legacy_ios.c -o $@
