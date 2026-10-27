@@ -160,7 +160,7 @@ TLS 1.2/1.3 (Safari, Cydia).
 
 ```bash
 make deps          # один раз: OpenSSL 3.5 (NEON), mbedTLS 3.6, libssh2 1.11 под armv7 / iOS 4.0
-make package       # → packages/com.legacyray.app_1.0.3_iphoneos-arm.deb
+make package       # → packages/com.legacyray.app_1.0.4_iphoneos-arm.deb
 make install THEOS_DEVICE_IP=192.168.1.10
 ```
 
@@ -195,8 +195,8 @@ SpringBoard; что произошло — в `/var/log/legacyray-install.log`. 
    `app/Resources/Info.plist`, `Version` в `layout/DEBIAN/control`. `make`
    откажется собирать, если версии не совпадают.
 2. `make package`.
-3. GitHub → репозиторий → Releases → Draft a new release: тег `v1.0.3` (можно
-   без `v`), приложить `packages/com.legacyray.app_1.0.3_iphoneos-arm.deb`,
+3. GitHub → репозиторий → Releases → Draft a new release: тег `v1.0.4` (можно
+   без `v`), приложить `packages/com.legacyray.app_1.0.4_iphoneos-arm.deb`,
    опубликовать. Черновик и pre-release приложение не увидит: API «latest»
    их не отдаёт.
 
