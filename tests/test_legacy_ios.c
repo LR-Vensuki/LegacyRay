@@ -15,6 +15,12 @@ static void expect(const char *xml, int want, const char *name) {
 
 int main(void) {
     /* real device layout: value on the line after its key */
+    /* ios 4.3 shares darwin 11 with ios 5; the plist tells them apart */
+    expect("<dict>\n"
+           "\t<key>ProductBuildVersion</key>\n\t<string>8J2</string>\n"
+           "\t<key>ProductName</key>\n\t<string>iPhone OS</string>\n"
+           "\t<key>ProductVersion</key>\n\t<string>4.3.3</string>\n"
+           "</dict>", 4, "multiline ios 4.3.3");
     expect("<dict>\n"
            "\t<key>ProductBuildVersion</key>\n\t<string>9B206</string>\n"
            "\t<key>ProductName</key>\n\t<string>iPhone OS</string>\n"
