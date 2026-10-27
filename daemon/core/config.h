@@ -35,8 +35,17 @@ typedef enum {
     VL_PROTO_SHADOWSOCKS,
 /* quic only: no senko transport carries it, the go core's own hysteria client
    does. see transport_for_server and daemon_ctl_apply's CTL_ACT_START */
-    VL_PROTO_HYSTERIA2
+    VL_PROTO_HYSTERIA2,
+/* the aead header only: the id lives in uuid, the body cipher ("auto",
+   "aes-128-gcm", "chacha20-poly1305") in encryption, and a session takes it
+   from user, as it takes the shadowsocks method */
+    VL_PROTO_VMESS
 } vl_proto_t;
+
+/* vless and vmess name their user by uuid; every dial path parses it for both */
+static inline int cfg_proto_uses_uuid(vl_proto_t p) {
+    return p == VL_PROTO_VLESS || p == VL_PROTO_VMESS;
+}
 
 /* fixed storage avoids heap ownership ambiguity on old ios */
 typedef struct {

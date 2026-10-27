@@ -178,6 +178,19 @@ static int append_outbound(json_out_t *j, const vl_server_t *s,
         return j->failed ? -1 : 0;
     }
 
+    if (s->proto == VL_PROTO_VMESS) {
+        append_raw(j, "{\"tag\":\"legacyray-out\",\"protocol\":\"vmess\",\"settings\":{\"vnext\":[{\"address\":");
+        append_string(j, endpoint_ip);
+        append_format(j, ",\"port\":%u,\"users\":[{\"id\":", (unsigned)s->port);
+        append_string(j, s->uuid);
+        append_raw(j, ",\"security\":");
+        append_string(j, s->encryption[0] ? s->encryption : "auto");
+        append_raw(j, "}]}]}");
+        if (append_stream(j, s) != 0) return -1;
+        append_raw(j, "}");
+        return j->failed ? -1 : 0;
+    }
+
     if (s->proto == VL_PROTO_HYSTERIA2) {
 /* the outbound settings only carry the destination: auth and the quic
    transport itself live in streamSettings.hysteriaSettings below */

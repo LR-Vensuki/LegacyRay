@@ -13,6 +13,7 @@
 #include "http_client.h"
 #include "trojan_client.h"
 #include "shadowsocks_client.h"
+#include "vmess_client.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -50,6 +51,7 @@ typedef struct {
         http_client_t        hc;
         trojan_client_t      tc;
         shadowsocks_client_t sc;
+        vmess_client_t       mc;
     } u;
 
     uint8_t client_stage[512];

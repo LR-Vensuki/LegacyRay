@@ -70,11 +70,13 @@ HOST_TESTS += test_loop_route
 HOST_TESTS += test_loop_redial
 HOST_TESTS += test_engine_config
 HOST_TESTS += test_session_upstream
+HOST_TESTS += test_vmess
 
 all: test
 
 test: $(HOST_TESTS)
 	./test_legacyray
+	./test_vmess
 	./test_trojan
 	./test_shadowsocks
 	./test_qr_zbar
@@ -152,7 +154,7 @@ test_pf_table: test_pf_table.c $(DAEMON)/pf_table.c $(DAEMON)/pf_table.h $(CORE)
 LOOP_DEPS = $(DAEMON)/pf_natlook.c $(CORE)/session.c $(CORE)/socks5.c $(NET_SAFE) \
 	      $(CORE)/sniff.c $(CORE)/vless.c $(CORE)/vless_conn.c $(CORE)/socks5_client.c \
 	      $(CORE)/http_client.c $(CORE)/vision.c $(CORE)/transport_tcp.c \
-	      $(CORE)/trojan_client.c $(CORE)/shadowsocks_client.c $(CORE)/reality_crypto.c $(MLKEM768_SRC) \
+	      $(CORE)/trojan_client.c $(CORE)/shadowsocks_client.c $(CORE)/vmess_client.c $(CORE)/reality_crypto.c $(MLKEM768_SRC) \
 	      $(TRACE) $(REPLAY) $(UPLOAD)
 
 test_sniff: test_sniff.c $(CORE)/sniff.c $(CORE)/sniff.h
@@ -171,7 +173,7 @@ test_loop_traffic: test_loop_traffic.c $(DAEMON)/loop.c $(CORE)/session.c
 	      $(CORE)/sniff.c $(DAEMON)/pf_natlook.c $(CORE)/session.c $(CORE)/socks5.c $(NET_SAFE) \
 	      $(CORE)/vless.c $(CORE)/vless_conn.c $(CORE)/socks5_client.c \
 	      $(CORE)/http_client.c $(CORE)/vision.c $(CORE)/transport_tcp.c \
-	      $(CORE)/trojan_client.c $(CORE)/shadowsocks_client.c $(CORE)/reality_crypto.c $(MLKEM768_SRC) \
+	      $(CORE)/trojan_client.c $(CORE)/shadowsocks_client.c $(CORE)/vmess_client.c $(CORE)/reality_crypto.c $(MLKEM768_SRC) \
 	      $(TRACE) $(REPLAY) $(UPLOAD) -o $@ $(TLS_LDFLAGS) $(THREAD_LDFLAGS)
 
 test_go_config: test_go_config.c $(DAEMON)/go_config.c $(CFG_SRC)
@@ -252,29 +254,33 @@ test_storefile: test_storefile.c $(DAEMON)/storefile.c $(DAEMON)/settings.c \
 
 test_session_direct: test_session_direct.c $(CORE)/session.c $(CORE)/socks5.c $(NET_SAFE) \
               $(CORE)/vless.c $(CORE)/vless_conn.c $(CORE)/socks5_client.c $(CORE)/http_client.c $(CORE)/vision.c \
-              $(CORE)/trojan_client.c $(CORE)/shadowsocks_client.c $(CORE)/reality_crypto.c $(MLKEM768_SRC) $(TRACE) $(REPLAY) $(UPLOAD)
+              $(CORE)/trojan_client.c $(CORE)/shadowsocks_client.c $(CORE)/vmess_client.c $(CORE)/reality_crypto.c $(MLKEM768_SRC) $(TRACE) $(REPLAY) $(UPLOAD)
 	$(CC) $(CFLAGS) $(TLS_CFLAGS) test_session_direct.c $(CORE)/session.c \
 	      $(CORE)/socks5.c $(NET_SAFE) $(CORE)/vless.c $(CORE)/vless_conn.c \
 	      $(CORE)/socks5_client.c $(CORE)/http_client.c $(CORE)/vision.c \
-	      $(CORE)/trojan_client.c $(CORE)/shadowsocks_client.c $(CORE)/reality_crypto.c $(MLKEM768_SRC) \
+	      $(CORE)/trojan_client.c $(CORE)/shadowsocks_client.c $(CORE)/vmess_client.c $(CORE)/reality_crypto.c $(MLKEM768_SRC) \
 	      $(TRACE) $(REPLAY) $(UPLOAD) -o $@ $(TLS_LDFLAGS)
 
 test_session_upstream: test_session_upstream.c $(CORE)/session.c $(CORE)/session.h $(CORE)/socks5.c \
               $(NET_SAFE) $(CORE)/vless.c $(CORE)/vless_conn.c $(CORE)/socks5_client.c \
               $(CORE)/http_client.c $(CORE)/vision.c $(CORE)/trojan_client.c \
-              $(CORE)/shadowsocks_client.c $(CORE)/reality_crypto.c $(MLKEM768_SRC) $(CORE)/transport_tcp.c \
+              $(CORE)/shadowsocks_client.c $(CORE)/vmess_client.c $(CORE)/reality_crypto.c $(MLKEM768_SRC) $(CORE)/transport_tcp.c \
               $(TRACE) $(REPLAY) $(UPLOAD)
 	$(CC) $(CFLAGS) $(TLS_CFLAGS) test_session_upstream.c $(CORE)/session.c \
 	      $(CORE)/socks5.c $(NET_SAFE) $(CORE)/vless.c $(CORE)/vless_conn.c \
 	      $(CORE)/socks5_client.c $(CORE)/http_client.c $(CORE)/vision.c \
-	      $(CORE)/trojan_client.c $(CORE)/shadowsocks_client.c $(CORE)/reality_crypto.c $(MLKEM768_SRC) \
+	      $(CORE)/trojan_client.c $(CORE)/shadowsocks_client.c $(CORE)/vmess_client.c $(CORE)/reality_crypto.c $(MLKEM768_SRC) \
 	      $(CORE)/transport_tcp.c $(TRACE) $(REPLAY) $(UPLOAD) -o $@ $(TLS_LDFLAGS)
 
 test_trojan: test_trojan.c $(CORE)/trojan_client.c $(CFG_SRC)
 	$(CC) $(CFLAGS) $(TLS_CFLAGS) test_trojan.c $(CORE)/trojan_client.c $(CFG_SRC) -o $@ $(TLS_LDFLAGS)
 
-test_shadowsocks: test_shadowsocks.c $(CORE)/shadowsocks_client.c $(CORE)/reality_crypto.c $(MLKEM768_SRC) $(CFG_SRC)
-	$(CC) $(CFLAGS) $(TLS_CFLAGS) test_shadowsocks.c $(CORE)/shadowsocks_client.c $(CORE)/reality_crypto.c $(MLKEM768_SRC) $(CFG_SRC) -o $@ $(TLS_LDFLAGS)
+test_vmess: test_vmess.c vmess_fixture.inc vmess_udp_fixture.inc $(CORE)/vmess_client.c $(CORE)/vmess_client.h
+	$(CC) $(CFLAGS) $(TLS_CFLAGS) -I$(CORE) test_vmess.c $(CORE)/vmess_client.c $(CORE)/vless.c $(MLKEM768_SRC) \
+	      -o $@ $(TLS_LDFLAGS)
+
+test_shadowsocks: test_shadowsocks.c $(CORE)/shadowsocks_client.c $(CORE)/vmess_client.c $(CORE)/reality_crypto.c $(MLKEM768_SRC) $(CFG_SRC)
+	$(CC) $(CFLAGS) $(TLS_CFLAGS) test_shadowsocks.c $(CORE)/shadowsocks_client.c $(CORE)/vmess_client.c $(CORE)/reality_crypto.c $(MLKEM768_SRC) $(CFG_SRC) -o $@ $(TLS_LDFLAGS)
 
 test_qr_zbar: test_qr_zbar.c $(ZBAR_SRC)
 	$(CC) $(ZBAR_CFLAGS) $(CFLAGS) test_qr_zbar.c $(ZBAR_SRC) -o $@

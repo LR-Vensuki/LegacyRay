@@ -190,6 +190,20 @@ int main(void) {
         ok("rebuilt vless link reparses", cfg_parse_link(relink, &reparsed) == CFG_OK);
         ok("vless allowInsecure survives the round trip", reparsed.insecure == 1);
 
+        size_t midx = 0;
+        ok("vmess link accepted",
+           store_add_manual(&rt,
+               "vmess://11111111-1111-4111-8111-111111111111@vm.example:443"
+               "?security=tls&type=ws&path=%2Fvm&host=cdn.example&encryption=aes-128-gcm#VM",
+               &midx) == STORE_OK);
+        ok("vmess link rebuilds", store_link_at(&rt, midx, relink, sizeof relink) == 0);
+        memset(&reparsed, 0, sizeof reparsed);
+        ok("rebuilt vmess link reparses", cfg_parse_link(relink, &reparsed) == CFG_OK);
+        ok("vmess survives the round trip", reparsed.proto == VL_PROTO_VMESS &&
+           strcmp(reparsed.encryption, "aes-128-gcm") == 0 &&
+           strcmp(reparsed.user, "aes-128-gcm") == 0 && reparsed.net == VL_NET_WS &&
+           strcmp(reparsed.path, "/vm") == 0 && strcmp(reparsed.remark, "VM") == 0);
+
 /* a link's extra holds the xhttp knobs the server enforces; losing them on
    restart puts the client back on xray's defaults, which that server refuses */
         size_t xidx = 0;

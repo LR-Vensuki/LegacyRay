@@ -93,6 +93,9 @@ int engine_config_supports(const vl_server_t *s) {
         case VL_PROTO_TROJAN:
             if (!s->pass[0] || s->security == VL_SEC_NONE) return 0;
             break;
+        case VL_PROTO_VMESS:
+            if (!s->uuid[0]) return 0;
+            break;
         case VL_PROTO_SHADOWSOCKS:
             return s->security == VL_SEC_NONE && s->net == VL_NET_TCP &&
                    s->pass[0] && ss_cipher_known(s->user);
@@ -116,6 +119,19 @@ int engine_config_supports(const vl_server_t *s) {
     return 1;
 }
 
+/* the engine knows the two aead body ciphers by name. xray runs every other
+   name, "none" and "zero" included, as auto: aes-128-gcm where the cpu has aes
+   instructions, chacha20-poly1305 where it does not, as on armv7 */
+static const char *engine_vmess_cipher(const char *name) {
+    if (strcmp(name, "aes-128-gcm") == 0 || strcmp(name, "chacha20-poly1305") == 0)
+        return name;
+#if defined(__aarch64__) || defined(__x86_64__)
+    return "aes-128-gcm";
+#else
+    return "chacha20-poly1305";
+#endif
+}
+
 static void put_proxy(eout_t *o, const vl_server_t *s) {
     if (s->proto == VL_PROTO_TROJAN) {
         put(o, "{");
@@ -136,6 +152,16 @@ static void put_proxy(eout_t *o, const vl_server_t *s) {
         put_key(o, "cipher", cipher);
         put(o, ",");
         put_key(o, "password", s->pass);
+        put(o, "}");
+        return;
+    }
+    if (s->proto == VL_PROTO_VMESS) {
+        put(o, "{");
+        put_key(o, "type", "vmess");
+        put(o, ",");
+        put_key(o, "cipher", engine_vmess_cipher(s->encryption));
+        put(o, ",");
+        put_key(o, "user_id", s->uuid);
         put(o, "}");
         return;
     }

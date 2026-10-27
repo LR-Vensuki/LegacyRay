@@ -724,12 +724,14 @@ static const char *server_proto_name(const vl_server_t *sv) {
     if (sv->proto == VL_PROTO_TROJAN) return "trojan";
     if (sv->proto == VL_PROTO_SHADOWSOCKS) return "shadowsocks";
     if (sv->proto == VL_PROTO_HYSTERIA2) return "hysteria2";
+    if (sv->proto == VL_PROTO_VMESS) return "vmess";
     return "vless";
 }
 
 static const char *server_net_name(const vl_server_t *sv) {
     if (sv->proto == VL_PROTO_HYSTERIA2) return "quic";
-    if (sv->proto != VL_PROTO_VLESS && sv->proto != VL_PROTO_TROJAN) return "tcp";
+    if (sv->proto != VL_PROTO_VLESS && sv->proto != VL_PROTO_VMESS &&
+        sv->proto != VL_PROTO_TROJAN) return "tcp";
     switch (sv->net) {
         case VL_NET_TCP:   return "tcp";
         case VL_NET_WS:    return "ws";

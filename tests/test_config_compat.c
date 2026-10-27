@@ -153,6 +153,72 @@ int main(void) {
            strcmp(list[0].path, "/svc/TunMulti") == 0);
     }
 
+/* vmess: the v2rayn base64 json body and the xtls share link form */
+#define VM_UUID "11111111-1111-4111-8111-111111111111"
+    ok("v2rayn ws over tls",
+       cfg_parse_link("vmess://eyJ2IjoiMiIsInBzIjoianAgd3MiLCJhZGQiOiJqcC5leGFtcGxlIiwicG9ydCI6IjQ0MyIsImlkIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwiYWlkIjoiMCIsInNjeSI6ImNoYWNoYTIwLXBvbHkxMzA1IiwibmV0Ijoid3MiLCJ0eXBlIjoibm9uZSIsImhvc3QiOiJjZG4uZXhhbXBsZSIsInBhdGgiOiIvdm0iLCJ0bHMiOiJ0bHMiLCJzbmkiOiJzbmkuZXhhbXBsZSIsImZwIjoiY2hyb21lIn0=", &s) == CFG_OK &&
+       cfg_validate_server(&s, reason, sizeof reason) && s.proto == VL_PROTO_VMESS &&
+       strcmp(s.uuid, VM_UUID) == 0 && strcmp(s.encryption, "chacha20-poly1305") == 0 &&
+       strcmp(s.user, "chacha20-poly1305") == 0 && s.net == VL_NET_WS &&
+       strcmp(s.path, "/vm") == 0 && strcmp(s.ws_host, "cdn.example") == 0 &&
+       s.security == VL_SEC_TLS && strcmp(s.sni, "sni.example") == 0 &&
+       strcmp(s.fp, "chrome") == 0 && strcmp(s.remark, "jp ws") == 0);
+    ok("v2rayn numeric port, no cipher, no tls",
+       cfg_parse_link("vmess://eyJ2IjoiMiIsInBzIjoiIiwiYWRkIjoiMTAuMC4wLjEiLCJwb3J0Ijo4MDgwLCJpZCI6IjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMSIsImFpZCI6MCwibmV0IjoidGNwIiwidHlwZSI6Im5vbmUiLCJ0bHMiOiIifQ==#named", &s) == CFG_OK &&
+       cfg_validate_server(&s, reason, sizeof reason) && s.port == 8080 &&
+       s.net == VL_NET_TCP && s.security == VL_SEC_NONE &&
+       strcmp(s.encryption, "auto") == 0 && strcmp(s.remark, "named") == 0);
+    ok("v2rayn grpc multi",
+       cfg_parse_link("vmess://eyJ2IjoiMiIsInBzIjoiZyIsImFkZCI6ImcuZXhhbXBsZSIsInBvcnQiOiI0NDMiLCJpZCI6IjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMSIsIm5ldCI6ImdycGMiLCJ0eXBlIjoibXVsdGkiLCJwYXRoIjoic3ZjIiwidGxzIjoidGxzIn0=", &s) == CFG_OK &&
+       s.net == VL_NET_GRPC && s.grpc_multi && strcmp(s.path, "/svc/TunMulti") == 0);
+    ok("v2rayn tcp http header is refused",
+       cfg_parse_link("vmess://eyJ2IjoiMiIsInBzIjoiaCIsImFkZCI6ImguZXhhbXBsZSIsInBvcnQiOiI4MCIsImlkIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwibmV0IjoidGNwIiwidHlwZSI6Imh0dHAifQ==", &s) != CFG_OK);
+    ok("v2rayn kcp is refused",
+       cfg_parse_link("vmess://eyJ2IjoiMiIsInBzIjoiayIsImFkZCI6ImsuZXhhbXBsZSIsInBvcnQiOiI4MCIsImlkIjoiMTExMTExMTEtMTExMS00MTExLTgxMTEtMTExMTExMTExMTExIiwibmV0Ijoia2NwIn0=", &s) != CFG_OK ||
+       !cfg_validate_server(&s, reason, sizeof reason));
+    ok("v2rayn body without an id",
+       cfg_parse_link("vmess://eyJ2IjoiMiIsInBzIjoibiIsImFkZCI6Im4uZXhhbXBsZSIsInBvcnQiOiI4MCJ9", &s) != CFG_OK);
+    ok("a body that is not base64", cfg_parse_link("vmess://%%%%not-base64%%%%", &s) != CFG_OK);
+    ok("xtls share link form",
+       cfg_parse_link("vmess://" VM_UUID "@example.com:443?encryption=aes-128-gcm&security=tls"
+                      "&type=tcp#r", &s) == CFG_OK &&
+       cfg_validate_server(&s, reason, sizeof reason) &&
+       s.proto == VL_PROTO_VMESS && s.security == VL_SEC_TLS &&
+       strcmp(s.encryption, "aes-128-gcm") == 0 && strcmp(s.user, "aes-128-gcm") == 0 &&
+       strcmp(s.remark, "r") == 0);
+    ok("xtls form without encryption runs auto",
+       cfg_parse_link("vmess://" VM_UUID "@example.com:80?type=ws&path=%2F#w", &s) == CFG_OK &&
+       strcmp(s.encryption, "auto") == 0 && s.net == VL_NET_WS && s.security == VL_SEC_NONE);
+    ok("vmess carries no flow",
+       cfg_parse_link("vmess://" VM_UUID "@example.com:443?security=tls&flow=xtls-rprx-vision#f",
+                      &s) == CFG_OK && !cfg_validate_server(&s, reason, sizeof reason));
+    ok("vmess needs an id", cfg_parse_link("vmess://@example.com:443?security=tls#f", &s) != CFG_OK ||
+       !cfg_validate_server(&s, reason, sizeof reason));
+    {
+        static const char xray[] =
+            "{\"outbounds\":[{\"protocol\":\"vmess\",\"settings\":{\"vnext\":[{"
+            "\"address\":\"a.example\",\"port\":443,\"users\":[{\"id\":\"" VM_UUID "\","
+            "\"alterId\":0,\"security\":\"aes-128-gcm\"}]}]},\"streamSettings\":{"
+            "\"network\":\"ws\",\"security\":\"tls\",\"wsSettings\":{\"path\":\"/p\"}}}]}";
+        static const char singbox[] =
+            "{\"outbounds\":[{\"type\":\"vmess\",\"tag\":\"v\",\"server\":\"b.example\","
+            "\"server_port\":443,\"uuid\":\"" VM_UUID "\",\"security\":\"chacha20-poly1305\","
+            "\"tls\":{\"enabled\":true,\"server_name\":\"b.example\"}}]}";
+        vl_server_t list[2];
+        size_t n = 0;
+        ok("xray vmess vnext",
+           cfg_parse_subscription(xray, strlen(xray), list, 2, &n) == CFG_OK && n == 1 &&
+           list[0].proto == VL_PROTO_VMESS && strcmp(list[0].encryption, "aes-128-gcm") == 0 &&
+           strcmp(list[0].user, "aes-128-gcm") == 0 &&
+           list[0].net == VL_NET_WS && list[0].security == VL_SEC_TLS &&
+           strcmp(list[0].path, "/p") == 0);
+        n = 0;
+        ok("sing-box vmess",
+           cfg_parse_subscription(singbox, strlen(singbox), list, 2, &n) == CFG_OK && n == 1 &&
+           list[0].proto == VL_PROTO_VMESS &&
+           strcmp(list[0].user, "chacha20-poly1305") == 0 && list[0].security == VL_SEC_TLS);
+    }
+
     if (g_fail) {
         fprintf(stderr, "%d check(s) failed\n", g_fail);
         return 1;

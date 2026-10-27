@@ -163,14 +163,21 @@ static int entry_to_server(const prof_entry_t *e, vl_server_t *s) {
     snprintf(s->host, sizeof s->host, "%s", host);
     if (name) snprintf(s->remark, sizeof s->remark, "%s", name);
 
-    if (ci_equal(type, "vless")) {
+    if (ci_equal(type, "vless") || ci_equal(type, "vmess")) {
         const char *uuid = entry_get_any(e, "uuid", "id");
         if (!uuid || !uuid[0]) return -1;
-        s->proto = VL_PROTO_VLESS;
         snprintf(s->uuid, sizeof s->uuid, "%s", uuid);
-        snprintf(s->encryption, sizeof s->encryption, "none");
-        {
+        if (ci_equal(type, "vmess")) {
+/* a session takes the body cipher from user, as the shadowsocks method */
+            const char *cipher = entry_get(e, "cipher");
+            s->proto = VL_PROTO_VMESS;
+            snprintf(s->encryption, sizeof s->encryption, "%s",
+                     cipher && cipher[0] ? cipher : "auto");
+            snprintf(s->user, sizeof s->user, "%s", s->encryption);
+        } else {
             const char *flow = entry_get(e, "flow");
+            s->proto = VL_PROTO_VLESS;
+            snprintf(s->encryption, sizeof s->encryption, "none");
             if (flow) snprintf(s->flow, sizeof s->flow, "%s", flow);
         }
         set_network(s, entry_get(e, "network"));
@@ -288,7 +295,7 @@ static int entry_to_server(const prof_entry_t *e, vl_server_t *s) {
                                          sizeof s->port_hop, NULL);
         }
     } else {
-        return -1; /* vmess has no senko transport */
+        return -1; /* tuic, hysteria v1 and the rest have no client here */
     }
 
     finish_server(s);

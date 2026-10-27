@@ -1,6 +1,6 @@
 # LegacyRay
 
-Клиент VLESS / Trojan / Shadowsocks / SOCKS / AmneziaWG / WireGuard для всего
+Клиент VLESS / VMess / Trojan / Shadowsocks / SOCKS / AmneziaWG / WireGuard для всего
 устройства на **iOS 4.0 – 7.x** (джейлбрейк, armv7). На iOS 4–6 — интерфейс
 в духе самих приложений Apple для iOS 6: панели из чёрного денима с медной
 строчкой (как на иконке), одна большая кнопка и стандартные таблицы iOS 6;

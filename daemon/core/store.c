@@ -810,7 +810,8 @@ static int build_link(const vl_server_t *s, char *buf, size_t cap) {
         return (int)off;
     }
 
-    int n = snprintf(buf, cap, "vless://%s@%s:%u?security=%s&type=%s",
+    int n = snprintf(buf, cap, "%s://%s@%s:%u?security=%s&type=%s",
+                     s->proto == VL_PROTO_VMESS ? "vmess" : "vless",
                      s->uuid, s->host, s->port,
                      security_name(s->security), net_name(s->net));
     if (n < 0 || (size_t)n >= cap) return -1;
@@ -825,6 +826,7 @@ static int build_link(const vl_server_t *s, char *buf, size_t cap) {
         { "sid",  s->sid  },
         { "path", s->path },
         { "mode", s->mode },
+        { "encryption", s->proto == VL_PROTO_VMESS ? s->encryption : "" },
     };
     for (size_t i = 0; i < sizeof opt / sizeof opt[0]; ++i) {
         if (!opt[i].val[0]) continue;

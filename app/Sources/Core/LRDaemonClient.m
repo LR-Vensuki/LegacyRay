@@ -450,7 +450,7 @@ static NSString *LRKickFailureText(int status, pid_t reaped) {
 
 static BOOL LRTokenIsProto(NSString *s) {
     static NSSet *set = nil;
-    if (!set) set = [[NSSet alloc] initWithObjects:@"vless", @"socks5", @"http", @"https",
+    if (!set) set = [[NSSet alloc] initWithObjects:@"vless", @"vmess", @"socks5", @"http", @"https",
                      @"trojan", @"shadowsocks", @"ss", @"hysteria2", nil];
     return [set containsObject:s];
 }

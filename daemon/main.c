@@ -111,7 +111,7 @@ static int run_single(const char *link, int port) {
 
     uint8_t uuid[VLESS_UUID_LEN];
     memset(uuid, 0, sizeof uuid);
-    if (srv.proto == VL_PROTO_VLESS) {
+    if (cfg_proto_uses_uuid(srv.proto)) {
         if (vless_uuid_parse(srv.uuid, uuid) != VLESS_OK) {
             fprintf(stderr, "bad uuid in link\n");
             return 2;

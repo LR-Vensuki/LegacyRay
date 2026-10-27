@@ -146,17 +146,30 @@ int cfg_validate_server(const vl_server_t *s, char *reason, size_t reason_cap) {
         return 1;
     }
 
-    if (s->proto != VL_PROTO_VLESS) {
+/* vmess shares every transport and security vless has; only the id, the
+   body cipher and the absence of flow differ. xray runs a cipher name it does
+   not know as auto, so the name is not checked here either */
+    if (s->proto == VL_PROTO_VMESS) {
+        if (!uuid_text_ok(s->uuid)) {
+            cfg_reason(reason, reason_cap, "invalid uuid");
+            return 0;
+        }
+        if (s->flow[0]) {
+            cfg_reason(reason, reason_cap, "vmess does not use flow");
+            return 0;
+        }
+    } else if (s->proto != VL_PROTO_VLESS) {
         cfg_reason(reason, reason_cap, "unsupported protocol");
         return 0;
-    }
-    if (!uuid_text_ok(s->uuid)) {
-        cfg_reason(reason, reason_cap, "invalid uuid");
-        return 0;
-    }
-    if (s->encryption[0] && strcmp(s->encryption, "none") != 0) {
-        cfg_reason(reason, reason_cap, "unsupported encryption");
-        return 0;
+    } else {
+        if (!uuid_text_ok(s->uuid)) {
+            cfg_reason(reason, reason_cap, "invalid uuid");
+            return 0;
+        }
+        if (s->encryption[0] && strcmp(s->encryption, "none") != 0) {
+            cfg_reason(reason, reason_cap, "unsupported encryption");
+            return 0;
+        }
     }
     if (s->net != VL_NET_TCP && s->net != VL_NET_WS &&
         s->net != VL_NET_GRPC && s->net != VL_NET_XHTTP) {
@@ -660,6 +673,140 @@ static void normalize_grpc_path(vl_server_t *s) {
    riding the C stack down. */
 #define CFG_PARSE_LINK_MAX_DEPTH 8
 
+static int jstr_copy(const cJSON *obj, const char *key, char *dst, size_t cap);
+static int j_port(const cJSON *obj, const char *key, uint16_t *out);
+static int json_flag_on(const cJSON *obj, const char *key);
+
+/* query-safe copy of a json field into the rebuilt link */
+static int put_link_param(char *dst, size_t cap, size_t *off, const char *key,
+                          const char *val) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t o = *off;
+    int n;
+    if (!val || !val[0]) return 0;
+    n = snprintf(dst + o, cap - o, "%s%s=", strchr(dst, '?') ? "&" : "?", key);
+    if (n < 0 || (size_t)n >= cap - o) return -1;
+    o += (size_t)n;
+    for (const unsigned char *p = (const unsigned char *)val; *p; ++p) {
+        int plain = (*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') ||
+                    (*p >= '0' && *p <= '9') || *p == '-' || *p == '.' ||
+                    *p == '_' || *p == '~';
+        if (o + (plain ? 1 : 3) >= cap) return -1;
+        if (plain) {
+            dst[o++] = (char)*p;
+        } else {
+            dst[o++] = '%';
+            dst[o++] = hex[*p >> 4];
+            dst[o++] = hex[*p & 0xf];
+        }
+    }
+    dst[o] = '\0';
+    *off = o;
+    return 0;
+}
+
+/* the v2rayn body of a vmess:// link: base64 of a flat json object. it is
+   rebuilt as the xtls share link form and parsed as that. "type" is the tcp
+   header, the grpc mode or the xhttp mode depending on net */
+static cfg_status_t vmess_json_to_link(const char *body, size_t len,
+                                       char *link, size_t cap) {
+    unsigned char plain[4096];
+    size_t n = 0, off;
+    char id[64] = "", add[256] = "", net[24] = "", type[24] = "", tls[24] = "";
+    char host[256] = "", path[256] = "", sni[256] = "", fp[32] = "", pbk[128] = "";
+    char sid[32] = "", mode[24] = "", scy[32] = "", ps[256] = "";
+    uint16_t port = 0;
+    int insecure;
+    cJSON *root;
+
+    if (b64_decode(body, len, plain, sizeof plain - 1, &n) != 0 || n == 0)
+        return CFG_ERR_NO_AT;
+    root = cJSON_ParseWithLength((const char *)plain, n);
+    if (!cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return CFG_ERR_NO_AT;
+    }
+    (void)jstr_copy(root, "add", add, sizeof add);
+    (void)jstr_copy(root, "id", id, sizeof id);
+    if (j_port(root, "port", &port) != 0) port = 0;
+    (void)jstr_copy(root, "scy", scy, sizeof scy);
+    (void)jstr_copy(root, "ps", ps, sizeof ps);
+    (void)jstr_copy(root, "net", net, sizeof net);
+    (void)jstr_copy(root, "type", type, sizeof type);
+    (void)jstr_copy(root, "tls", tls, sizeof tls);
+    (void)jstr_copy(root, "host", host, sizeof host);
+    (void)jstr_copy(root, "path", path, sizeof path);
+    (void)jstr_copy(root, "sni", sni, sizeof sni);
+    (void)jstr_copy(root, "fp", fp, sizeof fp);
+    (void)jstr_copy(root, "pbk", pbk, sizeof pbk);
+    (void)jstr_copy(root, "sid", sid, sizeof sid);
+    (void)jstr_copy(root, "mode", mode, sizeof mode);
+    insecure = json_flag_on(root, "allowInsecure") || json_flag_on(root, "insecure");
+    {
+        const cJSON *ai = cJSON_GetObjectItemCaseSensitive(root, "allowInsecure");
+        if (cJSON_IsString(ai) && ai->valuestring &&
+            (strcmp(ai->valuestring, "1") == 0 || strcmp(ai->valuestring, "true") == 0))
+            insecure = 1;
+    }
+    cJSON_Delete(root);
+
+    if (!add[0]) return CFG_ERR_NO_HOST;
+    if (!port) return CFG_ERR_BAD_PORT;
+    if (!id[0]) return CFG_ERR_NO_AT;
+    if (!net[0]) snprintf(net, sizeof net, "tcp");
+/* tcp with the http header obfuscation is a different wire format */
+    if ((strcmp(net, "tcp") == 0 || strcmp(net, "raw") == 0) && type[0] &&
+        strcmp(type, "none") != 0)
+        return CFG_ERR_SCHEME;
+    if (strcmp(net, "grpc") == 0 && strcmp(type, "multi") == 0)
+        snprintf(mode, sizeof mode, "multi");
+    if ((strcmp(net, "xhttp") == 0 || strcmp(net, "splithttp") == 0) && !mode[0] &&
+        type[0] && strcmp(type, "none") != 0)
+        snprintf(mode, sizeof mode, "%s", type);
+    /* a host header only means something on the transports that send one */
+    if (strcmp(net, "ws") != 0 && strcmp(net, "xhttp") != 0 &&
+        strcmp(net, "splithttp") != 0 && strcmp(net, "http") != 0 && strcmp(net, "h2") != 0)
+        host[0] = '\0';
+
+    {
+        int w = strchr(add, ':') ? snprintf(link, cap, "vmess://%s@[%s]:%u", id, add, port)
+                                 : snprintf(link, cap, "vmess://%s@%s:%u", id, add, port);
+        if (w < 0 || (size_t)w >= cap) return CFG_ERR_TOO_LONG;
+        off = (size_t)w;
+    }
+    if (put_link_param(link, cap, &off, "type", net) != 0 ||
+        put_link_param(link, cap, &off, "security",
+                       strcmp(tls, "tls") == 0 || strcmp(tls, "reality") == 0 ? tls : "none") != 0 ||
+        put_link_param(link, cap, &off, "encryption", scy[0] ? scy : "auto") != 0 ||
+        put_link_param(link, cap, &off, "host", host) != 0 ||
+        put_link_param(link, cap, &off, strcmp(net, "grpc") == 0 ? "serviceName" : "path",
+                       path) != 0 ||
+        put_link_param(link, cap, &off, "sni", sni) != 0 ||
+        put_link_param(link, cap, &off, "fp", fp) != 0 ||
+        put_link_param(link, cap, &off, "pbk", pbk) != 0 ||
+        put_link_param(link, cap, &off, "sid", sid) != 0 ||
+        put_link_param(link, cap, &off, "mode", mode) != 0 ||
+        put_link_param(link, cap, &off, "allowInsecure", insecure ? "1" : "") != 0)
+        return CFG_ERR_TOO_LONG;
+    if (ps[0]) {
+        size_t before = off;
+        if (put_link_param(link, cap, &off, "x", ps) != 0) return CFG_ERR_TOO_LONG;
+/* the remark goes in the fragment: reuse the encoder, then turn "?x=" or
+   "&x=" into "#" */
+        memmove(link + before + 1, link + before + 3, off - before - 3 + 1);
+        link[before] = '#';
+    }
+    return CFG_OK;
+}
+
+/* sessions take the vmess body cipher from user, as they take the shadowsocks
+   method; "none" and "zero" are gone from xray and run as auto there too */
+static void vmess_finish(vl_server_t *s) {
+    if (!s->encryption[0] || strcmp(s->encryption, "unsupported") == 0)
+        snprintf(s->encryption, sizeof s->encryption, "auto");
+    snprintf(s->user, sizeof s->user, "%s", s->encryption);
+}
+
 static cfg_status_t cfg_parse_link_inner(const char *uri, vl_server_t *out, int depth) {
     if (!uri || !out) return CFG_ERR_BAD_ARG;
     memset(out, 0, sizeof *out);
@@ -710,6 +857,23 @@ static cfg_status_t cfg_parse_link_inner(const char *uri, vl_server_t *out, int 
     } else if (strncmp(p, "https://", 8) == 0) {
         proto = VL_PROTO_HTTPS;
         slen = 8;
+    } else if (strncmp(p, "vmess://", 8) == 0) {
+        proto = VL_PROTO_VMESS;
+        slen = 8;
+/* v2rayn writes vmess as base64 json; the xtls share link form has an '@'
+   in the authority and takes the vless path below */
+        const char *body = p + 8;
+        size_t end = strcspn(body, "#?");
+        if (!memchr(body, '@', end)) {
+            char link[2048];
+            const char *hash = strchr(body, '#');
+            cfg_status_t st = vmess_json_to_link(body, end, link, sizeof link);
+            if (st != CFG_OK) return st;
+            st = cfg_parse_link_inner(link, out, depth + 1);
+            if (st == CFG_OK && !out->remark[0] && hash && hash[1])
+                copy_remark(hash + 1, strlen(hash + 1), out->remark, sizeof out->remark);
+            return st;
+        }
     } else if (strncmp(p, "trojan://", 9) == 0) {
         proto = VL_PROTO_TROJAN;
         slen = 9;
@@ -750,8 +914,11 @@ static cfg_status_t cfg_parse_link_inner(const char *uri, vl_server_t *out, int 
 
     const char *at = memchr(p, '@', (size_t)(body_end - p));
     if (at) {
-        if (proto == VL_PROTO_VLESS) {
-            if (copy_span(p, at, out->uuid, sizeof out->uuid) != 0) return CFG_ERR_TOO_LONG;
+        if (proto == VL_PROTO_VLESS || proto == VL_PROTO_VMESS) {
+            char enc_id[sizeof out->uuid];
+            if (copy_span(p, at, enc_id, sizeof enc_id) != 0 ||
+                url_percent_decode(enc_id, strlen(enc_id), out->uuid, sizeof out->uuid) < 0)
+                return CFG_ERR_TOO_LONG;
         } else if (proto == VL_PROTO_TROJAN || proto == VL_PROTO_HYSTERIA2) {
 /* the whole userinfo is one opaque auth token, not a user:pass pair: a
    hysteria2 password commonly contains a colon of its own */
@@ -806,7 +973,7 @@ static cfg_status_t cfg_parse_link_inner(const char *uri, vl_server_t *out, int 
         }
         p = at + 1;
     } else {
-        if (proto == VL_PROTO_VLESS || proto == VL_PROTO_TROJAN ||
+        if (proto == VL_PROTO_VLESS || proto == VL_PROTO_VMESS || proto == VL_PROTO_TROJAN ||
             proto == VL_PROTO_SHADOWSOCKS || proto == VL_PROTO_HYSTERIA2)
             return CFG_ERR_NO_AT;
     }
@@ -890,6 +1057,8 @@ static cfg_status_t cfg_parse_link_inner(const char *uri, vl_server_t *out, int 
         if (out->security == VL_SEC_UNKNOWN) out->security = VL_SEC_NONE;
         if (out->net == VL_NET_UNKNOWN) out->net = VL_NET_TCP;
         if (!out->user[0]) snprintf(out->user, sizeof out->user, "chacha20-ietf-poly1305");
+    } else if (out->proto == VL_PROTO_VMESS) {
+        vmess_finish(out);
     }
 
     if (frag) copy_remark(frag + 1, strlen(frag + 1), out->remark, sizeof out->remark);
@@ -937,6 +1106,7 @@ static void parse_link_lines(const char *text, size_t len,
    more often than it is a CONNECT proxy */
 static int embedded_link_start(const char *p) {
     return strncmp(p, "vless://", 8) == 0 ||
+           strncmp(p, "vmess://", 8) == 0 ||
            strncmp(p, "socks5://", 9) == 0 ||
            strncmp(p, "happ://", 7) == 0 ||
            strncmp(p, "HAPP://", 7) == 0 ||
@@ -1160,6 +1330,7 @@ static int json_server_finish(vl_server_t *s, const cJSON *ob,
     (void)multi;
 
     normalize_grpc_path(s);
+    if (s->proto == VL_PROTO_VMESS) vmess_finish(s);
 
     if (s->sni[0] == '\0' &&
         (s->security == VL_SEC_TLS || s->security == VL_SEC_REALITY))
@@ -1309,8 +1480,9 @@ static int xray_outbound_to_server(const cJSON *ob, const char *remarks,
     if (strcmp(protocol_name, "hysteria") == 0)
         return xray_hysteria_to_server(ob, settings, remarks, multi, s);
 
-    if (strcmp(protocol_name, "vless") != 0) return -1;
-    s->proto = VL_PROTO_VLESS;
+    if (strcmp(protocol_name, "vless") != 0 && strcmp(protocol_name, "vmess") != 0)
+        return -1;
+    s->proto = protocol_name[1] == 'm' ? VL_PROTO_VMESS : VL_PROTO_VLESS;
 
     vnext = cJSON_GetObjectItemCaseSensitive(settings, "vnext");
     if (!cJSON_IsArray(vnext) || cJSON_GetArraySize(vnext) < 1) return -1;
@@ -1325,9 +1497,13 @@ static int xray_outbound_to_server(const cJSON *ob, const char *remarks,
     user = cJSON_GetArrayItem(user, 0);
     if (!cJSON_IsObject(user)) return -1;
     if (jstr_copy(user, "id", s->uuid, sizeof s->uuid) != 0) return -1;
-    (void)jstr_copy(user, "flow", s->flow, sizeof s->flow);
-    if (jstr_copy(user, "encryption", s->encryption, sizeof s->encryption) != 0)
-        snprintf(s->encryption, sizeof s->encryption, "%s", "none");
+    if (s->proto == VL_PROTO_VMESS) {
+        (void)jstr_copy(user, "security", s->encryption, sizeof s->encryption);
+    } else {
+        (void)jstr_copy(user, "flow", s->flow, sizeof s->flow);
+        if (jstr_copy(user, "encryption", s->encryption, sizeof s->encryption) != 0)
+            snprintf(s->encryption, sizeof s->encryption, "%s", "none");
+    }
 
     stream = cJSON_GetObjectItemCaseSensitive(ob, "streamSettings");
     if (cJSON_IsObject(stream)) {
@@ -1481,17 +1657,22 @@ static int singbox_outbound_to_server(const cJSON *ob, const char *remarks,
         return singbox_hysteria2_to_server(ob, remarks, multi, s);
     }
 
-    if (strcmp(type_name, "vless") != 0) return -1;
+    if (strcmp(type_name, "vless") != 0 && strcmp(type_name, "vmess") != 0) return -1;
 
     memset(s, 0, sizeof *s);
-    s->proto = VL_PROTO_VLESS;
+    s->proto = type_name[1] == 'm' ? VL_PROTO_VMESS : VL_PROTO_VLESS;
 
     if (jstr_copy(ob, "server", s->host, sizeof s->host) != 0) return -1;
     if (j_port(ob, "server_port", &s->port) != 0) return -1;
     if (jstr_copy(ob, "uuid", s->uuid, sizeof s->uuid) != 0) return -1;
-    (void)jstr_copy(ob, "flow", s->flow, sizeof s->flow);
-/* sing-box has no per-user encryption field: vless over it is always none */
-    snprintf(s->encryption, sizeof s->encryption, "%s", "none");
+    if (s->proto == VL_PROTO_VLESS)
+        (void)jstr_copy(ob, "flow", s->flow, sizeof s->flow);
+/* sing-box has no per-user encryption field: vless over it is always none.
+   vmess names its body cipher "security" */
+    if (s->proto == VL_PROTO_VMESS)
+        (void)jstr_copy(ob, "security", s->encryption, sizeof s->encryption);
+    else
+        snprintf(s->encryption, sizeof s->encryption, "%s", "none");
 
     transport = cJSON_GetObjectItemCaseSensitive(ob, "transport");
     if (cJSON_IsObject(transport)) {

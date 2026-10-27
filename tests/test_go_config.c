@@ -84,6 +84,13 @@ int main(int argc, char **argv) {
     assert(strstr(json, "\"grpcSettings\":{\"serviceName\":\"senko\",\"multiMode\":true}") != NULL);
     cJSON_Delete(root);
 
+    root = render(
+        "vmess://11111111-1111-4111-8111-111111111111@example.com:443"
+        "?type=ws&security=tls&path=%2Fvm&encryption=chacha20-poly1305", json, sizeof json);
+    assert(strstr(json, "\"protocol\":\"vmess\"") != NULL);
+    assert(strstr(json, "\"security\":\"chacha20-poly1305\"") != NULL);
+    cJSON_Delete(root);
+
     root = render("socks5://user:p%40ss@example.com:1080#proxy", json, sizeof json);
     assert(strstr(json, "\"protocol\":\"socks\"") != NULL);
     assert(strstr(json, "\"pass\":\"p@ss\"") != NULL);

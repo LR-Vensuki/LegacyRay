@@ -223,6 +223,25 @@ static size_t push_app(session_t *s, const uint8_t *buf, size_t len) {
         s->to_remote_hold += took;
         return took;
     }
+    if (s->proto == VL_PROTO_VMESS) {
+        enum { overhead = 2 + 16 + 63 };
+        if (len == 0) return 0;
+        size_t free_rm = sizeof s->to_remote - s->to_remote_len;
+        if (free_rm <= overhead) return 0;
+        size_t content = free_rm - overhead;
+        if (content > VMESS_CHUNK_PAYLOAD_MAX) content = VMESS_CHUNK_PAYLOAD_MAX;
+        if (content > len) content = len;
+        uint8_t enc[VMESS_CHUNK_PAYLOAD_MAX + overhead];
+        size_t enc_len = 0;
+        if (vmess_client_encrypt_chunk(&s->u.mc, buf, content, enc, sizeof enc,
+                                       &enc_len) != VMESS_OK) {
+            s->state = SESS_ERROR;
+            return 0;
+        }
+        if (push_remote(s, enc, enc_len) == 0) return 0;
+        s->trace_app_tx += (uint64_t)content;
+        return content;
+    }
     if (s->proto == VL_PROTO_SHADOWSOCKS) {
         if (len == 0) return 0;
         size_t free_rm = sizeof s->to_remote - s->to_remote_len;
@@ -370,6 +389,11 @@ sess_status_t session_init(session_t *s,
         trojan_client_init(&s->u.tc, pass, &(vless_dest_t){0});
     } else if (proto == VL_PROTO_SHADOWSOCKS) {
         ss_client_init(&s->u.sc, user, pass, &(vless_dest_t){0});
+    } else if (proto == VL_PROTO_VMESS) {
+/* user carries the body cipher, as it carries the shadowsocks method */
+        if (!uuid || vmess_client_init(&s->u.mc, uuid, user, &(vless_dest_t){0},
+                                       NULL) != VMESS_OK)
+            return SESS_ERR_ARG;
     }
     return SESS_OK;
 }
@@ -520,6 +544,25 @@ static sess_status_t begin_upstream_dest(session_t *s, const vless_dest_t *dest,
         payload_used = payload_len;
         s->state = SESS_RELAY;
 /* shadowsocks has no distinct response header, so ack the local socks client now */
+        queue_socks_reply(s, SOCKS5_REP_OK);
+    } else if (s->proto == VL_PROTO_VMESS) {
+        session_set_trace_host(s, dest);
+        s->u.mc.dest = *dest;
+
+        uint8_t req[VMESS_REQUEST_MAX + sizeof s->client_stage + 2 + 16 + 63];
+        size_t reqlen = 0;
+        if (vmess_client_build_request(&s->u.mc, payload, payload_len, req, sizeof req,
+                                       &reqlen) != VMESS_OK) {
+            s->state = SESS_ERROR;
+            return SESS_ERR;
+        }
+
+        push_remote(s, req, reqlen);
+        if (s->state == SESS_ERROR) return SESS_ERR;
+        payload_used = payload_len;
+        s->state = SESS_RELAY;
+/* the vmess response header rides with the first reply bytes, which never come
+   for a client that waits to be spoken to, so ack the local socks client now */
         queue_socks_reply(s, SOCKS5_REP_OK);
     } else {
         s->state = SESS_ERROR;
@@ -819,6 +862,40 @@ sess_status_t session_pump_remote(session_t *s) {
             continue;
         }
 
+        if (s->proto == VL_PROTO_VMESS) {
+            const uint8_t *feed = tmp;
+            size_t feed_len = (size_t)n;
+/* session_remote_room keeps every whole chunk staged here openable into the
+   client queue, as for shadowsocks */
+            for (;;) {
+                uint8_t plain[16384];
+                size_t room_c = sizeof s->to_client - s->to_client_len;
+                size_t plain_len = 0;
+                int fr = vmess_client_feed_downstream(&s->u.mc, feed, feed_len, plain,
+                                                      room_c < sizeof plain ? room_c : sizeof plain,
+                                                      &plain_len);
+                feed = NULL;
+                feed_len = 0;
+                if (plain_len > 0) {
+                    deliver_client(s, plain, plain_len);
+                    if (s->state == SESS_ERROR) return SESS_ERR;
+                }
+/* the server's end chunk is its eof */
+                if (fr == VMESS_EOF) {
+                    s->state = SESS_CLOSED;
+                    return SESS_OK;
+                }
+                if (fr != VMESS_OK && fr != VMESS_NEED_MORE) {
+                    fprintf(stderr, "legacyrayd: vmess response failed rc=%d\n", fr);
+                    fail_pending_socks(s);
+                    s->state = SESS_ERROR;
+                    return SESS_ERR;
+                }
+                if (plain_len == 0) break;
+            }
+            continue;
+        }
+
         deliver_client(s, tmp, (size_t)n);
         if (s->state == SESS_ERROR) return SESS_ERR;
     }
@@ -844,6 +921,13 @@ size_t session_remote_room(const session_t *s) {
    fit the client queue, or the tail of a download is dropped */
     if (s->proto == VL_PROTO_SHADOWSOCKS)
         room = s->u.sc.dec_stage_len < room ? room - s->u.sc.dec_stage_len : 0;
+/* the same for vmess, whose stage also must take the whole read */
+    if (s->proto == VL_PROTO_VMESS) {
+        size_t staged = s->u.mc.dec_stage_len;
+        size_t stage_room = sizeof s->u.mc.dec_stage - staged;
+        room = staged < room ? room - staged : 0;
+        if (room > stage_room) room = stage_room;
+    }
     return room;
 }
 

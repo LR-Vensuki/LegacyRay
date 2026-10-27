@@ -396,7 +396,7 @@ int daemon_ctl_apply(void *ctx, const ctl_action_t *action) {
 
             uint8_t uuid[VLESS_UUID_LEN];
             memset(uuid, 0, sizeof uuid);
-            if (s->proto == VL_PROTO_VLESS) {
+            if (cfg_proto_uses_uuid(s->proto)) {
                 if (vless_uuid_parse(s->uuid, uuid) != VLESS_OK) {
                     fprintf(stderr, "legacyrayd: bad uuid in server link\n");
                     status_set(0);
@@ -1984,7 +1984,7 @@ static int prepare_server_probe(daemon_ctl_t *d, const vl_server_t *server,
 
     uint8_t uuid[VLESS_UUID_LEN];
     memset(uuid, 0, sizeof uuid);
-    if (server->proto == VL_PROTO_VLESS &&
+    if (cfg_proto_uses_uuid(server->proto) &&
         vless_uuid_parse(server->uuid, uuid) != VLESS_OK) {
         if (reason && reason_cap)
             snprintf(reason, reason_cap, "profile has an invalid UUID");

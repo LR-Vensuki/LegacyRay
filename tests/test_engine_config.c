@@ -220,6 +220,30 @@ int main(int argc, char **argv) {
     assert(strcmp(str(p, "password"), "pa\"ss\\word") == 0);
     cJSON_Delete(root);
 
+    /* vmess over ws and tls; auto is the cipher the cpu runs fastest */
+    root = render("vmess://11111111-1111-4111-8111-111111111111@example.com:443"
+                  "?security=tls&type=ws&path=%2Fvm&encryption=aes-128-gcm", "203.0.113.7",
+                  json, sizeof json);
+    p = inner(chain_of(root));
+    assert(strcmp(str(p, "type"), "tls") == 0);
+    p = inner(p);
+    assert(strcmp(str(p, "type"), "websocket") == 0);
+    p = inner(p);
+    assert(strcmp(str(p, "type"), "vmess") == 0);
+    assert(strcmp(str(p, "cipher"), "aes-128-gcm") == 0);
+    assert(strcmp(str(p, "user_id"), "11111111-1111-4111-8111-111111111111") == 0);
+    cJSON_Delete(root);
+    root = render("vmess://11111111-1111-4111-8111-111111111111@example.com:80?type=tcp",
+                  "203.0.113.7", json, sizeof json);
+    p = inner(chain_of(root));
+    assert(strcmp(str(p, "type"), "vmess") == 0);
+#if defined(__aarch64__) || defined(__x86_64__)
+    assert(strcmp(str(p, "cipher"), "aes-128-gcm") == 0);
+#else
+    assert(strcmp(str(p, "cipher"), "chacha20-poly1305") == 0);
+#endif
+    cJSON_Delete(root);
+
     /* shadowsocks, both link forms; xray's 2022 chacha name becomes the engine's */
     root = render("ss://YWVzLTI1Ni1nY206c2VjcmV0@example.com:8388#ss", "203.0.113.7",
                   json, sizeof json);

@@ -83,7 +83,8 @@ static NSString *LRFlagCodeInText(NSString *text, NSRange *outRange) {
         ![_security isEqualToString:@"unknown"] && ![proto isEqualToString:@"SHADOWSOCKS"])
         [parts addObject:[_security uppercaseString]];
     if ([_net length] && ![_net isEqualToString:@"tcp"] &&
-        ([proto isEqualToString:@"VLESS"] || [proto isEqualToString:@"TROJAN"]))
+        ([proto isEqualToString:@"VLESS"] || [proto isEqualToString:@"VMESS"] ||
+         [proto isEqualToString:@"TROJAN"]))
         [parts addObject:[_net uppercaseString]];
     return [parts componentsJoinedByString:@" · "];
 }

@@ -217,7 +217,7 @@ loop_status_t loop_init(loop_t *lp, uint16_t listen_port, int bind_public,
                         const uint8_t uuid[VLESS_UUID_LEN], const char *flow,
                         const char *user, const char *pass) {
     if (!lp || !vt || !dial) return LOOP_ERR_ARG;
-    if (proto == VL_PROTO_VLESS && !uuid) return LOOP_ERR_ARG;
+    if (cfg_proto_uses_uuid(proto) && !uuid) return LOOP_ERR_ARG;
     memset(lp, 0, sizeof *lp);
     lp->listen_fd = -1;
     lp->tproxy_fd = -1;
@@ -619,7 +619,7 @@ static void reap_opening_conns(loop_t *lp) {
             ir = session_restart_upstream(&c->sess, th);
         } else if (c->transparent) {
             ir = session_init(&c->sess, c->open_vt, th, c->open_proto,
-                              c->open_proto == VL_PROTO_VLESS ? c->open_uuid : NULL,
+                              cfg_proto_uses_uuid(c->open_proto) ? c->open_uuid : NULL,
                               c->open_flow[0] ? c->open_flow : NULL,
                               c->open_user[0] ? c->open_user : NULL,
                               c->open_pass[0] ? c->open_pass : NULL);
@@ -634,13 +634,13 @@ static void reap_opening_conns(loop_t *lp) {
             }
         } else if (c->socks_greet_done) {
             ir = session_init_after_greet(&c->sess, c->open_vt, th, c->open_proto,
-                                          c->open_proto == VL_PROTO_VLESS ? c->open_uuid : NULL,
+                                          cfg_proto_uses_uuid(c->open_proto) ? c->open_uuid : NULL,
                                           c->open_flow[0] ? c->open_flow : NULL,
                                           c->open_user[0] ? c->open_user : NULL,
                                           c->open_pass[0] ? c->open_pass : NULL);
         } else {
             ir = session_init(&c->sess, c->open_vt, th, c->open_proto,
-                              c->open_proto == VL_PROTO_VLESS ? c->open_uuid : NULL,
+                              cfg_proto_uses_uuid(c->open_proto) ? c->open_uuid : NULL,
                               c->open_flow[0] ? c->open_flow : NULL,
                               c->open_user[0] ? c->open_user : NULL,
                               c->open_pass[0] ? c->open_pass : NULL);
@@ -689,7 +689,7 @@ loop_status_t loop_set_server(loop_t *lp, const transport_vt_t *vt,
                               const char *xhttp_mode, const char *peer_host,
                               int insecure) {
     if (!lp || !vt || !dial) return LOOP_ERR_ARG;
-    if (proto == VL_PROTO_VLESS && !uuid) return LOOP_ERR_ARG;
+    if (cfg_proto_uses_uuid(proto) && !uuid) return LOOP_ERR_ARG;
 
     /* drop connections before switching servers */
     drop_all_conns(lp);

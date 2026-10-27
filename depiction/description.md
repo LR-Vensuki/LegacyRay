@@ -1,4 +1,4 @@
-VPN-клиент для всего устройства на **iOS 4.0 – 7.x**: VLESS, Trojan, Shadowsocks, SOCKS, AmneziaWG и WireGuard. На iOS 4–6 интерфейс нарисован так, как Apple рисовала iOS 6; на iOS 7 он родной плоский. На iPad — раскладка split view.
+VPN-клиент для всего устройства на **iOS 4.0 – 7.x**: VLESS, VMess, Trojan, Shadowsocks, SOCKS, AmneziaWG и WireGuard. На iOS 4–6 интерфейс нарисован так, как Apple рисовала iOS 6; на iOS 7 он родной плоский. На iPad — раскладка split view.
 
 LegacyRay — форк [senko](https://github.com/sqmrak/senko) от sqmrak (GPL-2.0): сетевое ядро и демон взяты из senko и доработаны, интерфейс написан заново.
 
