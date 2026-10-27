@@ -126,6 +126,33 @@ int main(void) {
            ((unsigned char)a.remark[strlen(a.remark) - 1] & 0xC0) == 0x80);
     }
 
+/* multiMode servers register TunMulti, not Tun */
+    ok("parse grpc multi",
+       cfg_parse_link("vless://11111111-1111-4111-8111-111111111111@1.2.3.4:443"
+                      "?security=tls&type=grpc&serviceName=svc&mode=multi#g", &s) == CFG_OK);
+    ok("grpc multi path", strcmp(s.path, "/svc/TunMulti") == 0 && s.grpc_multi);
+    ok("parse grpc gun",
+       cfg_parse_link("vless://11111111-1111-4111-8111-111111111111@1.2.3.4:443"
+                      "?security=tls&type=grpc&serviceName=svc&mode=gun#g", &s) == CFG_OK);
+    ok("grpc gun path", strcmp(s.path, "/svc/Tun") == 0 && !s.grpc_multi);
+    ok("parse grpc saved multi path",
+       cfg_parse_link("vless://11111111-1111-4111-8111-111111111111@1.2.3.4:443"
+                      "?security=tls&type=grpc&serviceName=%2Fsvc%2FTunMulti#g", &s) == CFG_OK);
+    ok("a path that names the stream is kept", strcmp(s.path, "/svc/TunMulti") == 0);
+    {
+        static const char xray[] =
+            "{\"outbounds\":[{\"protocol\":\"vless\",\"settings\":{\"vnext\":[{"
+            "\"address\":\"1.2.3.4\",\"port\":443,\"users\":[{\"id\":"
+            "\"11111111-1111-4111-8111-111111111111\"}]}]},\"streamSettings\":{"
+            "\"network\":\"grpc\",\"security\":\"tls\",\"grpcSettings\":"
+            "{\"serviceName\":\"svc\",\"multiMode\":true}}}]}";
+        vl_server_t list[2];
+        size_t n = 0;
+        ok("xray json grpc multi",
+           cfg_parse_subscription(xray, strlen(xray), list, 2, &n) == CFG_OK && n == 1 &&
+           strcmp(list[0].path, "/svc/TunMulti") == 0);
+    }
+
     if (g_fail) {
         fprintf(stderr, "%d check(s) failed\n", g_fail);
         return 1;

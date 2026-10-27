@@ -34,6 +34,10 @@ typedef struct {
     int post;
     int grpc_ct; /* content-type: application/grpc in the headers */
     char path[2048];
+    char referer[2560];
+    char authority[256];
+    int te_trailers;
+    int authority_first; /* :authority came before :path */
     size_t data; /* bytes of the data frames that follow on the stream */
     size_t biggest_frame;
 } request_t;
@@ -120,11 +124,35 @@ static int next_request(xh_test_t *t, request_t *r) {
             size_t used;
             sid = stream;
             r->post = p[0] == 0x83;
-            if (p[2] != 0x04) return -1; /* :path, name from the static table */
-            if (senko_hpack_string(p + 3, plen - 3, r->path, sizeof r->path, &used) != 0)
-                return -1;
-            for (size_t i = 0; i + 16 <= plen; ++i)
-                if (memcmp(p + i, "application/grpc", 16) == 0) r->grpc_ct = 1;
+/* method and scheme are indexed; the rest are literals without indexing,
+   their names either from the static table or spelled out */
+            size_t at = 2;
+            while (at < plen) {
+                char name[32], value[2560];
+                uint8_t idx = p[at++] & 0x0f;
+                if (idx == 1) snprintf(name, sizeof name, ":authority");
+                else if (idx == 4) snprintf(name, sizeof name, ":path");
+                else if (idx == 0) {
+                    if (senko_hpack_string(p + at, plen - at, name, sizeof name, &used) != 0)
+                        return -1;
+                    at += used;
+                } else return -1;
+                if (senko_hpack_string(p + at, plen - at, value, sizeof value, &used) != 0)
+                    return -1;
+                at += used;
+                if (strcmp(name, ":path") == 0) {
+                    snprintf(r->path, sizeof r->path, "%s", value);
+                    r->authority_first = r->authority[0] != 0;
+                } else if (strcmp(name, ":authority") == 0)
+                    snprintf(r->authority, sizeof r->authority, "%s", value);
+                else if (strcmp(name, "referer") == 0)
+                    snprintf(r->referer, sizeof r->referer, "%s", value);
+                else if (strcmp(name, "te") == 0)
+                    r->te_trailers = strcmp(value, "trailers") == 0;
+                else if (strcmp(name, "content-type") == 0)
+                    r->grpc_ct = strcmp(value, "application/grpc") == 0;
+            }
+            if (!r->path[0]) return -1;
         } else if (f[3] == 0 && sid && stream == sid) {
             r->data += plen;
             if (plen > r->biggest_frame) r->biggest_frame = plen;
@@ -134,7 +162,7 @@ static int next_request(xh_test_t *t, request_t *r) {
     return sid ? 0 : -1;
 }
 
-/* the padding sits in the query, within the range the server requires */
+/* the padding sits in the referer's query, within the range the server requires */
 static int padding_in(const char *path, size_t lo, size_t hi) {
     const char *p = strstr(path, "x_padding=");
     if (!p) return 0;
@@ -155,8 +183,27 @@ static void test_stream_one_path(void) {
     collect(t);
     ok("stream-one request", next_request(t, &r) == 0);
     ok("stream-one posts under the base with a trailing slash",
-       r.post && strncmp(r.path, "/xh/?x_padding=", 15) == 0);
-    ok("stream-one padding", padding_ok(r.path));
+       r.post && strcmp(r.path, "/xh/") == 0);
+    ok("stream-one padding", padding_ok(r.referer));
+    ok("referer is the request url", strncmp(r.referer, "http://", 7) == 0 &&
+       strstr(r.referer, "/xh/?x_padding=") != NULL);
+    ok("authority goes before path", r.authority_first);
+    ok("xhttp sends no te", !r.te_trailers);
+    stop(t);
+    free(t);
+}
+
+/* real grpc: grpc-go matches :path exactly and wants te: trailers */
+static void test_grpc_headers(void) {
+    xh_test_t *t = malloc(sizeof *t);
+    request_t r;
+    ok("grpc open", t && start(t, "/svc/TunMulti", "grpc") == 0);
+    collect(t);
+    ok("grpc request", next_request(t, &r) == 0);
+    ok("grpc path is exact", r.post && strcmp(r.path, "/svc/TunMulti") == 0);
+    ok("grpc says te: trailers", r.te_trailers && r.grpc_ct);
+    ok("grpc has no padding", !r.referer[0]);
+    ok("grpc authority goes before path", r.authority_first);
     stop(t);
     free(t);
 }
@@ -172,8 +219,9 @@ static void test_auto_packet_up(void) {
     ok("auto download request", next_request(t, &r) == 0);
     ok("auto over plain http is packet-up: a get first", !r.post);
     ok("download path keeps the configured query",
-       strncmp(r.path, "/xh/", 4) == 0 && strstr(r.path, "?ed=2048&x_padding=") != NULL);
-    ok("download padding", padding_ok(r.path));
+       strncmp(r.path, "/xh/", 4) == 0 && strstr(r.path, "?ed=2048") != NULL &&
+       !strstr(r.path, "x_padding"));
+    ok("download padding", padding_ok(r.referer));
     size_t sl = strcspn(r.path + 4, "/?");
     snprintf(session, sizeof session, "%.*s", (int)sl, r.path + 4);
     ok("session is uuid shaped", sl == 36);
@@ -184,9 +232,9 @@ static void test_auto_packet_up(void) {
     collect(t);
     ok("first post", next_request(t, &r) == 0);
     char want[128];
-    snprintf(want, sizeof want, "/xh/%s/0?ed=2048&x_padding=", session);
-    ok("first post path", r.post && strncmp(r.path, want, strlen(want)) == 0);
-    ok("first post padding", padding_ok(r.path));
+    snprintf(want, sizeof want, "/xh/%s/0?ed=2048", session);
+    ok("first post path", r.post && strcmp(r.path, want) == 0);
+    ok("first post padding", padding_ok(r.referer));
     ok("first post carries the bytes", r.data == 3000);
 
     w = transport_xhttp_tcp.write(t->th, big, sizeof big);
@@ -261,13 +309,13 @@ static void test_profile_knobs(void) {
     ok("knobs open", t && start_opts(t, "/k", "packet-up", &xh) == 0);
     collect(t);
     ok("knobs download", next_request(t, &r) == 0 && !r.post);
-    ok("download padding in the profile's range", padding_in(r.path, 20, 30));
+    ok("download padding in the profile's range", padding_in(r.referer, 20, 30));
     server_settings(t, 0);
     ok("posts stop at the server's size",
        transport_xhttp_tcp.write(t->th, big, sizeof big) == 4096);
     collect(t);
     ok("knobs post", next_request(t, &r) == 0 && r.post && r.data == 4096);
-    ok("post padding in the profile's range", padding_in(r.path, 20, 30));
+    ok("post padding in the profile's range", padding_in(r.referer, 20, 30));
     stop(t);
 
     ok("stream-one keeps the grpc type by default", start(t, "/k", "stream-one") == 0);
@@ -280,13 +328,14 @@ static void test_profile_knobs(void) {
     ok("no grpc header open", start_opts(t, "/k", "stream-one", &xh) == 0);
     collect(t);
     ok("noGRPCHeader drops the grpc type", next_request(t, &r) == 0 && r.post && !r.grpc_ct);
-    ok("and keeps the default padding", padding_ok(r.path));
+    ok("and keeps the default padding", padding_ok(r.referer));
     stop(t);
     free(t);
 }
 
 int main(void) {
     test_stream_one_path();
+    test_grpc_headers();
     test_auto_packet_up();
     test_packet_up_connection_window();
     test_packet_up_post_slots();

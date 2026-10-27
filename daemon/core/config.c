@@ -611,12 +611,24 @@ static void parse_query(vl_server_t *s, const char *q, const char *end) {
     }
 }
 
-/* xray's old grpc links carry only serviceName; the wire path also contains Tun */
+/* xray's old grpc links carry only serviceName; the wire path also names the
+   stream. multiMode servers register "TunMulti" instead of "Tun", and a path
+   built with the wrong one comes back "unknown service <name>/Tun" although
+   the token and the tls handshake were both fine. a share link spells it
+   mode=multi, the json formats multiMode / multi_mode */
+static int ends_with(const char *s, size_t n, const char *tail) {
+    size_t t = strlen(tail);
+    return n >= t && strcmp(s + n - t, tail) == 0;
+}
+
 static void normalize_grpc_path(vl_server_t *s) {
     char base[sizeof s->path];
+    const char *stream;
     size_t n;
 
     if (!s || s->net != VL_NET_GRPC) return;
+    if (strcmp(s->mode, "multi") == 0) s->grpc_multi = 1;
+    stream = s->grpc_multi ? "/TunMulti" : "/Tun";
     snprintf(base, sizeof base, "%s", s->path[0] ? s->path : "/");
     if (base[0] != '/') {
         size_t base_len = strlen(base);
@@ -626,12 +638,17 @@ static void normalize_grpc_path(vl_server_t *s) {
     }
     n = strlen(base);
     while (n > 1 && base[n - 1] == '/') base[--n] = '\0';
+/* a path that already names a stream is kept as it is: a saved profile comes
+   back through here with the flag no longer set */
     if (n == 1 && base[0] == '/') {
-        snprintf(s->path, sizeof s->path, "/Tun");
-    } else if (n >= 4 && strcmp(base + n - 4, "/Tun") == 0) {
+        snprintf(s->path, sizeof s->path, "%s", stream);
+    } else if (ends_with(base, n, "/TunMulti")) {
+        s->grpc_multi = 1;
+        snprintf(s->path, sizeof s->path, "%s", base);
+    } else if (ends_with(base, n, "/Tun")) {
         snprintf(s->path, sizeof s->path, "%s", base);
     } else {
-        snprintf(s->path, sizeof s->path, "%s/Tun", base);
+        snprintf(s->path, sizeof s->path, "%s%s", base, stream);
     }
     snprintf(s->mode, sizeof s->mode, "grpc");
 }
@@ -1369,8 +1386,10 @@ static int xray_outbound_to_server(const cJSON *ob, const char *remarks,
             xh_extra_apply(s, xh);
             xh_extra_apply(s, cJSON_GetObjectItemCaseSensitive(xh, "extra"));
         }
-        if (s->net == VL_NET_GRPC && cJSON_IsObject(gr))
+        if (s->net == VL_NET_GRPC && cJSON_IsObject(gr)) {
             (void)jstr_copy(gr, "serviceName", s->path, sizeof s->path);
+            s->grpc_multi = json_flag_on(gr, "multiMode");
+        }
     }
 
     return json_server_finish(s, ob, remarks, multi);
@@ -1520,9 +1539,12 @@ static int singbox_outbound_to_server(const cJSON *ob, const char *remarks,
                 }
             }
         }
-        if (s->net == VL_NET_GRPC)
+        if (s->net == VL_NET_GRPC) {
             (void)jstr_copy_any(transport, s->path, sizeof s->path,
                                 "service_name", "serviceName");
+            s->grpc_multi = json_flag_on(transport, "multi_mode") ||
+                            json_flag_on(transport, "multiMode");
+        }
     }
 
     return json_server_finish(s, ob, remarks, multi);

@@ -250,38 +250,54 @@ static int mode_for_open(const transport_tls_cfg_t *cfg, int reality) {
     return XH_MODE_ONE;
 }
 
+/* :authority before :path, the order every real client and grpc-go's own
+   stack produce. a real grpc stream also says te: trailers, which grpc-go's
+   server checks before it looks at :path */
 static int build_headers(uint8_t *out, size_t cap, size_t *n,
                          int is_post, const char *path, const char *host,
                          int with_grpc, size_t content_len, int has_cl,
-                         int is_https) {
+                         int is_https, int te_trailers, const char *referer) {
     size_t off = 0;
     if (is_post) out[off++] = 0x83; /* post method */
     else         out[off++] = 0x82; /* get method */
     out[off++] = is_https ? 0x87 : 0x86; /* :scheme https/http */
-    if (hpack_idx_name(out, cap, &off, 4, path) != 0) return -1;
     if (hpack_idx_name(out, cap, &off, 1, host) != 0) return -1;
+    if (hpack_idx_name(out, cap, &off, 4, path) != 0) return -1;
     if (with_grpc) {
         if (hpack_lit(out, cap, &off, "content-type", "application/grpc") != 0)
             return -1;
+    }
+    if (te_trailers) {
+        if (hpack_lit(out, cap, &off, "te", "trailers") != 0) return -1;
     }
     if (has_cl) {
         char cl[16];
         snprintf(cl, sizeof cl, "%zu", content_len);
         if (hpack_lit(out, cap, &off, "content-length", cl) != 0) return -1;
     }
+    if (referer) {
+        if (hpack_lit(out, cap, &off, "referer", referer) != 0) return -1;
+    }
     *n = off;
     return 0;
 }
 
-static void path_with_padding(const xh_t *h, const char *path, char *out, size_t cap) {
+/* like xray's client, the padding never touches the real :path: the request
+   url goes into Referer with x_padding as its whole query. the configured
+   query stays on the path itself. a server that expects a clean session/seq
+   path refuses one that grows a padding query */
+static void path_with_padding(const xh_t *h, const char *path, char *out, size_t cap,
+                              char *referer, size_t ref_cap) {
     char pad[XH_PAD_CAP + 1];
     size_t n = rand_pad_len(h);
     memset(pad, 'X', n);
     pad[n] = 0;
     if (h->query[0])
-        snprintf(out, cap, "%s?%s&x_padding=%s", path, h->query, pad);
+        snprintf(out, cap, "%s?%s", path, h->query);
     else
-        snprintf(out, cap, "%s?x_padding=%s", path, pad);
+        snprintf(out, cap, "%s", path);
+    snprintf(referer, ref_cap, "%s://%s%s?x_padding=%s",
+             h->security_tls ? "https" : "http", h->host, path, pad);
 }
 
 static int flush_tx(xh_t *h) {
@@ -707,17 +723,18 @@ static int queue_boot(xh_t *h, const transport_tls_cfg_t *cfg, int sec) {
     h2_put_u32(settings + 2, 128);
     if (frame_append(h, H2_SETTINGS, 0, 0, settings, 6) != 0) return -1;
 
-    uint8_t block[XH_PATH + 512];
+    uint8_t block[2 * XH_PATH + 768];
     size_t blen = 0;
-    char path[XH_PATH], path_pad[XH_PATH];
+    char path[XH_PATH], path_pad[XH_PATH], referer[XH_PATH + 256];
 
     if (h->mode == XH_MODE_ONE) {
         if (h->grpc)
             snprintf(path_pad, sizeof path_pad, "%s", h->base_path);
         else
-            path_with_padding(h, h->base_path, path_pad, sizeof path_pad);
+            path_with_padding(h, h->base_path, path_pad, sizeof path_pad,
+                              referer, sizeof referer);
         if (build_headers(block, sizeof block, &blen, 1, path_pad, h->host, h->stream_ct,
-                          0, 0, h->security_tls) != 0)
+                          0, 0, h->security_tls, h->grpc, h->grpc ? NULL : referer) != 0)
             return -1;
         h->up_stream = h->dn_stream = alloc_sid(h); /* stream 1 both ways */
         if (frame_append(h, H2_HEADERS, 0x04, h->up_stream, block, blen) != 0)
@@ -728,9 +745,9 @@ static int queue_boot(xh_t *h, const transport_tls_cfg_t *cfg, int sec) {
 
 /* the other modes open the long-lived download stream first */
     snprintf(path, sizeof path, "%s%s", h->base_path, h->session);
-    path_with_padding(h, path, path_pad, sizeof path_pad);
+    path_with_padding(h, path, path_pad, sizeof path_pad, referer, sizeof referer);
     if (build_headers(block, sizeof block, &blen, 0, path_pad, h->host, 0, 0, 0,
-                      h->security_tls) != 0)
+                      h->security_tls, 0, referer) != 0)
         return -1;
     h->dn_stream = alloc_sid(h);
     if (frame_append(h, H2_HEADERS, 0x04 | 0x01, h->dn_stream, block, blen) != 0)
@@ -739,9 +756,9 @@ static int queue_boot(xh_t *h, const transport_tls_cfg_t *cfg, int sec) {
     if (h->mode == XH_MODE_UP) {
 /* keep upload on its own stream for stream-up mode */
         blen = 0;
-        path_with_padding(h, path, path_pad, sizeof path_pad);
+        path_with_padding(h, path, path_pad, sizeof path_pad, referer, sizeof referer);
         if (build_headers(block, sizeof block, &blen, 1, path_pad, h->host, h->stream_ct,
-                          0, 0, h->security_tls) != 0)
+                          0, 0, h->security_tls, 0, referer) != 0)
             return -1;
         h->up_stream = alloc_sid(h);
         if (frame_append(h, H2_HEADERS, 0x04, h->up_stream, block, blen) != 0)
@@ -758,15 +775,15 @@ static int queue_boot(xh_t *h, const transport_tls_cfg_t *cfg, int sec) {
    nothing is queued unless both fit */
 static int send_packet(xh_t *h, const uint8_t *buf, size_t len) {
     if (len == 0 || len > h->pkt_max) return -1;
-    char path[XH_PATH], path_pad[XH_PATH];
+    char path[XH_PATH], path_pad[XH_PATH], referer[XH_PATH + 256];
     snprintf(path, sizeof path, "%s%s/%lld",
              h->base_path, h->session, (long long)h->seq);
-    path_with_padding(h, path, path_pad, sizeof path_pad);
+    path_with_padding(h, path, path_pad, sizeof path_pad, referer, sizeof referer);
 
-    uint8_t block[XH_PATH + 512];
+    uint8_t block[2 * XH_PATH + 768];
     size_t blen = 0;
     if (build_headers(block, sizeof block, &blen, 1, path_pad, h->host, 0, len, 1,
-                      h->security_tls) != 0)
+                      h->security_tls, 0, referer) != 0)
         return -1;
     if (9 + blen + 9 + len > sizeof h->tx - h->tx_len) return -1;
     if (h->posts_open >= post_limit(h)) return -1;

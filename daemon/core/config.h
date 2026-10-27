@@ -60,6 +60,10 @@ typedef struct {
     char     sid[32];
     char     path[256];
     char     mode[16]; /* preserve xhttp mode for transport selection */
+/* xray's grpc transport registers two distinct stream names, "Tun" and
+   "TunMulti"; cfg_normalize_grpc_path needs to know which one the server
+   expects before it can build a path the server will recognize */
+    int      grpc_multi;
     char     remark[256];
 /* skip certificate and hostname verification for this server's tls
    connection. plenty of trojan/vless nodes run behind a bare ip or a

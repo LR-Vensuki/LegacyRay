@@ -82,8 +82,9 @@ static void append_grpc_service(json_out_t *j, const char *path) {
     const char *start = path ? path : "";
     if (*start == '/') ++start;
     size_t len = strlen(start);
-    if (strcmp(start, "Tun") == 0) len = 0;
+    if (strcmp(start, "Tun") == 0 || strcmp(start, "TunMulti") == 0) len = 0;
     else if (len >= 4 && memcmp(start + len - 4, "/Tun", 4) == 0) len -= 4;
+    else if (len >= 9 && memcmp(start + len - 9, "/TunMulti", 9) == 0) len -= 9;
     if (len >= sizeof service) {
         j->failed = 1;
         return;
@@ -128,6 +129,9 @@ static int append_stream(json_out_t *j, const vl_server_t *s) {
     } else if (s->net == VL_NET_GRPC) {
         append_raw(j, ",\"grpcSettings\":{\"serviceName\":");
         append_grpc_service(j, s->path);
+        size_t plen = strlen(s->path);
+        if (s->grpc_multi || (plen >= 8 && strcmp(s->path + plen - 8, "TunMulti") == 0))
+            append_raw(j, ",\"multiMode\":true");
         append_raw(j, "}");
     } else if (s->net == VL_NET_XHTTP) {
         append_raw(j, ",\"xhttpSettings\":{\"path\":");
