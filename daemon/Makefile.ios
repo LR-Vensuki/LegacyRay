@@ -13,7 +13,7 @@ CFLAGS  := -std=c99 -Wall -Wextra -Wno-unused-parameter -O2 -DSENKO_RELEASE \
 LIBS    := $(LR_OSSL)/lib/libssl.a $(LR_OSSL)/lib/libcrypto.a -lz
 LDFLAGS := $(LR_ARCH) $(LR_SYSROOT) -Wl,-dead_strip
 
-CORE_SRC = core/vless.c core/b64.c core/config.c core/rules.c core/dns_msg.c \
+CORE_SRC = core/vless.c core/b64.c core/config.c core/rules.c core/dns_msg.c core/doh.c \
            core/dns_cache.c core/profiles.c core/happ.c core/happ_crypt5.c \
            core/third_party/cJSON.c core/net_safe.c core/socks5.c core/senko_trace.c \
            core/senko_replay.c core/senko_upload.c core/vless_conn.c core/session.c \

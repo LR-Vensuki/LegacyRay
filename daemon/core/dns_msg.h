@@ -47,6 +47,16 @@ dns_msg_status_t dns_msg_build_block(const uint8_t *query, size_t query_len,
                                      dns_block_response_t mode,
                                      uint8_t *out, size_t cap, size_t *out_len);
 
+/* an empty answer with TC set: the real one did not fit, ask again over tcp */
+dns_msg_status_t dns_msg_build_truncated(const uint8_t *query, size_t query_len,
+                                         uint8_t *out, size_t cap, size_t *out_len);
+
+/* 1 for a name a resolver answers itself instead of asking the internet
+   (rfc 6303, 6761, 6762, 8375): the reverse trees of private and special
+   addresses, .local and home.arpa. the public resolvers say nxdomain for all
+   of them anyway */
+int dns_msg_locally_served(const char *name);
+
 dns_msg_status_t dns_msg_response_info(const uint8_t *msg, size_t len,
                                        dns_response_info_t *out);
 

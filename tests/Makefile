@@ -47,6 +47,7 @@ HOST_TESTS = test_ctl_server test_autoconnect test_session_direct test_config_co
              test_subinfo test_profiles test_amnezia_bundle test_happ_links \
              test_b64 test_traffic test_loop_traffic test_rules
 HOST_TESTS += test_dns_msg
+HOST_TESTS += test_doh
 HOST_TESTS += test_dns_cache
 HOST_TESTS += test_pf_table
 HOST_TESTS += test_trojan
@@ -79,6 +80,7 @@ test: $(HOST_TESTS)
 	./test_loop_redial
 	./test_rules
 	./test_dns_msg
+	./test_doh
 	./test_dns_cache
 	./test_pf_table
 	./test_ctl_server
@@ -127,6 +129,9 @@ test_rules: test_rules.c $(CORE)/rules.c $(CORE)/rules.h
 
 test_dns_msg: test_dns_msg.c $(CORE)/dns_msg.c $(CORE)/dns_msg.h
 	$(CC) $(CFLAGS) test_dns_msg.c $(CORE)/dns_msg.c -o $@
+
+test_doh: test_doh.c $(CORE)/doh.c $(CORE)/doh.h
+	$(CC) $(CFLAGS) test_doh.c $(CORE)/doh.c -o $@
 
 test_dns_cache: test_dns_cache.c $(CORE)/dns_cache.c $(CORE)/dns_cache.h \
                 $(CORE)/dns_msg.c $(CORE)/dns_msg.h $(CORE)/rules.h
@@ -350,13 +355,18 @@ test_legacyray: test_legacyray.c $(CORE)/rules.c $(CORE)/store.c $(DAEMON)/routi
 	      $(DAEMON)/routing.c $(DAEMON)/settings.c $(CORE)/tls_clienthello.c \
 	      $(CORE)/geo.c $(CORE)/frag.c $(CORE)/control.c $(CFG_SRC) -o $@ $(TLS_LDFLAGS) -lpthread
 
+# the dns forwarder asks the resolver over https for the types port 53 drops
+DNS_TLS = $(CORE)/doh.c $(CORE)/transport_tls.c $(CORE)/frag.c $(CORE)/tls_clienthello.c
+
 test_routing_exec: test_routing_exec.c $(DAEMON)/routing_exec.c $(CORE)/geo.c $(DAEMON)/routing.c \
                    $(DAEMON)/legacy_ios.c $(DAEMON)/routing_exec.h $(DAEMON)/routing.h \
                    $(CORE)/rules.c $(CORE)/rules.h $(CORE)/dns_msg.c \
-                   $(CORE)/dns_cache.c $(DAEMON)/pf_table.c
-	$(CC) $(CFLAGS) -I$(DAEMON) test_routing_exec.c $(DAEMON)/routing_exec.c $(CORE)/geo.c \
+                   $(CORE)/dns_cache.c $(DAEMON)/pf_table.c $(DNS_TLS)
+	$(CC) $(CFLAGS) $(TLS_CFLAGS) $(THREAD_CFLAGS) -I$(DAEMON) test_routing_exec.c \
+	      $(DAEMON)/routing_exec.c $(CORE)/geo.c \
 	      $(DAEMON)/routing.c $(DAEMON)/legacy_ios.c $(NET_SAFE) $(CORE)/rules.c \
-	      $(CORE)/dns_msg.c $(CORE)/dns_cache.c $(DAEMON)/pf_table.c -o $@
+	      $(CORE)/dns_msg.c $(CORE)/dns_cache.c $(DAEMON)/pf_table.c $(DNS_TLS) -o $@ \
+	      $(TLS_LDFLAGS) $(THREAD_LDFLAGS)
 
 test_pf_natlook: test_pf_natlook.c $(DAEMON)/pf_natlook.c $(DAEMON)/pf_natlook.h
 	$(CC) $(CFLAGS) -D_POSIX_C_SOURCE=200809L -DSENKO_HOST_TEST -I$(DAEMON) test_pf_natlook.c \
@@ -372,25 +382,25 @@ test_ctl_server: test_ctl_server.c $(DAEMON)/ctl_server.c $(CORE)/ctl_engine.c \
                  $(CORE)/control.c $(CORE)/store.c $(CORE)/url.c $(NET_SAFE) \
                  $(DAEMON)/settings.c $(DAEMON)/routing_exec.c $(CORE)/geo.c $(DAEMON)/routing.c \
                  $(DAEMON)/legacy_ios.c $(CFG_SRC) $(CORE)/dns_msg.c \
-                 $(CORE)/dns_cache.c $(DAEMON)/pf_table.c
-	$(CC) $(CFLAGS) $(TLS_CFLAGS) -I$(DAEMON) test_ctl_server.c $(DAEMON)/ctl_server.c \
+                 $(CORE)/dns_cache.c $(DAEMON)/pf_table.c $(DNS_TLS)
+	$(CC) $(CFLAGS) $(TLS_CFLAGS) $(THREAD_CFLAGS) -I$(DAEMON) test_ctl_server.c $(DAEMON)/ctl_server.c \
 	      $(CORE)/ctl_engine.c $(CORE)/control.c $(CORE)/store.c $(CORE)/url.c \
 	      $(DAEMON)/settings.c $(DAEMON)/routing_exec.c $(CORE)/geo.c $(DAEMON)/routing.c \
 	      $(DAEMON)/legacy_ios.c \
 	      $(NET_SAFE) $(CFG_SRC) $(CORE)/dns_msg.c $(CORE)/dns_cache.c \
-	      $(DAEMON)/pf_table.c -o $@ $(TLS_LDFLAGS)
+	      $(DAEMON)/pf_table.c $(DNS_TLS) -o $@ $(TLS_LDFLAGS) $(THREAD_LDFLAGS)
 
 test_autoconnect: test_autoconnect.c $(DAEMON)/ctl_server.c $(CORE)/ctl_engine.c \
                  $(CORE)/control.c $(CORE)/store.c $(CORE)/url.c $(NET_SAFE) \
                  $(DAEMON)/settings.c $(DAEMON)/routing_exec.c $(CORE)/geo.c $(DAEMON)/routing.c \
                  $(DAEMON)/legacy_ios.c $(CFG_SRC) $(CORE)/dns_msg.c \
-                 $(CORE)/dns_cache.c $(DAEMON)/pf_table.c
-	$(CC) $(CFLAGS) $(TLS_CFLAGS) -I$(DAEMON) test_autoconnect.c $(DAEMON)/ctl_server.c \
+                 $(CORE)/dns_cache.c $(DAEMON)/pf_table.c $(DNS_TLS)
+	$(CC) $(CFLAGS) $(TLS_CFLAGS) $(THREAD_CFLAGS) -I$(DAEMON) test_autoconnect.c $(DAEMON)/ctl_server.c \
 	      $(CORE)/ctl_engine.c $(CORE)/control.c $(CORE)/store.c $(CORE)/url.c \
 	      $(DAEMON)/settings.c $(DAEMON)/routing_exec.c $(CORE)/geo.c $(DAEMON)/routing.c \
 	      $(DAEMON)/legacy_ios.c \
 	      $(NET_SAFE) $(CFG_SRC) $(CORE)/dns_msg.c $(CORE)/dns_cache.c \
-	      $(DAEMON)/pf_table.c -o $@ $(TLS_LDFLAGS)
+	      $(DAEMON)/pf_table.c $(DNS_TLS) -o $@ $(TLS_LDFLAGS) $(THREAD_LDFLAGS)
 
 test_profiles: test_profiles.c $(CFG_SRC)
 	$(CC) $(CFLAGS) $(TLS_CFLAGS) test_profiles.c $(CFG_SRC) -o $@ $(TLS_LDFLAGS)

@@ -70,6 +70,11 @@ typedef struct transport_vt {
     int (*blocked)(void *h);
 } transport_vt_t;
 
+/* the parsed root certificates every tls client in the daemon shares; NULL
+   while the bundle is missing */
+struct x509_store_st;
+struct x509_store_st *transport_tls_roots(void);
+
 extern const transport_vt_t transport_tcp; /* plain tcp transport */
 extern const transport_vt_t transport_tls; /* tls and reality transport */
 extern const transport_vt_t transport_ws_tcp;/* websocket over plain tcp */
