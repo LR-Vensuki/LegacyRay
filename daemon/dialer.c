@@ -95,8 +95,10 @@ int dialer_connect(void *ctx) {
 
     struct addrinfo *res = NULL;
     if (net_getaddrinfo_timed(d->host, d->port, &hints, &res, DIALER_RESOLVE_MS) != 0 ||
-        !res)
+        !res) {
+        errno = EHOSTUNREACH;
         return -1;
+    }
 
     int fd = -1;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {

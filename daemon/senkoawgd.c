@@ -105,11 +105,16 @@ static void usage(const char *argv0) {
    the loop is busy decrypting, and each lost datagram is a tcp retransmit */
 #define AWG_UDP_BUFFER (256 * 1024)
 
+/* an old kernel caps a socket buffer below 256 KiB: halve until it takes */
+static void size_udp_buffer(int fd, int which, const char *name) {
+    for (int size = AWG_UDP_BUFFER; size >= 32 * 1024; size /= 2)
+        if (setsockopt(fd, SOL_SOCKET, which, &size, sizeof size) == 0) return;
+    fprintf(stderr, "legacyrayawgd: keeping the stock udp %s buffer (errno %d)\n", name, errno);
+}
+
 static void size_udp_buffers(int fd) {
-    int size = AWG_UDP_BUFFER;
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof size) != 0 ||
-        setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof size) != 0)
-        fprintf(stderr, "legacyrayawgd: keeping the stock udp buffers (errno %d)\n", errno);
+    size_udp_buffer(fd, SO_RCVBUF, "receive");
+    size_udp_buffer(fd, SO_SNDBUF, "send");
 }
 
 static int open_endpoint(const awg_config_t *cfg, char *endpoint, size_t endpoint_cap) {
@@ -259,7 +264,7 @@ static int run_tunnel(const awg_config_t *cfg, int timeout_ms) {
 /* a responder starts sending on new keys only once a packet sealed with them
    arrives, so a tunnel with nothing to send yet would leave the server's
    first packets waiting for a timer */
-    {
+    if (cfg->persistent_keepalive && ka_mode != AWG_KEEPALIVE_OFF) {
         size_t wire_len = 0;
         if (awg_tunnel_seal(&tunnel, NULL, 0, wire, sizeof wire, &wire_len) == AWG_TUN_OK &&
             send(udp_fd, wire, wire_len, 0) != (ssize_t)wire_len)

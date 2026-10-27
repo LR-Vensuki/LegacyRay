@@ -181,6 +181,7 @@ static void *open_worker_main(void *arg) {
             if (cancelled) break;
         }
         if (c->remote_fd < 0) {
+            errno = 0;
             int rfd = lp->dial(lp->dial_ctx);
             if (rfd < 0) {
                 net_fail_note(&c->open_fail, net_fail_from_errno(errno ? errno : ETIMEDOUT), 0);
@@ -204,6 +205,8 @@ static void *open_worker_main(void *arg) {
         pthread_mutex_unlock(&lp->open_lock);
     }
 
+/* an attempt that failed before one that worked says nothing about the server */
+    if (th) memset(&c->open_fail, 0, sizeof c->open_fail);
     pthread_mutex_lock(&lp->open_lock);
     c->open_th = th;
     c->open_done = 1;

@@ -2046,14 +2046,12 @@ static int measure_device_clock(daemon_ctl_t *d, int timeout_ms) {
         "Connection: close\r\n\r\n";
     char ip[INET6_ADDRSTRLEN];
     if (!net_resolve_public("www.gstatic.com", 80, ip, sizeof ip)) return -1;
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(80);
-    if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1) return -1;
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+/* darwin bounds no connect() by SO_SNDTIMEO: dial against a deadline, then
+   read and write blocking under the socket timeouts */
+    int fd = dial_numeric_until(d, ip, 80, probe_now_ms() + timeout_ms, NULL);
     if (fd < 0) return -1;
-    probe_bind_physical_interface(fd, d->full_device);
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl >= 0) (void)fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
     struct timeval tv;
     tv.tv_sec = timeout_ms / 1000;
     tv.tv_usec = (timeout_ms % 1000) * 1000;
@@ -2062,8 +2060,7 @@ static int measure_device_clock(daemon_ctl_t *d, int timeout_ms) {
     char head[1024];
     size_t got = 0;
     int rc = -1;
-    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0 &&
-        write(fd, request, sizeof request - 1) == (ssize_t)(sizeof request - 1)) {
+    if (write(fd, request, sizeof request - 1) == (ssize_t)(sizeof request - 1)) {
         while (got < sizeof head - 1) {
             ssize_t r = read(fd, head + got, sizeof head - 1 - got);
             if (r <= 0) break;
@@ -2102,13 +2099,13 @@ static void explain_handshake_failure(daemon_ctl_t *d, const vl_server_t *server
         diag.stage = NET_DIAG_CLOSED;
 /* the probe's own deadline can end before the tunnel's dial gives up, so a
    server that never answered left no failure behind: ask it directly */
-    if (diag.stage == NET_DIAG_SILENT || diag.stage == NET_DIAG_CLOSED) {
-        char ip[INET6_ADDRSTRLEN];
+    char ip[INET6_ADDRSTRLEN];
+    if (!net_resolve_public(server->host, server->port, ip, sizeof ip)) {
+        diag.stage = NET_DIAG_DNS;
+    } else if (diag.stage == NET_DIAG_SILENT || diag.stage == NET_DIAG_CLOSED) {
         net_fail_kind_t why = NET_FAIL_NONE;
-        if (!net_resolve_public(server->host, server->port, ip, sizeof ip)) {
-            diag.stage = NET_DIAG_DNS;
-        } else if (probe_tcp_ipv4(ip, server->port, 2500, d->full_device, &why) < 0 &&
-                   why != NET_FAIL_SYSTEM) {
+        if (probe_tcp_ipv4(ip, server->port, 2500, d->full_device, &why) < 0 &&
+            why != NET_FAIL_SYSTEM) {
             diag.stage = NET_DIAG_TRANSPORT;
             diag.transport.kind = why;
         }
