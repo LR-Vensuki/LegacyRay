@@ -14,7 +14,7 @@ Mac — на **OS X 10.8 Mountain Lion и 10.9 Mavericks** в скевоморф
 
 ## Скачать
 
-[**LegacyRay‑1.0.3‑mac.zip**](https://github.com/LR-Vensuki/LegacyRay-Mac/releases/latest)
+[**LegacyRay‑1.0.4‑mac.zip**](https://github.com/LR-Vensuki/LegacyRay-Mac/releases/latest)
 со страницы релизов.
 
 1. Распаковать и перенести LegacyRay в «Программы».
